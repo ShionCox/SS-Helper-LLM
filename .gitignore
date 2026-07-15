@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build, cache, and test output
+dist/
+build/
+coverage/
+.nyc_output/
+.cache/
+.vite/
+.turbo/
+.eslintcache
+*.tsbuildinfo
+test-results/
+playwright-report/
+blob-report/
+.verification-temp/
+
+# Logs and temporary files
+logs/
+tmp/
+temp/
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+
+# Local environment and sensitive configuration
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# Editor and operating-system metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local OMX runtime state
+.omx/
+
+# Generated npm pack archives (vendored SDK archives are source inputs)
+*.tgz
+!vendor/**/*.tgz
