@@ -1,9 +1,5 @@
 export * from './providers/types';
-export { OpenAIProvider } from './providers/openai-provider';
-export { ClaudeProvider } from './providers/claude-provider';
-export { GeminiProvider } from './providers/gemini-provider';
 export { TavernProvider } from './providers/tavern-provider';
-export { CustomRerankProvider } from './providers/custom-rerank-provider';
 export { TaskRouter, BUILTIN_TAVERN_RESOURCE_ID } from './router/router';
 export { ConsumerRegistry } from './registry/consumer-registry';
 export { RequestOrchestrator } from './orchestrator/orchestrator';
@@ -21,6 +17,7 @@ export type * from './schema/types';
 export { logger } from './runtime/logger';
 export { startLlmPlugin } from './ss-helper/plugin';
 export { LLM_SETTINGS_KEY, LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter } from './ss-helper/settings';
+export { LlmSettingsStatusMonitor, type LlmSettingsStatusMap, type LlmSettingsStatusSource } from './ss-helper/settings-status';
 export { createLlmSdkServiceHandlers, exposeLlmServices, publishRouteChanged } from './ss-helper/services';
 export type { LlmSdkServicePort, LlmServiceHandlers } from './ss-helper/services';
 export { createProductionLlmServices, createProviderFromResource } from './ss-helper/llm-service-runtime';

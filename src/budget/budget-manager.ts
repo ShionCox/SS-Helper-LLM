@@ -1,4 +1,5 @@
 import { logger } from '../runtime/logger';
+import { validateBudgetConfigs } from '../validation/settings';
 
 /**
  * 预算与熔断器 —— 控制每个 consumer 的调用频率和成本
@@ -8,7 +9,6 @@ export interface BudgetConfig {
     maxRPM?: number;       // 每分钟最大请求数
     maxTokens?: number;    // 单次最大 token
     maxLatencyMs?: number; // 最大延迟容忍
-    maxCost?: number;      // 最大成本（预留）
 }
 
 interface ConsumerState {
@@ -32,7 +32,7 @@ export class BudgetManager {
      * 为指定 consumer 设置预算
      */
     setConfig(consumer: string, config: BudgetConfig): void {
-        this.configs.set(consumer, config);
+        this.configs.set(consumer, Object.freeze({ ...validateBudgetConfigs({ [consumer]: config })[consumer] }));
     }
 
     /**
@@ -43,8 +43,9 @@ export class BudgetManager {
     }
 
     replaceConfigs(configs: Record<string, BudgetConfig> = {}): void {
+        const validated = validateBudgetConfigs(configs);
         this.configs.clear();
-        for (const [consumer, config] of Object.entries(configs)) this.configs.set(consumer, { ...config });
+        for (const [consumer, config] of Object.entries(validated)) this.configs.set(consumer, Object.freeze({ ...config }));
     }
 
     resetCircuit(consumer?: string): void {
@@ -124,6 +125,7 @@ export class BudgetManager {
      * 获取 consumer 配置中的 budget 参数
      */
     getConfig(consumer: string): BudgetConfig | undefined {
-        return this.configs.get(consumer);
+        const config = this.configs.get(consumer);
+        return config ? { ...config } : undefined;
     }
 }

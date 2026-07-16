@@ -1,6 +1,5 @@
 {
   "name": "@ss-helper/llm",
-  "version": "0.1.0",
   "description": "SS-Helper LLM consumer plugin",
   "type": "module",
   "main": "dist/index.js",
@@ -12,8 +11,9 @@
     "docs/g009-sdk-artifact.md"
   ],
   "scripts": {
-    "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",
-    "build": "pnpm run clean && tsc && esbuild src/index.ts --bundle --format=esm --platform=browser --outfile=dist/index.js && esbuild src/runtime-entry.ts --bundle --format=esm --platform=browser --outfile=dist/runtime-entry.js && node scripts/verify-browser-artifact.mjs",
+    "clean": "node -e \"for(const p of ['dist','dist-server'])require('node:fs').rmSync(p,{recursive:true,force:true})\"",
+    "build:browser": "esbuild src/index.ts --bundle --format=esm --platform=browser --outfile=dist/index.js && esbuild src/runtime-entry.ts --bundle --format=esm --platform=browser --outfile=dist/runtime-entry.js && node scripts/verify-browser-artifact.mjs",
+    "build": "pnpm run clean && tsc && pnpm run build:browser",
     "typecheck": "tsc --noEmit --pretty false",
     "test": "pnpm run build && node --experimental-vm-modules --test test/**/*.test.mjs",
     "lint": "pnpm run typecheck && node scripts/legacy-scan.mjs"
@@ -21,7 +21,7 @@
   "license": "ISC",
   "packageManager": "pnpm@10.30.3",
   "dependencies": {
-    "@ss-helper/sdk": "1.0.0",
+    "@ss-helper/sdk": "2.0.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {
@@ -31,7 +31,7 @@
   },
   "pnpm": {
     "overrides": {
-      "@ss-helper/sdk": "file:vendor/ss-helper-sdk-1.0.0.tgz"
+      "@ss-helper/sdk": "file:vendor/ss-helper-sdk-2.0.0.tgz"
     }
   }
 }

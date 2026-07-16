@@ -7,6 +7,7 @@ import type {
     ProviderConnectionResult,
     ProviderModelListResult,
 } from './types';
+import { providerHttpError, providerProtocolError } from './provider-errors';
 
 /**
  * 独立自定义重排 Provider
@@ -24,6 +25,7 @@ export class CustomRerankProvider implements LLMProvider {
     private model: string;
     private rerankPath: string;
     private customParams: Record<string, unknown>;
+    private fetchImpl: typeof fetch;
 
     constructor(config: {
         id: string;
@@ -32,12 +34,14 @@ export class CustomRerankProvider implements LLMProvider {
         model?: string;
         rerankPath?: string;
         customParams?: Record<string, unknown>;
+        fetchImpl?: typeof fetch;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
         this.baseUrl = config.baseUrl.replace(/\/+$/, '');
         this.model = config.model || '';
         this.rerankPath = this.normalizePath(config.rerankPath || '/rerank');
+        this.fetchImpl = config.fetchImpl ?? fetch;
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -186,11 +190,9 @@ export class CustomRerankProvider implements LLMProvider {
     private async executeCompatibleRerank(req: RerankRequest): Promise<RerankResponse> {
         const urls = this.buildCandidateUrls();
         const payloads = this.buildPayloadVariants(req);
-        const errors: string[] = [];
-
         for (const url of urls) {
             for (const payload of payloads) {
-                const response = await fetch(url, {
+                const response = await this.fetchImpl(url, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -201,10 +203,9 @@ export class CustomRerankProvider implements LLMProvider {
                 });
 
                 if (!response.ok) {
-                    const errText = await response.text().catch(() => '');
-                    errors.push(`${response.status} @ ${url} -> ${errText}`);
+                    await response.text().catch(() => undefined);
                     if (response.status === 401 || response.status === 403) {
-                        throw new Error(`Rerank 请求失败: ${response.status} ${errText}`);
+                        throw providerHttpError('Rerank', response.status);
                     }
                     continue;
                 }
@@ -214,12 +215,10 @@ export class CustomRerankProvider implements LLMProvider {
                 if (Array.isArray(normalized.results) && normalized.results.length > 0) {
                     return normalized;
                 }
-                errors.push(`empty-results @ ${url} -> ${JSON.stringify(data).slice(0, 300)}`);
             }
         }
 
-        const detail = errors.slice(0, 4).join(' | ');
-        throw new Error(`Rerank 请求失败：未匹配到兼容接口或返回格式异常。请检查 Base URL 与服务协议。${detail ? ` 详情：${detail}` : ''}`);
+        throw providerProtocolError('Rerank');
     }
 
     async request(_req: LLMRequest): Promise<LLMResponse> {
@@ -257,7 +256,7 @@ export class CustomRerankProvider implements LLMProvider {
 
     async listModels(): Promise<ProviderModelListResult> {
         try {
-            const res = await fetch(`${this.getModelListBaseUrl()}/models`, {
+            const res = await this.fetchImpl(`${this.getModelListBaseUrl()}/models`, {
                 method: 'GET',
                 headers: { 'Authorization': `Bearer ${this.apiKey}` },
             });

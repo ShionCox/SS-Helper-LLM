@@ -2,7 +2,7 @@ import type { LLMHubSettings } from './types';
 
 export type LlmSettingsDefaults = Required<Pick<
     LLMHubSettings,
-    'enabled' | 'globalProfile' | 'maxTokensMode' | 'maxTokens' | 'timeoutMs' | 'resultDisplay' | 'detailedLogs'
+    'enabled' | 'globalProfile' | 'maxTokensMode' | 'maxTokens' | 'timeoutMs' | 'resultDisplay'
 >>;
 
 export const DEFAULT_LLM_SETTINGS: Readonly<LlmSettingsDefaults> = Object.freeze({
@@ -12,5 +12,4 @@ export const DEFAULT_LLM_SETTINGS: Readonly<LlmSettingsDefaults> = Object.freeze
     maxTokens: 2048,
     timeoutMs: 60000,
     resultDisplay: 'auto',
-    detailedLogs: false,
 });

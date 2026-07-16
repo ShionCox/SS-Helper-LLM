@@ -1,4 +1,4 @@
-import { LLM_CAPABILITY_STATUS_CHANGED_V1, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession, type WorkspacePort } from '@ss-helper/sdk';
+import { LLM_CAPABILITY_STATUS_CHANGED_V1, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
 import { BudgetManager } from '../budget/budget-manager';
 import { DisplayController } from '../display/display-controller';
 import { RequestLogService } from '../log/requestLogService';
@@ -14,7 +14,8 @@ import { BUILTIN_TAVERN_RESOURCE_ID, TaskRouter } from '../router/router';
 import { LLMSDKImpl } from '../sdk/llm-sdk';
 import type { LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
 import { createLlmSdkServiceHandlers, publishRouteChanged, type LlmServiceHandlers } from './services';
-import { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
+import { LlmWorkspaceRepository, type PreparedSettingsRuntime, type SettingsRuntimePrepareOptions } from '../storage/llm-workspace-repository';
+import { validateLlmSettings } from '../validation/settings';
 
 export interface ProductionLlmProviderRegistration {
     readonly provider: LLMProvider;
@@ -27,20 +28,14 @@ export interface ProductionLlmServiceOptions {
     readonly providers?: readonly ProductionLlmProviderRegistration[];
     readonly settings?: () => LLMHubSettings;
     readonly repository?: LlmWorkspaceRepository;
-    readonly workspace?: WorkspacePort;
 }
 
 export function createProviderFromResource(resource: ResourceConfig, apiKey: string): LLMProvider {
-    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams };
-    if (resource.type === 'rerank') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath, model: resource.model });
-    switch (resource.apiType) {
-        case 'claude': return new ClaudeProvider(base);
-        case 'gemini': return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
-        case 'deepseek':
-        case 'generic':
-        case 'openai':
-        default: return new OpenAIProvider({ ...base, apiType: resource.apiType, enableRerank: resource.capabilities?.includes('rerank') });
-    }
+    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl: fetch };
+    if (resource.type === 'rerank') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath });
+    if (resource.apiType === 'claude') return new ClaudeProvider(base);
+    if (resource.apiType === 'gemini') return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
+    return new OpenAIProvider({ ...base, apiType: resource.apiType, enableRerank: resource.capabilities?.includes('rerank') });
 }
 
 export function createProductionLlmServices(
@@ -51,7 +46,7 @@ export function createProductionLlmServices(
     const registry = new ConsumerRegistry();
     const budget = new BudgetManager();
     const display = new DisplayController();
-    const repository = options.repository ?? (options.workspace ? new LlmWorkspaceRepository(options.workspace) : undefined);
+    const repository = options.repository;
     const settingsState: { value: LLMHubSettings } = { value: options.settings?.() ?? { enabled: true, globalProfile: 'balanced', maxTokensControl: { mode: 'adaptive' } } };
     router.setRegistry(registry);
     registry.setResourceCapabilityQuery((resourceId) => router.getProviderCapabilities(resourceId));
@@ -70,33 +65,69 @@ export function createProductionLlmServices(
 
     const sdk = new LLMSDKImpl(router, budget, new RequestOrchestrator(), display, registry, new RequestLogService(repository));
     sdk.setSettingsResolver(() => { const value = settingsState.value as LLMHubSettings & Record<string, unknown>; return { ...settingsState.value, maxTokensControl: settingsState.value.maxTokensControl ?? ({ mode: value.maxTokensMode as 'inherit' | 'manual' | 'adaptive', manualValue: Number(value.maxTokens ?? 2048) }) }; });
+    let disposed = false;
+    let applyGeneration = 0;
 
-    const apply = async (settings: LLMHubSettings): Promise<void> => {
-        settingsState.value = { ...settings };
-        try { if (settings.globalProfile) sdk.setGlobalProfile(settings.globalProfile); } catch { sdk.setGlobalProfile('balanced'); }
-        router.applyGlobalAssignments(settings.globalAssignments ?? {});
-        router.applyPluginAssignments(settings.pluginAssignments ?? []);
-        router.applyTaskAssignments(settings.taskAssignments ?? []);
-        budget.replaceConfigs(settings.budgets ?? {});
-        display.restoreSilentPermissions(settings.silentPermissions ?? []);
-        const nextGenerationRoute = settings.globalAssignments?.generation?.resourceId;
-        if (nextGenerationRoute && nextGenerationRoute !== lastGenerationRoute) { publishRouteChanged(session, lastGenerationRoute, nextGenerationRoute, 'configured'); lastGenerationRoute = nextGenerationRoute; }
-        if (!repository) { notifyCapabilityChange(['generation', 'embedding', 'rerank']); return; }
+    const prepareRuntime = async (input: LLMHubSettings, options: SettingsRuntimePrepareOptions = {}): Promise<PreparedSettingsRuntime> => {
+        const generation = ++applyGeneration;
+        const settings = validateLlmSettings(input);
         const resources = Array.isArray(settings.resources) ? settings.resources : [];
-        const next = new Map<string, LLMProvider>();
-        for (const resource of resources) {
-            if (!resource || resource.enabled === false || resource.source === 'tavern') continue;
-            try {
-                const key = await repository.getResourceSecret(resource.id);
-                if (!key && resource.type !== 'rerank') continue;
-                if (!key) continue;
-                next.set(resource.id, createProviderFromResource(resource, key));
-            } catch { /* missing Secret or malformed resource keeps it visibly disabled */ }
+        const registrations: ProductionLlmProviderRegistration[] = [];
+        const built: LLMProvider[] = [];
+        const overrides = options.credentialOverrides ?? {};
+        try {
+            for (const resource of resources) {
+                if (resource.enabled === false || resource.source === 'tavern') continue;
+                let apiKey: string | null = null;
+                if (Object.prototype.hasOwnProperty.call(overrides, resource.id)) apiKey = overrides[resource.id] ?? null;
+                else if (!options.emptyCredentials && repository) apiKey = await repository.getResourceSecret(resource.id);
+                if (!apiKey) continue;
+                const provider = createProviderFromResource(resource, apiKey);
+                built.push(provider);
+                registrations.push({ provider, resourceType: resource.type, capabilities: resource.capabilities, defaultModel: resource.model });
+            }
+            const occupied = new Set(router.getAllProviders().filter((provider) => !managed.has(provider.id)).map((provider) => provider.id));
+            if (registrations.some((registration) => occupied.has(registration.provider.id))) throw new Error('Provider ID 已被占用');
+            if (disposed || generation !== applyGeneration) throw new Error('运行时应用已过期');
+        } catch (error) {
+            for (const provider of built) provider.dispose?.();
+            if (error instanceof Error && error.message === '运行时应用已过期') throw Object.assign(new Error('运行时应用已过期'), { code: 'LLM_RUNTIME_APPLY_STALE' });
+            throw Object.assign(new Error('LLM runtime apply failed'), { code: 'LLM_RUNTIME_APPLY_FAILED' });
         }
-        for (const id of managed) { router.getProvider(id)?.dispose?.(); router.removeProvider(id); }
-        managed.clear();
-        for (const [id, provider] of next) { const resource = resources.find((item) => item.id === id)!; router.registerProvider(provider, resource.type, resource.capabilities, resource.model); managed.add(id); }
-        notifyCapabilityChange(['generation', 'embedding', 'rerank']);
+
+        let committed = false;
+        let released = false;
+        return {
+            commit: (): void => {
+                if (committed || released) return;
+                if (disposed || generation !== applyGeneration) {
+                    for (const provider of built) provider.dispose?.();
+                    released = true;
+                    return;
+                }
+                const oldProviders = [...managed].map((id) => router.getProvider(id)).filter((provider): provider is LLMProvider => Boolean(provider));
+                settingsState.value = { ...settings };
+                sdk.setGlobalProfile(settings.globalProfile ?? 'balanced');
+                router.applyGlobalAssignments(settings.globalAssignments ?? {});
+                router.applyPluginAssignments(settings.pluginAssignments ?? []);
+                router.applyTaskAssignments(settings.taskAssignments ?? []);
+                budget.replaceConfigs(settings.budgets ?? {});
+                display.restoreSilentPermissions(settings.silentPermissions ?? []);
+                router.replaceManagedProviders([...managed], registrations);
+                managed.clear();
+                for (const registration of registrations) managed.add(registration.provider.id);
+                for (const provider of oldProviders) provider.dispose?.();
+                const nextGenerationRoute = settings.globalAssignments?.generation?.resourceId;
+                if (nextGenerationRoute && nextGenerationRoute !== lastGenerationRoute) { publishRouteChanged(session, lastGenerationRoute, nextGenerationRoute, 'configured'); lastGenerationRoute = nextGenerationRoute; }
+                notifyCapabilityChange(['generation', 'embedding', 'rerank']);
+                committed = true;
+            },
+            dispose: (): void => {
+                if (committed || released) return;
+                for (const provider of built) provider.dispose?.();
+                released = true;
+            },
+        };
     };
 
     const capabilityStatus = async (request: LlmCapabilityStatusRequest, signal: AbortSignal): Promise<LlmCapabilityStatusResponse> => {
@@ -118,7 +149,7 @@ export function createProductionLlmServices(
             const enabledCandidates = candidates.filter((resource) => resource.enabled !== false);
             let missingCredential = false;
             for (const resource of enabledCandidates) {
-                if (await repository?.getResourceSecret(resource.id)) break;
+                if (await repository?.hasResourceSecret(resource.id)) break;
                 missingCredential = true;
             }
             let route;
@@ -141,17 +172,19 @@ export function createProductionLlmServices(
             const resource = resources.find((item) => item.id === route.resourceId);
             if (!resource) return { ...base, configured: false, available: false, reason: 'route_unavailable' as const };
             if (resource.enabled === false) return { ...base, configured: false, available: false, reason: 'resource_disabled' as const };
-            if (repository && !(await repository.getResourceSecret(resource.id))) return { ...base, configured: false, available: false, reason: 'credential_missing' as const };
+            if (repository && !(await repository.hasResourceSecret(resource.id))) return { ...base, configured: false, available: false, reason: 'credential_missing' as const };
             return { ...base, configured: true, available: true, source: 'custom' as const, resourceId: resource.id, ...(route.model ?? resource.model ? { model: route.model ?? resource.model } : {}) };
         }));
         return { revision: statusRevision, checks: entries };
     };
 
+    const detachRuntimePreparer = repository?.attachRuntimePreparer(prepareRuntime);
     if (repository) {
         registry.setPersistCallback((snapshots) => { void repository.saveConsumers(snapshots as unknown as Record<string, import('@ss-helper/sdk').PlainData>); });
-        void repository.ready().then(async () => { const consumers = await repository.loadConsumers(); if (Object.keys(consumers).length) registry.restoreFromStorage(consumers as never); return repository.loadSettings(); }).then((settings) => apply(settings)).catch(() => undefined);
-        repository.subscribeSettings((settings) => { void apply(settings); });
+        void repository.ready().then(async () => { const consumers = await repository.loadConsumers(); if (Object.keys(consumers).length) registry.restoreFromStorage(consumers as never); return repository.loadSettings(); }).then(async (settings) => { const prepared = await prepareRuntime(settings); prepared.commit(); }).catch(() => undefined);
         repository.subscribeChanges((kinds) => notifyCapabilityChange(kinds));
+    } else {
+        void prepareRuntime(settingsState.value).then((prepared) => prepared.commit()).catch(() => undefined);
     }
     const host = session.host as unknown as HostPort;
     const unlistenGeneration = host.has?.('tavern.chat.events') && host.events ? host.events.subscribe('generation-config-changed', () => notifyCapabilityChange(['generation'])) : undefined;
@@ -160,6 +193,5 @@ export function createProductionLlmServices(
         if (display === 'fullscreen' || display === 'compact' || display === 'silent') return display;
         return kind === 'generation' ? 'compact' : 'silent';
     });
-    let disposed = false;
-    return { ...handlers, capabilityStatus, dispose(): void { if (disposed) return; disposed = true; unlistenGeneration?.(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); } };
+    return { ...handlers, capabilityStatus, dispose(): void { if (disposed) return; disposed = true; applyGeneration += 1; detachRuntimePreparer?.(); unlistenGeneration?.(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); } };
 }

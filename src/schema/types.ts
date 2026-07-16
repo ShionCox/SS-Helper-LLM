@@ -574,7 +574,7 @@ export interface RunTaskArgs<T = unknown> {
     schema?: any;
     schemaCompat?: import('./strict-json-schema').SchemaCompatOptions;
     routeHint?: { resource?: string; profile?: string; model?: string };
-    budget?: { maxTokens?: number; maxLatencyMs?: number; maxCost?: number };
+    budget?: { maxTokens?: number; maxLatencyMs?: number };
     enqueue?: RequestEnqueueOptions;
     onLifecycle?: LLMTaskLifecycleHandler;
     signal?: AbortSignal;

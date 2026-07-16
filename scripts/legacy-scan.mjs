@@ -36,7 +36,9 @@ async function files(root) {
 const violations = [];
 for (const path of await files('src')) {
   const text = await readFile(path, 'utf8');
-  for (const pattern of forbidden) if (pattern.test(text)) violations.push(`${relative('.', path)}: ${pattern}`);
+  for (const pattern of forbidden) {
+    if (pattern.test(text)) violations.push(`${relative('.', path)}: ${pattern}`);
+  }
 }
 for (const path of ['docs/integration-manual.md']) {
   const text = await readFile(path, 'utf8');

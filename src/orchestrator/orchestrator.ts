@@ -44,6 +44,11 @@ function getRunResultReasonCode<T>(result: LLMRunResult<T>): string | undefined 
     return undefined;
 }
 
+function safeFailureCode(error: unknown): string {
+    const code = error && typeof error === 'object' && 'code' in error ? (error as { code?: unknown }).code : undefined;
+    return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(code) ? code : 'LLM_REQUEST_FAILED';
+}
+
 export interface OrchestratorConfig {
     /** generation 默认 blockNextUntilOverlayClose=true */
     defaultBlockForGeneration: boolean;
@@ -469,7 +474,7 @@ export class RequestOrchestrator {
         } catch (error) {
             record.state = 'failed';
             record.finishedAt = Date.now();
-            const errMsg = (error as Error).message;
+            const errMsg = safeFailureCode(error);
             logger.error('[RequestLifecycle][Failed]', {
                 requestId: record.requestId,
                 consumer: record.consumer,
@@ -485,7 +490,7 @@ export class RequestOrchestrator {
             record.resolveOverlay?.();
             this.activeRequest = null;
             this.archiveRecord(record);
-            logger.error(`请求 ${record.requestId} 执行失败:`, error);
+            logger.error(`请求 ${record.requestId} 执行失败:`, { code: errMsg });
         }
 
         this.processing = false;

@@ -15,7 +15,7 @@ import {
 const bootstrap = await bootstrapSSHelper({
   id: 'example.consumer',
   displayName: 'Example consumer',
-  pluginVersion: '1.0.0',
+  pluginVersion: '0.3.0',
   capabilities: [],
 }, async (session) => {
   const result = await session.services.call(LLM_STRUCTURED_TASK_V1, {

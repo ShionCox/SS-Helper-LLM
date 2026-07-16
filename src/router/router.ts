@@ -15,6 +15,13 @@ import type { ConsumerRegistry } from '../registry/consumer-registry';
 /** 内置酒馆资源固定 ID */
 export const BUILTIN_TAVERN_RESOURCE_ID = '__builtin_tavern__';
 
+export interface ProviderRegistration {
+    readonly provider: LLMProvider;
+    readonly resourceType: ResourceType;
+    readonly capabilities?: readonly LLMCapability[];
+    readonly defaultModel?: string;
+}
+
 /**
  * 资源感知任务路由器
  *
@@ -66,6 +73,54 @@ export class TaskRouter {
         this.providerCapabilities.delete(resourceId);
         this.providerDefaultModels.delete(resourceId);
         this.resourceTypes.delete(resourceId);
+    }
+
+    /**
+     * Atomically replace a caller-owned provider set. All validation and map
+     * construction happens before the live maps are swapped, so a failed
+     * registration cannot leave the router partially updated.
+     */
+    replaceManagedProviders(managedIds: readonly string[], registrations: readonly ProviderRegistration[]): void {
+        const managed = new Set(managedIds);
+        const ids = new Set<string>();
+        for (const registration of registrations) {
+            const id = registration.provider.id;
+            if (ids.has(id)) throw new Error(`重复 Provider: ${id}`);
+            if (!managed.has(id) && this.providers.has(id)) throw new Error(`Provider ID 已被占用: ${id}`);
+            ids.add(id);
+        }
+
+        const providers = new Map(this.providers);
+        const capabilities = new Map(this.providerCapabilities);
+        const defaultModels = new Map(this.providerDefaultModels);
+        const resourceTypes = new Map(this.resourceTypes);
+        for (const id of managed) {
+            providers.delete(id);
+            capabilities.delete(id);
+            defaultModels.delete(id);
+            resourceTypes.delete(id);
+        }
+        for (const registration of registrations) {
+            const id = registration.provider.id;
+            providers.set(id, registration.provider);
+            resourceTypes.set(id, registration.resourceType);
+            capabilities.set(id, registration.capabilities ? [...registration.capabilities] : this.inferCapabilities(registration.provider));
+            defaultModels.set(id, registration.defaultModel);
+        }
+        this.providers = providers;
+        this.providerCapabilities = capabilities;
+        this.providerDefaultModels = defaultModels;
+        this.resourceTypes = resourceTypes;
+    }
+
+    private inferCapabilities(provider: LLMProvider): LLMCapability[] {
+        const capabilities: LLMCapability[] = [];
+        if (provider.capabilities.chat) capabilities.push('chat');
+        if (provider.capabilities.json) capabilities.push('json');
+        if (provider.capabilities.tools) capabilities.push('tools');
+        if (provider.capabilities.embeddings) capabilities.push('embeddings');
+        if (provider.capabilities.rerank) capabilities.push('rerank');
+        return capabilities;
     }
 
     // ─── 分配设置管理 ───

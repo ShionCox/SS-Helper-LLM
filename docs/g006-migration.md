@@ -4,7 +4,7 @@
 
 The historical migration established these boundaries; they are superseded by the new workspace architecture:
 
-- The LLM plugin consumes the vendored `@ss-helper/sdk@1.0.0` package rather than sibling source.
+- The LLM plugin consumes the vendored `@ss-helper/sdk@2.0.0` package rather than sibling source.
 - Core owns the plugin session, typed registration surface, ordinary settings host, popup host, and Tavern generation capability.
 - The LLM plugin exposes typed completion, structured-task, embedding, rerank, diagnostics, and route-change contracts.
 - The former `SSHelperLLMDatabase`/IndexedDB path is no longer used. No old data is discovered, migrated, imported, or deleted.

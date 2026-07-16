@@ -3,6 +3,7 @@ import type {
     RerankRequest, RerankResponse,
     ProviderConnectionResult, ProviderModelListResult,
 } from './types';
+import { providerHttpError } from './provider-errors';
 import type { ApiType } from '../schema/types';
 import { buildStructuredOutputSystemInstruction } from '../schema/structured-output';
 
@@ -20,6 +21,7 @@ export class OpenAIProvider implements LLMProvider {
     private model: string;
     public readonly apiType: ApiType;
     private customParams: Record<string, unknown>;
+    private fetchImpl: typeof fetch;
 
     constructor(config: {
         id: string;
@@ -29,6 +31,7 @@ export class OpenAIProvider implements LLMProvider {
         apiType?: ApiType;
         enableRerank?: boolean;
         customParams?: Record<string, unknown>;
+        fetchImpl?: typeof fetch;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
@@ -50,6 +53,7 @@ export class OpenAIProvider implements LLMProvider {
             embeddings: true,
             rerank: config.enableRerank === true,
         };
+        this.fetchImpl = config.fetchImpl ?? fetch;
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -222,7 +226,7 @@ export class OpenAIProvider implements LLMProvider {
     }
 
     private async sendChatCompletion(body: Record<string, any>, signal?: AbortSignal): Promise<any> {
-        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),
@@ -230,8 +234,8 @@ export class OpenAIProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`OpenAI API 请求失败: ${response.status} ${errText}`);
+            await response.text().catch(() => undefined);
+            throw providerHttpError('OpenAI', response.status);
         }
 
         return response.json();
@@ -291,7 +295,7 @@ export class OpenAIProvider implements LLMProvider {
     }
 
     async embed(req: EmbedRequest): Promise<EmbedResponse> {
-        const response = await fetch(`${this.baseUrl}/embeddings`, {
+        const response = await this.fetchImpl(`${this.baseUrl}/embeddings`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(this.withCustomParams({
@@ -302,8 +306,8 @@ export class OpenAIProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Embedding 请求失败: ${response.status} ${errText}`);
+            await response.text().catch(() => undefined);
+            throw providerHttpError('Embedding', response.status);
         }
 
         const data = await response.json();
@@ -323,7 +327,7 @@ export class OpenAIProvider implements LLMProvider {
             topK: req.topK ?? req.docs.length,
         });
 
-        const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(this.withCustomParams({
@@ -346,8 +350,8 @@ export class OpenAIProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`LLM 重排请求失败: ${response.status} ${errText}`);
+            await response.text().catch(() => undefined);
+            throw providerHttpError('Rerank', response.status);
         }
 
         const data = await response.json();
@@ -364,7 +368,7 @@ export class OpenAIProvider implements LLMProvider {
     async testConnection(): Promise<ProviderConnectionResult> {
         const start = Date.now();
         try {
-            const res = await fetch(`${this.baseUrl}/chat/completions`, {
+            const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
                 method: 'POST',
                 headers: this.buildHeaders(),
                 body: JSON.stringify(this.withCustomParams({
@@ -400,7 +404,7 @@ export class OpenAIProvider implements LLMProvider {
 
     async listModels(): Promise<ProviderModelListResult> {
         try {
-            const res = await fetch(`${this.baseUrl}/models`, {
+            const res = await this.fetchImpl(`${this.baseUrl}/models`, {
                 method: 'GET',
                 headers: { 'Authorization': `Bearer ${this.apiKey}` },
             });

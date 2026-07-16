@@ -10,6 +10,7 @@ import type {
     ProviderConnectionResult,
     ProviderModelListResult,
 } from './types';
+import { providerHttpError } from './provider-errors';
 
 export class GeminiProvider implements LLMProvider {
     id: string;
@@ -21,6 +22,7 @@ export class GeminiProvider implements LLMProvider {
     private baseUrl: string;
     private model: string;
     private customParams: Record<string, unknown>;
+    private fetchImpl: typeof fetch;
 
     constructor(config: {
         id: string;
@@ -29,6 +31,7 @@ export class GeminiProvider implements LLMProvider {
         model?: string;
         enableRerank?: boolean;
         customParams?: Record<string, unknown>;
+        fetchImpl?: typeof fetch;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
@@ -41,6 +44,7 @@ export class GeminiProvider implements LLMProvider {
             embeddings: true,
             rerank: config.enableRerank === true,
         };
+        this.fetchImpl = config.fetchImpl ?? fetch;
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -111,7 +115,7 @@ export class GeminiProvider implements LLMProvider {
             ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
         });
 
-        const response = await fetch(`${this.baseUrl}/models/${encodeURIComponent(req.model || this.model)}:generateContent`, {
+        const response = await this.fetchImpl(`${this.baseUrl}/models/${encodeURIComponent(req.model || this.model)}:generateContent`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),
@@ -119,8 +123,8 @@ export class GeminiProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Gemini API 请求失败: ${response.status} ${errText}`);
+            await response.text().catch(() => undefined);
+            throw providerHttpError('Gemini', response.status);
         }
 
         const data = await response.json();
@@ -154,7 +158,7 @@ export class GeminiProvider implements LLMProvider {
             : { content: { parts: [{ text: req.texts[0] ?? '' }] } });
 
         const modelPath = model.startsWith('models/') ? model : `models/${model}`;
-        const response = await fetch(`${this.baseUrl}/${modelPath}:${batch ? 'batchEmbedContents' : 'embedContent'}`, {
+        const response = await this.fetchImpl(`${this.baseUrl}/${modelPath}:${batch ? 'batchEmbedContents' : 'embedContent'}`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),
@@ -162,8 +166,8 @@ export class GeminiProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            const errText = await response.text();
-            throw new Error(`Gemini Embedding 请求失败: ${response.status} ${errText}`);
+            await response.text().catch(() => undefined);
+            throw providerHttpError('Gemini Embedding', response.status);
         }
 
         const data = await response.json();
@@ -210,7 +214,7 @@ export class GeminiProvider implements LLMProvider {
 
     async listModels(): Promise<ProviderModelListResult> {
         try {
-            const res = await fetch(`${this.baseUrl}/models`, {
+            const res = await this.fetchImpl(`${this.baseUrl}/models`, {
                 method: 'GET',
                 headers: this.buildHeaders(),
             });
