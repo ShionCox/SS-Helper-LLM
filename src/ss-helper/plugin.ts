@@ -74,8 +74,8 @@ export function registerLlmPopups(session: PluginSession, repository: LlmWorkspa
     return () => cleanups.reverse().forEach((cleanup) => cleanup());
 }
 
-export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute'>> {
-    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute'] }, (session) => {
+export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events'>> {
+    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events'] }, (session) => {
         const repository = new LlmWorkspaceRepository(session.workspace);
         const cleanups: Array<() => void> = [];
         try {

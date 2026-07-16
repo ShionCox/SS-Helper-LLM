@@ -35,10 +35,44 @@ class MemoryWorkspace {
 test('settings schema exposes five progressive pages and generic popup actions', () => {
   const sections = LLM_SETTINGS_SCHEMA.fields.filter((field) => field.kind === 'section');
   assert.deepEqual(sections.map((section) => section.label), ['开始', '资源', '路由', '运行', '诊断']);
-  const fields = sections.flatMap((section) => section.children);
-  assert.ok(fields.some((field) => field.id === 'globalProfile'));
-  assert.ok(fields.some((field) => field.id === 'detailedLogs'));
-  assert.ok(fields.filter((field) => field.kind === 'action').length >= 10);
+  const allFields = LLM_SETTINGS_SCHEMA.fields.flatMap(function flatten(field) {
+    return field.kind === 'section' ? [field, ...field.children.flatMap(flatten)] : [field];
+  });
+  assert.equal(new Set(allFields.map((field) => field.id)).size, allFields.length, 'settings field IDs must be globally unique');
+  assert.deepEqual(Object.fromEntries(sections.map((section) => [section.id, section.children.map((field) => field.label)])), {
+    start: ['服务状态', '生成偏好', '请求与展示'],
+    resources: ['资源管理', '能力测试'],
+    routing: ['路由配置', '高级配置'],
+    runtime: ['额度与任务', '权限与展示'],
+    diagnostics: ['检查与日志', '数据管理', '关于'],
+  });
+  assert.ok(allFields.some((field) => field.id === 'globalProfile'));
+  assert.ok(allFields.some((field) => field.id === 'detailedLogs'));
+
+  const actions = sections.flatMap((section) => section.children.flatMap(function flatten(field) {
+    if (field.kind === 'section') return field.children.flatMap(flatten);
+    return field.kind === 'action' ? [{ ...field, tabId: section.id }] : [];
+  }));
+  const expectedActions = {
+    resourceWizard: ['resources', 'open-resource-wizard', 'resource-wizard', '打开向导'],
+    resourceManager: ['resources', 'open-resource-manager', 'resource-manager', '打开'],
+    rerankTest: ['resources', 'open-rerank-test', 'rerank-test', '开始测试'],
+    routeManager: ['routing', 'open-route-manager', 'route-manager', '配置'],
+    routePreview: ['routing', 'open-route-preview', 'route-preview', '预览'],
+    advanced: ['routing', 'open-advanced', 'advanced-routing', '编辑'],
+    budgetManager: ['runtime', 'open-budget-manager', 'budget-manager', '配置'],
+    queueManager: ['runtime', 'open-queue-manager', 'queue-manager', '查看'],
+    permissionManager: ['runtime', 'open-permission-manager', 'permission-manager', '配置'],
+    displayRules: ['runtime', 'open-display-rules', 'display-rules', '配置'],
+    serviceDiagnostics: ['diagnostics', 'open-diagnostics', 'diagnostics', '运行检查'],
+    requestLogs: ['diagnostics', 'open-request-logs', 'request-logs', '查看'],
+    backup: ['diagnostics', 'open-backup', 'backup', '管理'],
+    reset: ['diagnostics', 'reset-llm', 'reset-confirm', '重置'],
+  };
+  assert.equal(actions.length, 14);
+  assert.deepEqual(Object.fromEntries(actions.map((field) => [field.id, [field.tabId, field.actionId, field.popup?.name, field.buttonLabel]])), expectedActions);
+  assert.ok(actions.every((field) => field.placement === 'inline'));
+  assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
 });
 
 test('LLM repository uses the shared workspace, encrypted Secret boundary and redacted logs', async () => {
@@ -46,8 +80,16 @@ test('LLM repository uses the shared workspace, encrypted Secret boundary and re
   const repository = new LlmWorkspaceRepository(workspace);
   await repository.ready();
   assert.ok(workspace.collections.includes('request-logs'));
-  await repository.saveSettings({ enabled: true, detailedLogs: false, globalProfile: 'economy' });
+  const expectedDefaults = { enabled: true, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000, resultDisplay: 'auto', detailedLogs: false };
+  const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
+  const initialSettings = await repository.loadSettings();
+  assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
+  assert.equal(Object.hasOwn(initialSettings, 'resources'), false);
+  await repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', label: 'Plain', enabled: false }] });
+  assert.equal(Object.hasOwn((await repository.loadSettings()).resources[0], 'customParams'), false);
+  await repository.saveSettings({ enabled: true, detailedLogs: false, globalProfile: 'economy', maxTokensMode: 'manual', maxTokens: 4096 });
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
+  assert.deepEqual(settingsDefaults(await repository.reset()), expectedDefaults);
   await repository.setResourceSecret('resource-test', 'secret-value', { label: 'Test' });
   assert.equal(await repository.getResourceSecret('resource-test'), 'secret-value');
   await repository.saveLog({ request: { taskKind: 'generation', taskDescription: 'hidden prompt', metrics: { total: 1 }, body: 'must not persist' }, response: { meta: { resourceId: 'resource-test' }, body: 'hidden response' }, state: 'completed', sourcePluginId: 'fixture' });
@@ -58,6 +100,7 @@ test('LLM repository uses the shared workspace, encrypted Secret boundary and re
   assert.equal((await repository.listSecrets()).length, 1);
   await repository.clearAll();
   assert.equal(await repository.getResourceSecret('resource-test'), undefined);
+  assert.deepEqual(settingsDefaults(await repository.loadSettings()), expectedDefaults);
   await repository.saveSettings({ enabled: true, globalProfile: 'precise' });
   assert.equal((await repository.loadSettings()).globalProfile, 'precise');
 });

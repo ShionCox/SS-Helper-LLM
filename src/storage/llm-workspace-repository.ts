@@ -3,6 +3,7 @@ import type {
     WorkspacePort,
     WorkspaceSecretMetadata,
 } from '@ss-helper/sdk';
+import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMHubSettings, ResourceConfig } from '../schema/types';
 
 export const LLM_WORKSPACE_ID = 'llm:global';
@@ -20,9 +21,10 @@ const asPlain = (value: unknown): PlainData => value as PlainData;
 export class LlmWorkspaceRepository {
     private readonly workspace: WorkspacePort;
     private initialized: Promise<void> | undefined;
-    private settings: PersistedSettings = { enabled: true, globalProfile: 'balanced', timeoutMs: 60000, resultDisplay: 'auto', detailedLogs: false };
+    private settings: PersistedSettings = { ...DEFAULT_LLM_SETTINGS };
     private settingsVersion: number | undefined;
     private readonly listeners = new Set<(settings: PersistedSettings) => void>();
+    private readonly changeListeners = new Set<(kinds: readonly ('generation' | 'embedding' | 'rerank')[]) => void>();
 
     constructor(workspace: WorkspacePort) { this.workspace = workspace; }
     async health() { return this.workspace.health(); }
@@ -41,7 +43,14 @@ export class LlmWorkspaceRepository {
         if (!opened) return;
     }
 
-    async loadSettings(): Promise<PersistedSettings> { await this.ready(); return { ...this.settings, resources: this.settings.resources?.map((item) => ({ ...item, customParams: item.customParams ? { ...item.customParams } : undefined })) }; }
+    async loadSettings(): Promise<PersistedSettings> {
+        await this.ready();
+        const resources = this.settings.resources?.map((item) => ({
+            ...item,
+            ...(item.customParams ? { customParams: { ...item.customParams } } : {}),
+        }));
+        return { ...this.settings, ...(resources === undefined ? {} : { resources }) };
+    }
 
     async saveSettings(next: LLMHubSettings & Record<string, unknown>): Promise<PersistedSettings> {
         await this.ready();
@@ -64,6 +73,7 @@ export class LlmWorkspaceRepository {
         }
         this.settings = value; this.settingsVersion = version;
         this.listeners.forEach((listener) => listener({ ...this.settings }));
+        this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
         return { ...this.settings };
     }
 
@@ -74,16 +84,20 @@ export class LlmWorkspaceRepository {
             idempotencyKey: `settings-reset-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
             operations: [{ action: 'delete', collection: 'settings', recordId: 'global', ...(this.settingsVersion === undefined ? {} : { expectedVersion: this.settingsVersion }) }],
         });
-        this.settings = { enabled: true, globalProfile: 'balanced', timeoutMs: 60000, resultDisplay: 'auto', detailedLogs: false }; this.settingsVersion = undefined;
+        this.settings = { ...DEFAULT_LLM_SETTINGS }; this.settingsVersion = undefined;
         this.listeners.forEach((listener) => listener({ ...this.settings }));
+        this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
         return { ...this.settings };
     }
 
     subscribeSettings(listener: (settings: PersistedSettings) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
+    subscribeChanges(listener: (kinds: readonly ('generation' | 'embedding' | 'rerank')[]) => void): () => void { this.changeListeners.add(listener); return () => this.changeListeners.delete(listener); }
 
     async setResourceSecret(resourceId: string, value: string, metadata: PlainData = {}): Promise<WorkspaceSecretMetadata> {
         await this.ready();
-        return this.workspace.secretSet({ workspaceId: LLM_WORKSPACE_ID, secretId: `resource:${resourceId}:api-key`, value, metadata });
+        const result = await this.workspace.secretSet({ workspaceId: LLM_WORKSPACE_ID, secretId: `resource:${resourceId}:api-key`, value, metadata });
+        this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
+        return result;
     }
 
     async getResourceSecret(resourceId: string): Promise<string | undefined> {
@@ -94,7 +108,9 @@ export class LlmWorkspaceRepository {
 
     async deleteResourceSecret(resourceId: string): Promise<boolean> {
         await this.ready();
-        return this.workspace.secretDelete({ workspaceId: LLM_WORKSPACE_ID, secretId: `resource:${resourceId}:api-key` });
+        const removed = await this.workspace.secretDelete({ workspaceId: LLM_WORKSPACE_ID, secretId: `resource:${resourceId}:api-key` });
+        if (removed) this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
+        return removed;
     }
 
     async listSecrets(): Promise<readonly WorkspaceSecretMetadata[]> {
@@ -112,9 +128,10 @@ export class LlmWorkspaceRepository {
         await this.workspace.importAll({ archive: archive as never, sha256 });
         this.settingsVersion = undefined;
         const record = await this.workspace.get({ workspaceId: LLM_WORKSPACE_ID, collection: 'settings', recordId: 'global' });
-        this.settings = record ? { ...this.settings, ...(record.value as unknown as PersistedSettings) } : { enabled: true, globalProfile: 'balanced', timeoutMs: 60000, resultDisplay: 'auto', detailedLogs: false };
+        this.settings = record ? { ...DEFAULT_LLM_SETTINGS, ...(record.value as unknown as PersistedSettings) } : { ...DEFAULT_LLM_SETTINGS };
         this.settingsVersion = record?.version;
         this.listeners.forEach((listener) => listener({ ...this.settings }));
+        this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
     }
 
     async clearAll(): Promise<void> {
@@ -122,11 +139,12 @@ export class LlmWorkspaceRepository {
         await this.workspace.clearOwned({ preserveWorkspaceIds: [] });
         // clearOwned removes the workspace itself. Re-open it before the next
         // save so a global reset leaves the plugin immediately usable.
+        this.settings = { ...DEFAULT_LLM_SETTINGS };
         this.initialized = undefined;
         await this.ready();
         this.settingsVersion = undefined;
-        this.settings = { enabled: true, globalProfile: 'balanced', timeoutMs: 60000, resultDisplay: 'auto', detailedLogs: false };
         this.listeners.forEach((listener) => listener({ ...this.settings }));
+        this.changeListeners.forEach((listener) => listener(['generation', 'embedding', 'rerank']));
     }
 
     async saveLog(entry: PlainData): Promise<void> {

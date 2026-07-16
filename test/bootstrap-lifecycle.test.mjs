@@ -20,7 +20,7 @@ function coreDescriptor(generation, overrides = {}) {
   return {
     kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: '1.0.0', sdkPackageVersion: '1.0.0',
     apiMajor: API_MAJOR, apiMinor: API_MINOR, generation, state: 'ready',
-    capabilities: ['tavern.generation.read', 'tavern.generation.execute'],
+    capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events'],
     artifact: { buildId: `fixture-${generation}`, contentDigest: 'a'.repeat(64) },
     ...overrides,
   };

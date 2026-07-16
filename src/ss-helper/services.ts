@@ -1,10 +1,10 @@
 import {
-    LLM_COMPLETION_V1, LLM_EMBEDDING_V1, LLM_RERANK_V1, LLM_ROUTE_CHANGED_V1,
+    LLM_COMPLETION_V1, LLM_EMBEDDING_V1, LLM_RERANK_V1, LLM_ROUTE_CHANGED_V1, LLM_CAPABILITY_STATUS_V1,
     LLM_ROUTE_DIAGNOSTICS_V1, LLM_STRUCTURED_TASK_V1, LLM_CONSUMER_REGISTER_V1, LLM_CONSUMER_UNREGISTER_V1, LLM_WAIT_FOR_DISPLAY_V1, SSHelperError,
     type LlmCompletionRequest, type LlmCompletionResponse, type LlmEmbeddingRequest,
     type LlmEmbeddingResponse, type LlmRerankRequest, type LlmRerankResponse,
     type LlmRouteDiagnostic, type LlmRouteDiagnosticsResponse, type LlmRouteMetadata,
-    type LlmStructuredTaskRequest, type LlmStructuredTaskResponse, type PlainData, type PluginSession,
+    type LlmStructuredTaskRequest, type LlmStructuredTaskResponse, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PlainData, type PluginSession,
 } from '@ss-helper/sdk';
 import type { EmbedArgs, LLMRunResult, RerankArgs, RunTaskArgs } from '../schema/types';
 
@@ -18,6 +18,7 @@ export interface LlmServiceHandlers {
     readonly unregisterConsumer?: (request: { keepPersistent?: boolean }, callerPluginId: string) => void;
     readonly waitForDisplay?: (request: { requestId: string }) => Promise<{ closed: boolean }>;
     readonly diagnostics: () => Promise<LlmRouteDiagnosticsResponse> | LlmRouteDiagnosticsResponse;
+    readonly capabilityStatus?: (request: LlmCapabilityStatusRequest, signal: AbortSignal, callerPluginId?: string) => Promise<LlmCapabilityStatusResponse>;
     readonly dispose?: () => void;
 }
 export interface LlmSdkServicePort {
@@ -96,6 +97,7 @@ export function exposeLlmServices(session: PluginSession, handlers: LlmServiceHa
         session.services.expose(LLM_EMBEDDING_V1, (request, context) => handlers.embed(request, context.signal, context.callerPluginId)),
         session.services.expose(LLM_RERANK_V1, (request, context) => handlers.rerank(request, context.signal, context.callerPluginId)),
         session.services.expose(LLM_ROUTE_DIAGNOSTICS_V1, () => handlers.diagnostics()),
+        ...(handlers.capabilityStatus === undefined ? [] : [session.services.expose(LLM_CAPABILITY_STATUS_V1, (request, context) => handlers.capabilityStatus!(request, context.signal, context.callerPluginId))]),
         session.services.expose(LLM_CONSUMER_REGISTER_V1, (request, context) => { handlers.registerConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
         session.services.expose(LLM_CONSUMER_UNREGISTER_V1, (request, context) => { handlers.unregisterConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
         session.services.expose(LLM_WAIT_FOR_DISPLAY_V1, (request) => handlers.waitForDisplay ? handlers.waitForDisplay(request) : Promise.resolve({ closed: true })),
