@@ -1,64 +1,88 @@
 import { bootstrapSSHelper, type PluginSession, type SessionBootstrap } from '@ss-helper/sdk';
 import { logger } from '../runtime/logger';
-import { createLlmSettingsAdapter, LLM_ADVANCED_ROUTING_KEY, LLM_SETTINGS_SCHEMA, loadLlmSettings } from './settings';
+import { createWorkspaceLlmSettingsAdapter, LLM_SETTINGS_SCHEMA } from './settings';
 import { exposeLlmServices, type LlmServiceHandlers } from './services';
 import { createProductionLlmServices } from './llm-service-runtime';
+import { createProviderFromResource } from './llm-service-runtime';
+import { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
+import type { LLMCapability, ResourceConfig } from '../schema/types';
+import config from '../../plugin.config.json' with { type: 'json' };
 
-const POPUP_TOKEN = { kind: 'popup', provider: 'ss-helper.llm', name: 'advanced-routing', version: 1 } as const;
+const POPUP_NAMES = ['resource-wizard', 'resource-manager', 'rerank-test', 'route-manager', 'route-preview', 'advanced-routing', 'budget-manager', 'queue-manager', 'permission-manager', 'display-rules', 'diagnostics', 'request-logs', 'backup', 'reset-confirm'] as const;
+type PopupName = typeof POPUP_NAMES[number];
 
 export interface StartLlmPluginOptions {
     pluginVersion: string;
     services?: LlmServiceHandlers;
     target?: { addEventListener(type: string, listener: EventListener): void; removeEventListener(type: string, listener: EventListener): void };
-    storage?: Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
 }
 
-export function registerLlmPopup(session: PluginSession, storage: Pick<Storage, 'getItem' | 'setItem'>): () => void {
-    return session.registerPopup({
-        token: POPUP_TOKEN,
-        title: 'LLM 高级路由配置',
-        ariaLabel: '编辑 LLM 高级路由配置',
-        render(container): () => void {
-            const textarea = document.createElement('textarea');
-            textarea.setAttribute('aria-label', 'LLM 路由 JSON');
-            textarea.value = storage.getItem(LLM_ADVANCED_ROUTING_KEY) ?? '{}';
-            textarea.style.width = '100%';
-            textarea.style.minHeight = '18rem';
-            const save = document.createElement('button');
-            save.type = 'button';
-            save.textContent = '保存';
-            const status = document.createElement('p');
-            const onSave = (): void => {
-                try { JSON.parse(textarea.value); storage.setItem(LLM_ADVANCED_ROUTING_KEY, textarea.value); status.textContent = '已保存'; }
-                catch { status.textContent = 'JSON 格式无效'; }
-            };
-            save.addEventListener('click', onSave);
-            container.append(textarea, save, status);
-            return () => save.removeEventListener('click', onSave);
-        },
-    });
+function button(text: string): HTMLButtonElement { const value = document.createElement('button'); value.type = 'button'; value.textContent = text; value.className = 'stx-ui-btn'; return value; }
+function field(label: string, type: string, value = ''): HTMLInputElement { const input = document.createElement('input'); input.type = type; input.value = value; input.className = 'text_pole'; input.setAttribute('aria-label', label); return input; }
+
+async function renderPopup(container: HTMLElement, name: PopupName, repository: LlmWorkspaceRepository): Promise<() => void> {
+    const title = document.createElement('h3'); title.textContent = ({ 'resource-wizard': '添加资源', 'resource-manager': '资源管理', 'rerank-test': 'Rerank 测试', 'route-manager': '路由分配', 'route-preview': '路由预览', 'advanced-routing': '高级规则', 'budget-manager': '额度与熔断', 'queue-manager': '请求队列', 'permission-manager': '后台权限', 'display-rules': '展示规则', diagnostics: '服务检查', 'request-logs': '请求日志', backup: '配置导入导出', 'reset-confirm': '全局重置' } as Record<PopupName, string>)[name];
+    const body = document.createElement('div'); body.className = 'ss-helper-llm-popup-body'; container.append(title, body);
+    if (name === 'resource-wizard') {
+        const type = document.createElement('select'); type.className = 'text_pole'; type.setAttribute('aria-label', '资源用途'); ['generation', 'embedding', 'rerank'].forEach((value) => { const option = document.createElement('option'); option.value = value; option.textContent = value === 'generation' ? '生成' : value === 'embedding' ? '向量化' : '重排序'; type.append(option); });
+        const api = document.createElement('select'); api.className = 'text_pole'; api.setAttribute('aria-label', '服务模板'); ['openai', 'deepseek', 'claude', 'gemini', 'generic'].forEach((value) => { const option = document.createElement('option'); option.value = value; option.textContent = value; api.append(option); });
+        const label = field('资源名称', 'text'); const baseUrl = field('Base URL', 'url'); const model = field('默认模型', 'text'); const key = field('API Key', 'password');
+        const save = button('测试并保存'); const status = document.createElement('p');
+        save.addEventListener('click', async () => { try { const id = `resource-${Date.now().toString(36)}`; const settings = await repository.loadSettings(); const capabilities: LLMCapability[] = type.value === 'rerank' ? ['rerank'] : type.value === 'embedding' ? ['embeddings'] : ['chat', 'json']; const resource: ResourceConfig = { id, type: type.value as ResourceConfig['type'], source: 'custom', apiType: api.value as ResourceConfig['apiType'], label: label.value.trim() || id, baseUrl: baseUrl.value.trim(), model: model.value.trim(), enabled: false, capabilities };
+            await repository.saveSettings({ ...settings, resources: [...(settings.resources ?? []), resource] }); if (key.value) await repository.setResourceSecret(id, key.value, { label: resource.label }); status.textContent = '配置已保存；连接测试通过后可启用。'; } catch (error) { status.textContent = `保存失败：${error instanceof Error ? error.message : String(error)}`; } });
+        body.append(document.createTextNode('步骤 1：选择用途'), type, document.createTextNode('步骤 2：选择模板'), api, label, baseUrl, key, model, save, status);
+    } else if (name === 'resource-manager') {
+        const search = field('搜索资源', 'search'); const usage = document.createElement('select'); usage.className = 'text_pole'; usage.setAttribute('aria-label', '按用途筛选'); for (const value of ['all', 'generation', 'embedding', 'rerank']) { const option = document.createElement('option'); option.value = value; option.textContent = value === 'all' ? '全部用途' : value === 'generation' ? '生成' : value === 'embedding' ? '向量化' : '重排序'; usage.append(option); } const list = document.createElement('div'); const refresh = button('刷新'); const status = document.createElement('p');
+        const load = async (): Promise<void> => { list.replaceChildren(); const settings = await repository.loadSettings(); const query = search.value.trim().toLowerCase(); for (const resource of settings.resources ?? []) { if (usage.value !== 'all' && resource.type !== usage.value) continue; if (query && !`${resource.id} ${resource.label} ${resource.type} ${resource.apiType ?? ''}`.toLowerCase().includes(query)) continue; const row = document.createElement('div'); row.className = 'stx-settings-row'; const labelText = document.createElement('span'); labelText.textContent = `${resource.label} · ${resource.type} · ${resource.enabled === false ? '停用' : '启用'}`; const toggle = button(resource.enabled === false ? '启用' : '停用'); const edit = button('编辑'); const secret = button('替换密钥'); const copy = button('复制'); const test = button('测试连接'); const models = button('获取模型'); const remove = button('删除');
+            toggle.addEventListener('click', async () => { const latest = await repository.loadSettings(); await repository.saveSettings({ ...latest, resources: latest.resources?.map((item) => item.id === resource.id ? { ...item, enabled: item.enabled === false } : item) ?? [] }); await load(); });
+            edit.addEventListener('click', async () => { const latest = await repository.loadSettings(); const label = typeof window !== 'undefined' ? window.prompt('资源名称', resource.label) : resource.label; if (!label) return; const baseUrl = typeof window !== 'undefined' ? window.prompt('Base URL', resource.baseUrl ?? '') : resource.baseUrl; const model = typeof window !== 'undefined' ? window.prompt('默认模型', resource.model ?? '') : resource.model; await repository.saveSettings({ ...latest, resources: latest.resources?.map((item) => item.id === resource.id ? { ...item, label, baseUrl: baseUrl?.trim(), model: model?.trim() } : item) ?? [] }); await load(); });
+            secret.addEventListener('click', async () => { const value = typeof window !== 'undefined' ? window.prompt('API Key（留空则删除）', '') : ''; if (value === null) return; if (value.trim()) await repository.setResourceSecret(resource.id, value.trim(), { label: resource.label }); else await repository.deleteResourceSecret(resource.id); status.textContent = value.trim() ? '密钥已替换并加密保存。' : '密钥已删除，资源已停用。'; if (!value.trim()) { const latest = await repository.loadSettings(); await repository.saveSettings({ ...latest, resources: latest.resources?.map((item) => item.id === resource.id ? { ...item, enabled: false } : item) ?? [] }); } await load(); });
+            copy.addEventListener('click', async () => { const latest = await repository.loadSettings(); const id = `resource-${Date.now().toString(36)}`; const clone = { ...resource, id, label: `${resource.label}（副本）`, enabled: false }; await repository.saveSettings({ ...latest, resources: [...(latest.resources ?? []), clone] }); const secret = await repository.getResourceSecret(resource.id); if (secret) await repository.setResourceSecret(id, secret, { label: clone.label }); await load(); });
+            test.addEventListener('click', async () => { try { const key = await repository.getResourceSecret(resource.id); if (!key) throw new Error('这个资源缺少密钥'); const provider = createProviderFromResource(resource, key); const result = await provider.testConnection?.(); status.textContent = result?.ok ? `${resource.label}：连接成功` : `${resource.label}：${result?.message ?? '连接失败'}`; if (result?.ok) { const latest = await repository.loadSettings(); await repository.saveSettings({ ...latest, resources: latest.resources?.map((item) => item.id === resource.id ? { ...item, enabled: true } : item) ?? [] }); } provider.dispose?.(); await load(); } catch (error) { status.textContent = `测试失败：${error instanceof Error ? error.message : String(error)}`; } });
+            models.addEventListener('click', async () => { try { const key = await repository.getResourceSecret(resource.id); if (!key) throw new Error('这个资源缺少密钥'); const provider = createProviderFromResource(resource, key); const result = await provider.listModels?.(); status.textContent = result?.ok ? `${resource.label}：${result.models.length} 个模型` : `${resource.label}：${result?.message ?? '获取失败'}`; provider.dispose?.(); } catch (error) { status.textContent = `获取失败：${error instanceof Error ? error.message : String(error)}`; } });
+            remove.addEventListener('click', async () => { const latest = await repository.loadSettings(); await repository.saveSettings({ ...latest, resources: latest.resources?.filter((item) => item.id !== resource.id) ?? [] }); await repository.deleteResourceSecret(resource.id); await load(); });
+            row.append(labelText, toggle, edit, secret, copy, test, models, remove); list.append(row); } if (!(settings.resources ?? []).length) status.textContent = '当前使用酒馆模型。添加资源后可以使用其他服务。'; };
+        search.addEventListener('input', () => { void load(); }); usage.addEventListener('change', () => { void load(); }); refresh.addEventListener('click', () => { void load(); }); body.append(search, usage, refresh, list, status); void load();
+    } else if (name === 'rerank-test') {
+        const query = field('Query', 'text'); const docs = document.createElement('textarea'); docs.className = 'text_pole'; docs.placeholder = '每行一个候选文档'; const topK = field('Top K', 'number', '3'); const resource = document.createElement('select'); resource.className = 'text_pole'; resource.setAttribute('aria-label', 'Rerank 资源'); const settings = await repository.loadSettings(); for (const item of settings.resources ?? []) if (item.type === 'rerank') { const option = document.createElement('option'); option.value = item.id; option.textContent = item.label; resource.append(option); } const run = button('运行测试'); const result = document.createElement('pre'); run.addEventListener('click', async () => { try { const item = (await repository.loadSettings()).resources?.find((candidate) => candidate.id === resource.value); if (!item) throw new Error('还没有重排序资源，添加后才能使用模型排序。'); const key = await repository.getResourceSecret(item.id); if (!key) throw new Error('这个资源缺少密钥，填写并测试后才能启用。'); const provider = createProviderFromResource(item, key); const response = await provider.rerank?.({ query: query.value, docs: docs.value.split(/\r?\n/).filter(Boolean), topK: Number(topK.value) || 3, model: item.model }); result.textContent = JSON.stringify(response?.results ?? [], null, 2); provider.dispose?.(); } catch (error) { result.textContent = `测试失败：${error instanceof Error ? error.message : String(error)}`; } }); body.append(query, docs, topK, resource, run, result);
+    } else if (name === 'advanced-routing') {
+        const area = document.createElement('textarea'); area.className = 'text_pole'; area.style.minHeight = '20rem'; const settings = await repository.loadSettings(); area.value = JSON.stringify(settings, null, 2); const save = button('校验并应用'); const status = document.createElement('p'); save.addEventListener('click', async () => { try { const parsed = JSON.parse(area.value) as Record<string, unknown>; await repository.saveSettings(parsed); status.textContent = '已校验并应用。'; } catch (error) { status.textContent = `JSON 无效：${error instanceof Error ? error.message : String(error)}`; } }); body.append(area, save, status);
+    } else if (name === 'backup') {
+        const exportButton = button('导出配置'); const importButton = button('导入配置'); const area = document.createElement('textarea'); area.className = 'text_pole'; area.placeholder = '粘贴备份 JSON'; const status = document.createElement('p'); exportButton.addEventListener('click', async () => { const value = await repository.exportConfig(); area.value = JSON.stringify(value); status.textContent = '已生成备份（不包含密钥）。'; }); importButton.addEventListener('click', async () => { try { const value = JSON.parse(area.value) as { archive: unknown; sha256: string }; await repository.importConfig(value.archive as never, value.sha256); status.textContent = '恢复完成。'; } catch (error) { status.textContent = `恢复失败：${error instanceof Error ? error.message : String(error)}`; } }); body.append(exportButton, importButton, area, status);
+    } else if (name === 'reset-confirm') {
+        const confirmButton = button('确认清空 LLM 配置'); confirmButton.className += ' danger'; const status = document.createElement('p'); confirmButton.addEventListener('click', async () => { await repository.clearAll(); status.textContent = '已恢复酒馆零配置状态。'; }); body.append(document.createTextNode('此操作会删除 LLM 资源、路由、额度、日志和密钥。'), confirmButton, status);
+    } else if (name === 'request-logs') {
+        const search = field('搜索日志', 'search'); const state = document.createElement('select'); state.className = 'text_pole'; state.setAttribute('aria-label', '状态筛选'); for (const value of ['all', 'completed', 'failed', 'queued', 'running', 'cancelled']) { const option = document.createElement('option'); option.value = value; option.textContent = value === 'all' ? '全部状态' : value; state.append(option); } const pluginFilter = field('插件筛选', 'text'); const resourceFilter = field('资源筛选', 'text'); const refresh = button('刷新'); const clear = button('清空'); const copy = button('复制'); const exportButton = button('导出'); const list = document.createElement('pre'); const status = document.createElement('p');
+        const load = async (): Promise<void> => { const entries = await repository.queryLogs({ limit: 100, search: search.value, state: state.value, sourcePluginId: pluginFilter.value.trim() || undefined, resourceId: resourceFilter.value.trim() || undefined }); list.textContent = JSON.stringify(entries, null, 2); status.textContent = `${entries.length} 条日志；默认只保存摘要，详细正文遵循设置中的脱敏开关。`; };
+        search.addEventListener('input', () => { void load(); }); state.addEventListener('change', () => { void load(); }); pluginFilter.addEventListener('input', () => { void load(); }); resourceFilter.addEventListener('input', () => { void load(); }); refresh.addEventListener('click', () => { void load(); }); clear.addEventListener('click', async () => { const removed = await repository.clearLogs(); status.textContent = `已清空 ${removed} 条日志。`; await load(); }); copy.addEventListener('click', () => { void navigator.clipboard?.writeText(list.textContent ?? ''); }); exportButton.addEventListener('click', () => { const blob = new Blob([list.textContent ?? '[]'], { type: 'application/json' }); const url = URL.createObjectURL(blob); const anchor = document.createElement('a'); anchor.href = url; anchor.download = 'ss-helper-llm-request-logs.json'; anchor.click(); URL.revokeObjectURL(url); }); body.append(search, state, pluginFilter, resourceFilter, refresh, clear, copy, exportButton, status, list); void load();
+    } else if (name === 'diagnostics') {
+        const output = document.createElement('pre'); body.append(output); try { const health = await repository.health(); output.textContent = JSON.stringify({ ...health, secretReady: health.secretReady === true ? '可用' : '不可用' }, null, 2); } catch (error) { output.textContent = `workspace 不可用：${error instanceof Error ? error.message : String(error)}`; }
+    } else if (name === 'route-manager' || name === 'budget-manager' || name === 'permission-manager' || name === 'display-rules') {
+        const settings = await repository.loadSettings(); const area = document.createElement('textarea'); area.className = 'text_pole'; area.style.minHeight = '15rem'; const key = name === 'route-manager' ? 'globalAssignments' : name === 'budget-manager' ? 'budgets' : name === 'permission-manager' ? 'silentPermissions' : 'resultDisplay'; area.value = JSON.stringify((settings as Record<string, unknown>)[key] ?? (name === 'display-rules' ? 'auto' : {}), null, 2); const save = button('应用'); const status = document.createElement('p'); save.addEventListener('click', async () => { try { const value = JSON.parse(area.value) as unknown; await repository.saveSettings({ ...(await repository.loadSettings()), [key]: value }); status.textContent = '已应用，正在热加载。'; } catch (error) { status.textContent = `配置无效：${error instanceof Error ? error.message : String(error)}`; } }); body.append(area, save, status);
+    } else if (name === 'route-preview') {
+        const settings = await repository.loadSettings(); const output = document.createElement('pre'); output.textContent = JSON.stringify({ priority: ['调用指定', '任务分配', '任务推荐', '插件分配', '全局分配', '酒馆', '能力 fallback'], globalAssignments: settings.globalAssignments ?? {}, pluginAssignments: settings.pluginAssignments ?? [], taskAssignments: settings.taskAssignments ?? [] }, null, 2); body.append(output);
+    } else if (name === 'queue-manager') {
+        const output = document.createElement('p'); output.textContent = '队列由 LLM Runtime 实时管理；正在等待的任务会显示在请求日志中。'; body.append(output);
+    } else {
+        const settings = await repository.loadSettings(); const output = document.createElement('pre'); output.textContent = JSON.stringify(settings, null, 2); body.append(output);
+    }
+    return () => undefined;
+}
+
+export function registerLlmPopups(session: PluginSession, repository: LlmWorkspaceRepository): () => void {
+    const cleanups = POPUP_NAMES.map((name) => session.registerPopup({ token: { kind: 'popup', provider: 'ss-helper.llm', name, version: 2 }, title: 'SS-Helper LLM', ariaLabel: `LLM ${name}`, render: (container) => { let disposed = false; void renderPopup(container, name, repository).catch((error) => { if (!disposed) container.textContent = `加载失败：${error instanceof Error ? error.message : String(error)}`; }); return () => { disposed = true; container.replaceChildren(); }; } }));
+    return () => cleanups.reverse().forEach((cleanup) => cleanup());
 }
 
 export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute'>> {
-    const storage = options.storage ?? localStorage;
-    return bootstrapSSHelper({
-        id: 'ss-helper.llm',
-        displayName: 'SS-Helper LLM',
-        pluginVersion: options.pluginVersion,
-        capabilities: ['tavern.generation.read', 'tavern.generation.execute'],
-    }, (session) => {
+    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute'] }, (session) => {
+        const repository = new LlmWorkspaceRepository(session.workspace);
         const cleanups: Array<() => void> = [];
         try {
-            cleanups.push(session.registerSettings(LLM_SETTINGS_SCHEMA, createLlmSettingsAdapter(storage)));
-            cleanups.push(registerLlmPopup(session, storage));
-            cleanups.push(exposeLlmServices(session, options.services ?? createProductionLlmServices(session, {
-                settings: () => ({ enabled: loadLlmSettings(storage).enabled !== false }),
-            })));
-        } catch (error) {
-            cleanups.reverse().forEach((cleanup) => cleanup());
-            session.dispose();
-            throw error;
-        }
+            cleanups.push(session.registerSettings(LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter(repository)));
+            cleanups.push(registerLlmPopups(session, repository));
+            cleanups.push(exposeLlmServices(session, options.services ?? createProductionLlmServices(session, { repository })));
+        } catch (error) { cleanups.reverse().forEach((cleanup) => cleanup()); session.dispose(); throw error; }
         void session.closed.then(() => cleanups.reverse().forEach((cleanup) => cleanup())).catch((error) => logger.error('Session cleanup failed', error));
     }, { target: options.target });
 }

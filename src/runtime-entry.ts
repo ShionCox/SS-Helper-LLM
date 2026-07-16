@@ -1,5 +1,5 @@
-import manifest from '../manifest.json';
-import type { SessionBootstrap } from '@ss-helper/sdk';
+import config from '../plugin.config.json' with { type: 'json' };
+import { ensureHostedCore, type SessionBootstrap } from '@ss-helper/sdk';
 import { logger } from './runtime/logger';
 import { startLlmPlugin } from './ss-helper/plugin';
 
@@ -7,7 +7,8 @@ let activeBootstrap: Promise<SessionBootstrap<'tavern.generation.read' | 'tavern
 
 export async function startLLMHubRuntime(): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute'>> {
     try {
-        activeBootstrap ??= startLlmPlugin({ pluginVersion: manifest.version });
+        await ensureHostedCore();
+        activeBootstrap ??= startLlmPlugin({ pluginVersion: config.manifest.version });
         const bootstrap = await activeBootstrap;
         void bootstrap.closed.catch((error) => logger.error('SS-Helper Core reconnect stopped', error));
         return bootstrap;

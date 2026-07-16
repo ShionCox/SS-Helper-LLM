@@ -148,11 +148,13 @@ export class GeminiProvider implements LLMProvider {
 
     async embed(req: EmbedRequest): Promise<EmbedResponse> {
         const model = req.model || this.model || 'gemini-embedding-001';
-        const body = this.withCustomParams({
-            contents: req.texts,
-        });
+        const batch = req.texts.length > 1;
+        const body = this.withCustomParams(batch
+            ? { requests: req.texts.map((text) => ({ model: `models/${model}`, content: { parts: [{ text }] } })) }
+            : { content: { parts: [{ text: req.texts[0] ?? '' }] } });
 
-        const response = await fetch(`${this.baseUrl}/models/${encodeURIComponent(model)}:embedContent`, {
+        const modelPath = model.startsWith('models/') ? model : `models/${model}`;
+        const response = await fetch(`${this.baseUrl}/${modelPath}:${batch ? 'batchEmbedContents' : 'embedContent'}`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),

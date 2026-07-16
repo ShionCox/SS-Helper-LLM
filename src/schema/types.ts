@@ -431,6 +431,7 @@ export interface ResourceConfig {
 /** 单条分配项 —— 只保存 resourceId */
 export interface AssignmentEntry {
     resourceId: string;
+    model?: string;
 }
 
 /** 全局 max_tokens 控制模式 */
@@ -473,6 +474,7 @@ export interface TaskAssignment {
     taskKey: string;
     taskKind: CapabilityKind;
     resourceId?: string;
+    model?: string;
     maxTokens?: number;
     isStale: boolean;
     staleReason?: string;
@@ -488,6 +490,11 @@ export interface SilentPermissionGrant {
 /** LLMHub 完整设置 */
 export interface LLMHubSettings {
     enabled?: boolean;
+    timeoutMs?: number;
+    maxTokensMode?: MaxTokensMode;
+    maxTokens?: number;
+    resultDisplay?: 'auto' | 'silent' | 'compact' | 'fullscreen';
+    detailedLogs?: boolean;
     globalProfile?: string;
     /** 全局 max_tokens 控制 */
     maxTokensControl?: GlobalMaxTokensControl;

@@ -42,6 +42,21 @@ export class BudgetManager {
         this.configs.delete(consumer);
     }
 
+    replaceConfigs(configs: Record<string, BudgetConfig> = {}): void {
+        this.configs.clear();
+        for (const [consumer, config] of Object.entries(configs)) this.configs.set(consumer, { ...config });
+    }
+
+    resetCircuit(consumer?: string): void {
+        if (consumer) this.states.delete(consumer);
+        else this.states.clear();
+    }
+
+    getCircuitState(consumer: string): { consecutiveFailures: number; openUntil: number } {
+        const state = this.getState(consumer);
+        return { consecutiveFailures: state.consecutiveFailures, openUntil: state.circuitOpenUntil };
+    }
+
     /**
      * 取得或初始化 consumer 状态
      */

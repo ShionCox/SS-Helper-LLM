@@ -125,8 +125,8 @@ export class DisplayController {
         // silent 权限检查
         if (mode === 'silent') {
             if (!this.canUseSilent(pluginId, taskKey, backgroundEligible)) {
-                logger.warn(`插件 ${pluginId} 任务 ${taskKey} 无 silent 权限，紧凑弹窗已禁用，保持静默执行`);
-                return 'silent';
+                logger.warn(`插件 ${pluginId} 任务 ${taskKey} 无 silent 权限，已降级为紧凑弹窗`);
+                return 'compact';
             }
             return 'silent';
         }

@@ -14,9 +14,6 @@ importers:
       '@ss-helper/sdk':
         specifier: file:vendor/ss-helper-sdk-1.0.0.tgz
         version: file:vendor/ss-helper-sdk-1.0.0.tgz
-      dexie:
-        specifier: ^4.2.1
-        version: 4.4.4
       zod:
         specifier: ^4.3.6
         version: 4.4.3
@@ -27,9 +24,6 @@ importers:
       esbuild:
         specifier: ^0.25.0
         version: 0.25.12
-      fake-indexeddb:
-        specifier: ^6.2.4
-        version: 6.2.5
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
@@ -193,24 +187,17 @@ packages:
     os: [win32]
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-1.0.0.tgz':
-    resolution: {integrity: sha512-3YZEafFJLhjt0M797T7618LAs9NUxoafm5bOsvCfAKh7V9nYF/dGtgMuPDr3fK137YuXfFsFiyshK9WhJBM5xw==, tarball: file:vendor/ss-helper-sdk-1.0.0.tgz}
+    resolution: {integrity: sha512-D9vSC8OnbuumPasd4OB7j+FZpSjcr9fp1dBv9I2nPUlzBqaSl1vtFqBXfoyixk9emDKGlZYjO6m6HlhfIk2a3Q==, tarball: file:vendor/ss-helper-sdk-1.0.0.tgz}
     version: 1.0.0
     engines: {node: '>=20'}
 
   '@types/node@25.3.3':
     resolution: {integrity: sha512-DpzbrH7wIcBaJibpKo9nnSQL0MTRdnWttGyE5haGwK86xgMOkFLp7vEyfQPGLOJh5wNYiJ3V9PmUMDhV9u8kkQ==}
 
-  dexie@4.4.4:
-    resolution: {integrity: sha512-jIwsYI8Os2hgnqc6O49YwFDKGc5v5QjGx0wPVp543ip1F53VFAKMLthV2pQosQcVTv3eAskTWYspOx195PM0FQ==}
-
   esbuild@0.25.12:
     resolution: {integrity: sha512-bbPBYYrtZbkt6Os6FiTLCTFxvq4tt3JKall1vRwshA3fdVztsLAatFaZobhkBC8/BrPetoa0oksYoKXoG4ryJg==}
     engines: {node: '>=18'}
     hasBin: true
-
-  fake-indexeddb@6.2.5:
-    resolution: {integrity: sha512-CGnyrvbhPlWYMngksqrSSUT1BAVP49dZocrHuK0SvtR0D5TMs5wP0o3j7jexDJW01KSadjBp1M/71o/KR3nD1w==}
-    engines: {node: '>=18'}
 
   typescript@5.9.3:
     resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
@@ -309,8 +296,6 @@ snapshots:
     dependencies:
       undici-types: 7.18.2
 
-  dexie@4.4.4: {}
-
   esbuild@0.25.12:
     optionalDependencies:
       '@esbuild/aix-ppc64': 0.25.12
@@ -339,8 +324,6 @@ snapshots:
       '@esbuild/win32-arm64': 0.25.12
       '@esbuild/win32-ia32': 0.25.12
       '@esbuild/win32-x64': 0.25.12
-
-  fake-indexeddb@6.2.5: {}
 
   typescript@5.9.3: {}
 

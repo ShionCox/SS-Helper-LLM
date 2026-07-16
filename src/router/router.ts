@@ -112,7 +112,7 @@ export class TaskRouter {
                 if (this.providerSatisfies(assignment.resourceId, requiredCapabilities)) {
                     return {
                         resourceId: assignment.resourceId,
-                        model: this.resolveDefaultModel(assignment.resourceId),
+                        model: assignment.model || this.resolveDefaultModel(assignment.resourceId),
                         resolvedBy: 'user_task_override',
                     };
                 }
@@ -126,6 +126,7 @@ export class TaskRouter {
                 if (this.providerSatisfies(taskDesc.recommendedRoute.resourceId, requiredCapabilities)) {
                     return {
                         resourceId: taskDesc.recommendedRoute.resourceId,
+                        model: this.resolveDefaultModel(taskDesc.recommendedRoute.resourceId),
                         profileId: taskDesc.recommendedRoute.profileId,
                         resolvedBy: 'plugin_task_recommend',
                     };
@@ -140,7 +141,7 @@ export class TaskRouter {
             if (this.providerSatisfies(pluginEntry.resourceId, requiredCapabilities)) {
                 return {
                     resourceId: pluginEntry.resourceId,
-                    model: this.resolveDefaultModel(pluginEntry.resourceId),
+                    model: pluginEntry.model || this.resolveDefaultModel(pluginEntry.resourceId),
                     resolvedBy: 'user_plugin_default',
                 };
             }
@@ -152,7 +153,7 @@ export class TaskRouter {
             if (this.providerSatisfies(globalEntry.resourceId, requiredCapabilities)) {
                 return {
                     resourceId: globalEntry.resourceId,
-                    model: this.resolveDefaultModel(globalEntry.resourceId),
+                    model: globalEntry.model || this.resolveDefaultModel(globalEntry.resourceId),
                     resolvedBy: 'user_global_default',
                 };
             }

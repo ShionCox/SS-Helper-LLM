@@ -32,7 +32,7 @@ export class OpenAIProvider implements LLMProvider {
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
-        this.baseUrl = config.baseUrl || 'https://api.openai.com/v1';
+        this.baseUrl = (config.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
         this.model = config.model || 'gpt-4o-mini';
         this.apiType = config.apiType === 'deepseek'
             ? 'deepseek'

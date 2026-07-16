@@ -1,10 +1,5 @@
-import {
-    appendLlmRequestLog,
-    clearLlmRequestLogs,
-    queryLlmRequestLogs,
-    trimLlmRequestLogs,
-} from '../storage/request-log-store';
 import { logger } from '../runtime/logger';
+import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type {
     CapabilityKind,
     LLMRequestLogEntry,
@@ -19,6 +14,7 @@ import type {
 const REQUEST_LOG_MAX_RECORDS = 2000;
 const ARCHIVABLE_STATES = new Set<RequestState>(['cancelled']);
 const FALLBACK_SOURCE_PLUGIN_ID = 'stx_llmhub';
+const memoryLogs: LLMRequestLogEntry[] = [];
 
 function normalizeOptionalText(value: unknown): string | undefined {
     const normalized = String(value || '').trim();
@@ -71,43 +67,17 @@ export interface RecordAttemptInput {
 }
 
 export class RequestLogService {
+    constructor(private readonly workspaceRepository?: LlmWorkspaceRepository) {}
+
     async listLogs(opts?: LLMRequestLogQueryOptions): Promise<LLMRequestLogEntry[]> {
-        const rows = await queryLlmRequestLogs(opts);
-        return rows
-            .map((row): LLMRequestLogEntry | null => {
-                const payload = row.payload as Partial<LLMRequestLogEntry> | undefined;
-                if (!payload?.requestId || !payload?.logId) {
-                    return null;
-                }
-                return {
-                    ...payload,
-                    logId: payload.logId,
-                    llmTaskId: payload.llmTaskId || String(row.llmTaskId || ''),
-                    requestId: payload.requestId,
-                    sourcePluginId: payload.sourcePluginId || String(row.sourcePluginId || row.consumer || FALLBACK_SOURCE_PLUGIN_ID),
-                    consumer: payload.consumer || String(row.consumer || ''),
-                    taskKey: payload.taskKey || String(row.taskKey || ''),
-                    taskKind: normalizeTaskKind(payload.taskKind || row.taskKind),
-                    state: normalizeLogState(payload.state || row.state),
-                    attemptIndex: Number(payload.attemptIndex || row.attemptIndex || 1),
-                    attemptTag: (payload.attemptTag || row.attemptTag || '初次请求') as AttemptTag,
-                    attemptOutcome: (payload.attemptOutcome || row.attemptOutcome || '失败') as AttemptOutcome,
-                    isFinalAttempt: Boolean(payload.isFinalAttempt ?? row.isFinalAttempt),
-                    chatKey: payload.chatKey || normalizeOptionalText(row.chatKey),
-                    sessionId: payload.sessionId || normalizeOptionalText(row.sessionId),
-                    queuedAt: Number(payload.queuedAt || row.queuedAt || 0),
-                    startedAt: payload.startedAt || normalizeOptionalNumber(row.startedAt),
-                    finishedAt: payload.finishedAt || normalizeOptionalNumber(row.finishedAt),
-                    latencyMs: payload.latencyMs || normalizeOptionalNumber(row.latencyMs),
-                    request: (payload.request || { taskKind: normalizeTaskKind(row.taskKind) }) as LLMRequestLogRequestSnapshot,
-                    response: (payload.response || {}) as LLMRequestLogResponseSnapshot,
-                };
-            })
-            .filter((entry): entry is LLMRequestLogEntry => Boolean(entry));
+        if (this.workspaceRepository) return (await this.workspaceRepository.queryLogs(opts)).filter((row) => Boolean((row as Record<string, unknown>).requestId && (row as Record<string, unknown>).logId)) as unknown as LLMRequestLogEntry[];
+        const rows = memoryLogs.slice().sort((a, b) => b.queuedAt - a.queuedAt).filter((row) => !opts?.sourcePluginId || row.sourcePluginId === opts.sourcePluginId).filter((row) => !opts?.state || opts.state === 'all' || row.state === opts.state).filter((row) => !opts?.search || JSON.stringify(row).toLowerCase().includes(opts.search.toLowerCase())).slice(opts?.offset ?? 0, (opts?.offset ?? 0) + (opts?.limit ?? 100));
+        return rows;
     }
 
     async clearLogs(): Promise<number> {
-        return clearLlmRequestLogs();
+        if (this.workspaceRepository) return this.workspaceRepository.clearLogs();
+        const count = memoryLogs.length; memoryLogs.length = 0; return count;
     }
 
     async recordAttempt(input: RecordAttemptInput): Promise<void> {
@@ -274,30 +244,11 @@ export class RequestLogService {
         });
 
         try {
-            await appendLlmRequestLog({
-                logId: logEntry.logId,
-                llmTaskId: logEntry.llmTaskId,
-                requestId: logEntry.requestId,
-                sourcePluginId: logEntry.sourcePluginId,
-                consumer: logEntry.consumer,
-                taskKey: logEntry.taskKey,
-                taskKind: logEntry.taskKind,
-                state: logEntry.state,
-                taskDescription: logEntry.taskDescription,
-                attemptIndex: logEntry.attemptIndex,
-                attemptTag: logEntry.attemptTag,
-                attemptOutcome: logEntry.attemptOutcome,
-                isFinalAttempt: logEntry.isFinalAttempt,
-                chatKey: logEntry.chatKey,
-                sessionId: logEntry.sessionId,
-                reasonCode: logEntry.response?.reasonCode,
-                queuedAt: logEntry.queuedAt,
-                startedAt: logEntry.startedAt,
-                finishedAt: logEntry.finishedAt,
-                latencyMs: logEntry.latencyMs,
-                payload: logEntry as unknown as Record<string, unknown>,
-            });
-            await trimLlmRequestLogs(REQUEST_LOG_MAX_RECORDS);
+            if (this.workspaceRepository) {
+                await this.workspaceRepository.saveLog(logEntry as unknown as Record<string, unknown> as never);
+                return;
+            }
+            memoryLogs.unshift(logEntry); if (memoryLogs.length > REQUEST_LOG_MAX_RECORDS) memoryLogs.length = REQUEST_LOG_MAX_RECORDS;
             logger.success('[RequestLog][PersistSuccess]', {
                 llmTaskId: logEntry.llmTaskId,
                 requestId: logEntry.requestId,

@@ -1,13 +1,10 @@
 {
     "display_name": "SS-Helper [AI 调度中枢]",
     "loading_order": -900,
-    "requires": [],
-    "dependencies": ["third-party/SS-Helper-SDK"],
-    "optional": [],
-    "js": "dist/runtime-entry.js",
+    "js": "index.js",
     "author": "Shion",
     "version": "0.1.0",
     "auto_update": false,
     "homePage": "https://github.com/ShionCox/SillyTavern-SS-Helper",
-    "email": "348591466@qq.com"
+    "minimum_client_version": "1.18.0"
 }

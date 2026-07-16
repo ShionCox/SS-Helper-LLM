@@ -71,13 +71,13 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   const bootstrap = await startLlmPlugin({ pluginVersion: '1.0.0', target, storage, services });
-  assert.equal(active.size, 7, 'settings + popup + five services register once');
+  assert.equal(active.size, 23, 'settings + popup + typed services register once');
 
   const second = fixtureCore(2, active);
   installSnapshot(target, coreDescriptor(2), second);
   first.close({ reason: 'core_replaced', generation: 1 });
   target.dispatchEvent(new Event(CORE_LIFECYCLE_EVENT));
-  await waitFor(() => bootstrap.current.generation === 2 && active.size === 7);
+  await waitFor(() => bootstrap.current.generation === 2 && active.size === 23);
 
   bootstrap.dispose();
   await bootstrap.closed;
