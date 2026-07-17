@@ -1,17 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { CORE_DISCOVERY_SYMBOL } from '@ss-helper/sdk';
+import { readFileSync } from 'node:fs';
+import { API_MAJOR, API_MINOR, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
 import { LlmSettingsStatusMonitor, createWorkspaceLlmSettingsAdapter } from '../dist/index.js';
 
 const wait = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+const llmConfig = JSON.parse(readFileSync(new URL('../plugin.config.json', import.meta.url), 'utf8'));
+const sdkConfig = JSON.parse(readFileSync(new URL('../../SS-Helper-SDK/plugin.config.json', import.meta.url), 'utf8'));
+const LLM_PLUGIN_VERSION = llmConfig.manifest.version;
+const CORE_VERSION = sdkConfig.browser.coreVersion;
 
 function fixture() {
   const target = new EventTarget();
   target[CORE_DISCOVERY_SYMBOL] = {
     kind: 'ss-helper-core-discovery',
     descriptor: {
-      kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: '2.0.0', sdkPackageVersion: '2.0.0',
-      apiMajor: 2, apiMinor: 0, generation: 7, state: 'ready', capabilities: [],
+      kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: CORE_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION,
+      apiMajor: API_MAJOR, apiMinor: API_MINOR, generation: 7, state: 'ready', capabilities: [],
       artifact: { buildId: 'fixture', contentDigest: 'a'.repeat(64) },
     },
     port: {},
@@ -27,7 +32,7 @@ function fixture() {
     async reset() { return { enabled: true }; },
   };
   const session = {
-    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: '0.3.0', sdkPackageVersion: '2.0.0', apiMajor: 2, minApiMinor: 0, capabilities: [] },
+    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: LLM_PLUGIN_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION, apiMajor: API_MAJOR, minApiMinor: API_MINOR, capabilities: [] },
     generation: 7,
     host: {
       generation: { available: async () => true, current: async () => current },
@@ -61,7 +66,7 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   await monitor.start();
   assert.equal(monitor.loadStatus().tavernStatus.value, 'openai · gpt-test');
   assert.equal(monitor.loadStatus().serviceStatus.value, '生成可用');
-  assert.equal(monitor.loadStatus().about.value, 'LLM v0.3.0 · Core v2.0.0 · SDK v2.0.0 · API 2.0');
+  assert.equal(monitor.loadStatus().about.value, `LLM v${LLM_PLUGIN_VERSION} · Core v${CORE_VERSION} · SDK v${SDK_PACKAGE_VERSION} · API ${API_MAJOR}.${API_MINOR}`);
 
   value.changeModel({ provider: 'claude', model: 'claude-test' });
   await wait();
