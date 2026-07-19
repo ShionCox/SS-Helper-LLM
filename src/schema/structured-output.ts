@@ -172,7 +172,7 @@ function collectSchemaFieldRules(schema?: object, depth = 0, path = ''): string[
 
 export function buildStructuredOutputSystemInstruction(args: {
     schema?: object;
-    schemaName?: string;
+    name?: string;
 }): string {
     const schemaProperties = args.schema && typeof args.schema === 'object' && 'properties' in (args.schema as Record<string, unknown>)
         ? (((args.schema as Record<string, unknown>).properties || {}) as Record<string, unknown>)
@@ -192,7 +192,7 @@ export function buildStructuredOutputSystemInstruction(args: {
 
     return [
         '你必须只输出一个合法 json 对象，不要输出额外解释、前后缀、Markdown 代码块或自然语言说明。',
-        args.schemaName ? `输出目标名称：${args.schemaName}` : '',
+        args.name ? `输出目标名称：${args.name}` : '',
         schemaText
             ? `请严格参考以下 JSON Schema / 结构定义：\n${schemaText}`
             : '若未提供完整 schema，也必须返回可被 JSON.parse 解析的 json 对象。',

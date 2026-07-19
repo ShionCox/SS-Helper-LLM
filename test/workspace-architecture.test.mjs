@@ -40,10 +40,17 @@ test('settings schema exposes five progressive pages and generic popup actions',
     resources: ['资源管理', '能力测试'],
     routing: ['路由配置', '高级配置'],
     runtime: ['额度与任务', '权限与展示'],
-    diagnostics: ['检查与日志', '数据管理', '关于'],
+    diagnostics: ['检查与日志', '日志记录策略', '数据管理', '关于'],
   });
   assert.ok(allFields.some((field) => field.id === 'globalProfile'));
+  assert.equal(allFields.find((field) => field.id === 'tavernStatus')?.label, '大语言模型');
+  const generationSource = allFields.find((field) => field.id === 'generationSource');
+  assert.deepEqual(
+    [generationSource?.kind, generationSource?.defaultValue, generationSource?.options?.map((option) => option.value)],
+    ['select', 'tavern', ['tavern', 'custom']],
+  );
   assert.equal(allFields.some((field) => field.id === 'detailedLogs'), false);
+  assert.equal(allFields.find((field) => field.id === 'requestLogging.detailMode')?.defaultValue, 'full');
 
   const actions = sections.flatMap((section) => section.children.flatMap(function flatten(field) {
     if (field.kind === 'section') return field.children.flatMap(flatten);
@@ -71,16 +78,16 @@ test('settings schema exposes five progressive pages and generic popup actions',
   assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
 });
 
-test('LLM browser repository uses SDK Workspace records and excludes credentials from backup/logs', async () => {
+test('LLM browser repository stores complete sanitized logs and excludes credentials', async () => {
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace);
   await repository.ready();
-  const expectedDefaults = { enabled: true, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000, resultDisplay: 'auto' };
+  const expectedDefaults = { enabled: true, generationSource: 'tavern', globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000, resultDisplay: 'auto' };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
   const initialSettings = await repository.loadSettings();
   assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
   assert.equal(Object.hasOwn(initialSettings, 'resources'), false);
-  await repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', label: 'Plain', enabled: false }] });
+  await repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', apiType: 'auto', label: 'Plain', enabled: false }] });
   assert.equal(Object.hasOwn((await repository.loadSettings()).resources[0], 'customParams'), false);
   await repository.saveSettings({ enabled: true, globalProfile: 'economy', maxTokensMode: 'manual', maxTokens: 4096 });
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
@@ -88,18 +95,24 @@ test('LLM browser repository uses SDK Workspace records and excludes credentials
   await repository.setResourceSecret('resource-test', 'secret-value', { label: 'Test' });
   assert.equal(await repository.hasResourceSecret('resource-test'), true);
   assert.equal(await repository.getResourceSecret('resource-test'), 'secret-value');
-  await repository.saveLog({ request: { taskKind: 'generation', taskDescription: 'hidden prompt', metrics: { total: 1 }, body: 'must not persist' }, response: { meta: { resourceId: 'resource-test' }, body: 'hidden response' }, state: 'completed', sourcePluginId: 'fixture' });
+  await repository.saveLog({ request: { taskKind: 'generation', taskDescription: 'visible prompt', metrics: { total: 1 }, body: 'must persist', headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
   const logs = await repository.queryLogs({ sourcePluginId: 'fixture' });
   assert.equal(logs.length, 1);
-  assert.equal(logs[0].request.body, undefined);
-  assert.equal(logs[0].request.taskDescription, undefined);
-  assert.equal(logs[0].response.body, undefined);
+  assert.equal(logs[0].contentMode, 'full');
+  assert.equal(logs[0].request.body, 'must persist');
+  assert.equal(logs[0].request.taskDescription, 'visible prompt');
+  assert.equal(logs[0].response.body, 'visible response');
+  assert.equal(logs[0].request.headers, '[已脱敏]');
+  assert.equal(JSON.stringify(logs[0]).includes('secret-value'), false);
   await assert.rejects(repository.saveSettings({ budgets: { fixture: { maxCost: 1 } } }), { code: 'LLM_DEPRECATED_MAX_COST' });
   await assert.rejects(repository.saveSettings({ resources: [{ id: 'http', type: 'generation', source: 'custom', apiType: 'openai', label: 'HTTP', baseUrl: 'http://provider.example', enabled: false }] }), { code: 'PAYLOAD_INVALID' });
   assert.equal((await repository.listSecrets()).length, 1);
+  await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom' });
   const exported = await repository.exportConfig();
+  assert.equal(exported.archive.settings.generationSource, 'custom');
   assert.equal(JSON.stringify(exported).includes('secret-value'), false);
   await repository.importConfig(exported.archive, exported.sha256);
+  assert.equal((await repository.loadSettings()).generationSource, 'custom');
   assert.equal(await repository.hasResourceSecret('resource-test'), false);
   await repository.clearAll();
   assert.equal(await repository.hasResourceSecret('resource-test'), false);
@@ -114,6 +127,23 @@ test('provider factory covers direct browser generation and rerank resources', (
   assert.equal(openai.id, 'openai');
   assert.equal(rerank.id, 'rerank');
   openai.dispose?.(); rerank.dispose?.();
+});
+
+test('request log policy supports summary mode and prunes by count', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace);
+  await repository.saveSettings({ requestLogging: { enabled: true, detailMode: 'summary', maxEntries: 2, retentionDays: 3650, maxBytes: 1024 * 1024 } });
+  for (let index = 0; index < 3; index += 1) {
+    await repository.saveLog({ logId: `log-${index}`, requestId: `request-${index}`, state: 'completed', sourcePluginId: 'fixture', taskKey: 'memory.extract', taskKind: 'generation', request: { taskKind: 'generation', generationInput: { messages: [{ content: `private-${index}` }] }, metrics: { inputCharCount: 10 } }, response: { rawResponseText: `raw-${index}`, meta: { resourceId: 'resource-test', model: 'model-test' } }, createdAt: Date.now() + index });
+  }
+  const logs = await repository.queryLogs({ limit: 10 });
+  assert.equal(logs.length, 2);
+  assert.equal(logs[0].contentMode, 'summary');
+  assert.equal(logs[0].request.generationInput, undefined);
+  assert.equal(logs.some((row) => row.logId === 'log-0'), false);
+  const stats = await repository.getLogStats();
+  assert.equal(stats.count, 2);
+  assert.equal(stats.policy.maxEntries, 2);
 });
 
 test('Workspace mutations use unique idempotency keys even when the clock is frozen', async () => {
@@ -135,6 +165,7 @@ test('settings validation rejects coercion and malformed nested routing values',
   const repository = new LlmWorkspaceRepository(new MemoryWorkspace());
   await assert.rejects(repository.saveSettings({ enabled: 'false' }), { code: 'PAYLOAD_INVALID' });
   await assert.rejects(repository.saveSettings({ globalProfile: 'unknown' }), { code: 'PAYLOAD_INVALID' });
+  await assert.rejects(repository.saveSettings({ generationSource: 'automatic' }), { code: 'PAYLOAD_INVALID' });
   await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad', type: 'generation', source: 'custom', label: 'Bad', enabled: 'false' }] }), { code: 'PAYLOAD_INVALID' });
   await assert.rejects(repository.saveSettings({ globalAssignments: { generation: { resourceId: 42 } } }), { code: 'PAYLOAD_INVALID' });
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
@@ -156,7 +187,7 @@ test('clearLogs paginates beyond one thousand records and can resume after a fai
 test('config import is atomic and resource deletion removes its credential in one transaction', async () => {
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace);
-  await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', label: 'A', enabled: false }] });
+  await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', apiType: 'auto', label: 'A', enabled: false }] });
   await repository.setResourceSecret('resource-a', 'secret-value');
   const exported = await repository.exportConfig();
   workspace.failNextTransaction = true;
@@ -186,6 +217,93 @@ test('runtime preparation failure leaves persisted settings and the active runti
   workspace.failCredentialRead = false;
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
   handlers.dispose?.();
+});
+
+test('generation source hot-switches Tavern to custom and back without crossing the source gate', async () => {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (input) => {
+    calls.push({ kind: 'custom', input: String(input) });
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'custom-ok' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace);
+  let tavernCurrent = { provider: 'openai', model: 'tavern-model' };
+  const session = {
+    host: {
+      generation: {
+        available: async () => true,
+        current: async () => tavernCurrent,
+        models: async () => ['tavern-model'],
+        generate: async () => { calls.push({ kind: 'tavern' }); return { text: 'tavern-ok', model: 'tavern-model' }; },
+        test: async () => ({ text: 'ok', model: 'tavern-model' }),
+      },
+      has: () => false,
+      events: { subscribe() { return () => {}; } },
+    },
+    events: { publish() {}, subscribe() { return () => {}; } },
+  };
+  const handlers = createProductionLlmServices(session, { repository });
+  const signal = new AbortController().signal;
+  try {
+    await repository.ready();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'one' }] }, signal)).text, 'tavern-ok');
+    tavernCurrent = { provider: 'novel' };
+    const providerOnly = await handlers.capabilityStatus({ checks: [{ id: 'generation', taskKey: 'completion', taskKind: 'generation' }] }, signal);
+    assert.deepEqual(providerOnly.checks[0], { id: 'generation', source: 'tavern', configured: true, available: true });
+
+    const resource = { id: 'custom-generation', type: 'generation', source: 'custom', apiType: 'openai', label: 'Custom', baseUrl: 'https://provider.example/v1', model: 'custom-model', enabled: true, capabilities: ['chat', 'json'] };
+    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom', resources: [resource], globalAssignments: { generation: { resourceId: resource.id } } });
+    await assert.rejects(handlers.completion({ messages: [{ role: 'user', content: 'missing key' }] }, signal));
+    const unavailable = await handlers.capabilityStatus({ checks: [{ id: 'generation', taskKey: 'completion', taskKind: 'generation' }] }, signal);
+    assert.deepEqual(unavailable.checks[0], { id: 'generation', source: 'custom', configured: false, available: false, reason: 'credential_missing' });
+    await repository.setResourceSecret(resource.id, 'runtime-secret');
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'two' }] }, signal)).text, 'custom-ok');
+
+    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'tavern' });
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'three' }], route: resource.id }, signal)).text, 'tavern-ok');
+    assert.deepEqual(calls.map((call) => call.kind), ['tavern', 'custom', 'tavern']);
+    assert.equal((await repository.loadSettings()).globalAssignments.generation.resourceId, resource.id, 'custom assignment remains stored');
+  } finally {
+    handlers.dispose?.();
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('event listener failures cannot turn an applied generation source change into a failed save', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace);
+  const session = {
+    host: {
+      generation: {
+        available: async () => true,
+        current: async () => ({ provider: 'openai', model: 'tavern-model' }),
+        models: async () => ['tavern-model'],
+        generate: async () => ({ text: 'tavern-ok', model: 'tavern-model' }),
+        test: async () => ({ text: 'ok', model: 'tavern-model' }),
+      },
+      has: () => false,
+      events: { subscribe() { return () => {}; } },
+    },
+    events: {
+      publish() { throw Object.assign(new Error('An event listener failed'), { code: 'PAYLOAD_INVALID' }); },
+      subscribe() { return () => {}; },
+    },
+  };
+  const handlers = createProductionLlmServices(session, { repository });
+  const signal = new AbortController().signal;
+  try {
+    await repository.ready();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom' });
+    const saved = await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'tavern' });
+    assert.equal(saved.generationSource, 'tavern');
+    assert.equal((await repository.loadSettings()).generationSource, 'tavern');
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'still applied' }] }, signal)).text, 'tavern-ok');
+  } finally {
+    handlers.dispose?.();
+  }
 });
 
 test('direct browser Provider sends the Workspace credential only to the configured origin', async () => {

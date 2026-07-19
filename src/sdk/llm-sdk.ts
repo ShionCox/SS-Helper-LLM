@@ -3,20 +3,12 @@ import { TaskRouter } from '../router/router';
 import { BudgetManager } from '../budget/budget-manager';
 import {
     parseJsonOutput,
-    validateZodSchema,
-    WorldTemplateSchema,
-    ProposalEnvelopeSchema,
-    normalizeProposalEnvelopeInput,
-    normalizeWorldTemplateInput,
 } from '../schema/validator';
 import { normalizeStructuredCategoryBuckets } from '../schema/structured-output-classifier';
+import { validateJsonSchema } from '../schema/json-schema-validator';
 import { ProfileManager } from '../profile/profile-manager';
 import { inferReasonCode } from '../schema/error-codes';
-import {
-    isStrictJsonSchemaCompatible,
-    processProviderStrictJsonSchema,
-    type SchemaCompatOptions,
-} from '../schema/strict-json-schema';
+import { detectStructuredOutputIdentity, createStructuredOutputPlan, withStructuredOutputInstruction, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { resolveMaxTokens } from './max-tokens';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
 import { DisplayController } from '../display/display-controller';
@@ -39,8 +31,6 @@ import type {
     LLMTaskLifecycleEvent,
     LLMHubSettings,
 } from '../schema/types';
-import type { ZodType } from 'zod';
-import type { ApiType } from '../schema/types';
 
 /**
  * 功能：判断输入是否为普通对象，便于拼装 generation 用户消息。
@@ -84,6 +74,31 @@ function buildGenerationUserContent(input: unknown): string {
     return JSON.stringify(rest);
 }
 
+type StructuredRetryRepair = NonNullable<RequestRecord['structuredRetryRepair']>;
+
+function structuredOutputLogFields(
+    plan: NonNullable<LLMRequest['structuredOutput']>,
+    retryRepair?: StructuredRetryRepair,
+    retryRepairState: 'queued' | 'applied' = 'applied',
+): NonNullable<LLMRequestLogRequestSnapshot['structuredOutput']> {
+    return {
+        vendor: plan.identity.vendor,
+        detectionEvidence: plan.identity.evidence,
+        confidence: plan.identity.confidence,
+        transport: plan.transport,
+        strictSchemaCompatible: plan.strictSchemaCompatible,
+        contextMode: plan.transport === 'prompt_only' ? 'isolated' : 'chat',
+        nativeJsonMode: plan.transport !== 'prompt_only',
+        nativeSchemaSent: plan.transport === 'json_schema' || plan.transport === 'tavern_json_schema',
+        ...(retryRepair === undefined ? {} : {
+            manualRetryRepair: {
+                reasonCode: retryRepair.reasonCode,
+                state: retryRepairState,
+            },
+        }),
+    };
+}
+
 
 /**
  * LLMSDK 门面层
@@ -102,6 +117,7 @@ export class LLMSDKImpl {
     private requestLogService: RequestLogService;
     private globalProfileId: string;
     private settingsResolver: (() => LLMHubSettings) | null = null;
+    private readonly unsupportedStrictSchemaResources = new Set<string>();
     public inspect?: LLMInspectApi;
 
     constructor(
@@ -238,6 +254,8 @@ export class LLMSDKImpl {
             || normalizedReasonCode === 'provider_unavailable'
             || normalizedReasonCode === 'unknown'
             || normalizedReasonCode === 'token_limit_exceeded'
+            || normalizedReasonCode === 'structured_output_empty'
+            || normalizedReasonCode === 'structured_output_truncated'
             || normalizedReasonCode === 'invalid_json'
             || normalizedReasonCode === 'schema_validation_failed';
     }
@@ -251,6 +269,58 @@ export class LLMSDKImpl {
         }
         const inferredReasonCode = String(result.reasonCode || '').trim() || inferReasonCode(String(result.error || ''));
         return this.isReasonCodeRetryable(inferredReasonCode);
+    }
+
+    private buildStructuredRetryRepair(record: RequestRecord, result: LLMRunResult<unknown>): StructuredRetryRepair | undefined {
+        if (result.ok) {
+            return undefined;
+        }
+        const reasonCode = String(result.reasonCode || '').trim();
+        if (record.taskKind !== 'generation'
+            || record.requestLogSnapshot?.structuredOutput === undefined
+            || !['structured_output_empty', 'structured_output_truncated', 'invalid_json', 'schema_validation_failed'].includes(reasonCode)) {
+            return undefined;
+        }
+
+        const validationHints = Array.isArray(record.debug?.validationErrors)
+            ? record.debug.validationErrors.slice(0, 6).map((item) => String(item).trim()).filter(Boolean)
+            : [];
+        const reasonInstruction: Record<string, string> = {
+            structured_output_empty: '上一轮没有返回 JSON 内容。现在必须返回一个完整的 JSON 对象。',
+            structured_output_truncated: '上一轮 JSON 被截断。请优先输出满足 Schema 的最小完整 JSON，不要附加解释。',
+            invalid_json: '上一轮输出不是合法 JSON。不要续写剧情、解释或 Markdown 代码块，只返回一个可直接 JSON.parse 的对象。',
+            schema_validation_failed: '上一轮 JSON 未通过 Schema 校验。请只保留 Schema 声明的字段，并补全所有必填字段和正确类型。',
+        };
+        return {
+            reasonCode,
+            instruction: [
+                '这是一次用户确认后的结构化输出修正请求。',
+                reasonInstruction[reasonCode],
+                validationHints.length > 0 ? `需修正的校验项：${validationHints.join('；')}` : '',
+                '忽略此前任何非 JSON 写作倾向，最终只能输出一个符合当前 Schema 的 JSON 对象。',
+            ].filter(Boolean).join('\n'),
+        };
+    }
+
+    private queueStructuredRetryRepair(record: RequestRecord, result: LLMRunResult<unknown>): void {
+        const repair = this.buildStructuredRetryRepair(record, result);
+        if (repair === undefined) {
+            return;
+        }
+        record.structuredRetryRepair = repair;
+        const structuredOutput = record.requestLogSnapshot?.structuredOutput;
+        if (structuredOutput !== undefined && record.requestLogSnapshot !== undefined) {
+            record.requestLogSnapshot = {
+                ...record.requestLogSnapshot,
+                structuredOutput: {
+                    ...structuredOutput,
+                    manualRetryRepair: {
+                        reasonCode: repair.reasonCode,
+                        state: 'queued',
+                    },
+                },
+            };
+        }
     }
 
     private confirmRetryableFailure(record: RequestRecord, result: LLMRunResult<unknown>, retryCount: number): boolean {
@@ -284,6 +354,10 @@ export class LLMSDKImpl {
             const shouldRetry = shouldOfferRetry
                 ? this.confirmRetryableFailure(record, currentResult, retryCount)
                 : false;
+
+            if (shouldRetry) {
+                this.queueStructuredRetryRepair(record, currentResult);
+            }
 
             await this.recordAttemptLog(record, attemptRequestId, currentResult, !shouldRetry);
 
@@ -327,28 +401,12 @@ export class LLMSDKImpl {
         return ctorName && ctorName !== 'Object' ? ctorName : 'schema';
     }
 
-    private isZodSchema(schema: unknown): schema is ZodType<any> {
-        return Boolean(schema) && typeof (schema as { safeParse?: unknown }).safeParse === 'function';
-    }
-
     private sanitizeSchemaName(name?: string): string {
         const normalized = String(name || 'structured_output')
             .trim()
             .replace(/[^a-zA-Z0-9_-]+/g, '_')
             .replace(/^_+|_+$/g, '');
         return normalized || 'structured_output';
-    }
-
-    private normalizeApiType(value: unknown): ApiType {
-        switch (value) {
-            case 'deepseek':
-            case 'gemini':
-            case 'claude':
-            case 'generic':
-                return value;
-            default:
-                return 'openai';
-        }
     }
 
     private buildRequestLogSnapshot(
@@ -619,209 +677,50 @@ export class LLMSDKImpl {
             && value.docs.every((doc) => typeof doc === 'string');
     }
 
-    private serializeSchemaForLog(schema: unknown): unknown {
-        if (!schema) return undefined;
-        if (!this.isZodSchema(schema)) {
-            return schema;
-        }
-
-        const visit = (node: any, depth: number): unknown => {
-            if (!node) return undefined;
-            if (depth >= 6) return '[MaxDepthSchema]';
-
-            const def = node._def || {};
-            const typeName = String(def.typeName || def.type || node.type || 'unknown');
-            const description = typeof node.description === 'string' && node.description.trim()
-                ? node.description.trim()
-                : typeof def.description === 'string' && def.description.trim()
-                    ? def.description.trim()
-                    : undefined;
-
-            if (def.innerType) {
-                const inner = visit(def.innerType, depth + 1);
-                if (typeName.includes('Optional')) {
-                    return { type: 'optional', inner, ...(description ? { description } : {}) };
-                }
-                if (typeName.includes('Nullable')) {
-                    return { type: 'nullable', inner, ...(description ? { description } : {}) };
-                }
-                if (typeName.includes('Default')) {
-                    return { type: 'default', inner, ...(description ? { description } : {}) };
-                }
-                return inner;
-            }
-
-            if (def.schema) {
-                return visit(def.schema, depth + 1);
-            }
-
-            if (typeName.includes('Object')) {
-                const rawShape = typeof def.shape === 'function' ? def.shape() : (def.shape || node.shape || {});
-                const properties = Object.fromEntries(
-                    Object.entries(rawShape).map(([key, value]) => [key, visit(value, depth + 1)]),
-                );
-                return {
-                    type: 'object',
-                    properties,
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            if (typeName.includes('Array')) {
-                return {
-                    type: 'array',
-                    items: visit(def.type || def.element || def.itemType, depth + 1),
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            if (typeName.includes('Enum')) {
-                const values = Array.isArray(def.values) ? def.values : Object.values(def.values || {});
-                return {
-                    type: 'enum',
-                    values,
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            if (typeName.includes('Record')) {
-                return {
-                    type: 'record',
-                    valueType: visit(def.valueType, depth + 1),
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            if (typeName.includes('Literal')) {
-                return {
-                    type: 'literal',
-                    value: def.value,
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            if (typeName.includes('Union')) {
-                return {
-                    type: 'union',
-                    options: Array.isArray(def.options)
-                        ? def.options.map((option: unknown) => visit(option, depth + 1))
-                        : [],
-                    ...(description ? { description } : {}),
-                };
-            }
-
-            const primitiveType = typeName.replace(/^Zod/i, '').toLowerCase() || 'unknown';
-            return {
-                type: primitiveType,
-                ...(description ? { description } : {}),
-            };
-        };
-
-        return visit(schema, 0);
+    private serializeSchemaForLog(schema: object): object {
+        return structuredClone(schema);
     }
 
     private buildGenerationProviderRequestSnapshot(
         resourceId: string,
         llmReq: LLMRequest,
-        runtimeSchema: unknown,
-        normalizeMode: 'proposal' | 'world_template' | 'none',
         args: RunTaskArgs,
-        schemaSummary?: string,
-        maxTokensSource?: string,
-        requestMeta?: {
-            originalStrictSchemaCompatible?: boolean;
-            providerSchemaCompatible?: boolean;
-            schemaAutofillApplied?: boolean;
-            schemaCompatMode?: string;
-            originalStrictIncompatibilityPath?: string;
-            originalStrictIncompatibilityReason?: string;
-            providerStrictIncompatibilityPath?: string;
-            providerStrictIncompatibilityReason?: string;
-            responseFormatBeforeCompat?: string;
-            responseFormatAfterCompat?: string;
-        },
+        schemaSummary: string | undefined,
+        maxTokensSource: string,
     ): Record<string, unknown> {
-        const provider = this.router.getProvider(resourceId) as ({ kind?: string; apiType?: ApiType } | undefined);
+        const provider = this.router.getProvider(resourceId) as ({ kind?: string } | undefined);
         const providerKind = provider?.kind || 'unknown';
-        const providerApiType: ApiType | undefined = provider ? this.normalizeApiType(provider.apiType ?? (providerKind === 'openai' ? 'openai' : undefined)) : undefined;
-        const requestedOutputSchema = this.serializeSchemaForLog(runtimeSchema);
-        const requestParams = {
-            model: llmReq.model,
-            temperature: llmReq.temperature,
-            maxTokens: llmReq.maxTokens,
-            maxTokensSource,
-            jsonMode: Boolean(llmReq.jsonMode),
-            apiType: providerApiType,
-            preferredResponseFormat: llmReq.preferredResponseFormat,
-            schemaCompat: llmReq.schemaCompat,
-            normalizeMode,
-            schemaSummary,
-            routeHint: args.routeHint,
-            budget: args.budget,
-            originalStrictSchemaCompatible: requestMeta?.originalStrictSchemaCompatible,
-            providerSchemaCompatible: requestMeta?.providerSchemaCompatible,
-            schemaAutofillApplied: requestMeta?.schemaAutofillApplied,
-            schemaCompatMode: requestMeta?.schemaCompatMode,
-            originalStrictIncompatibilityPath: requestMeta?.originalStrictIncompatibilityPath,
-            originalStrictIncompatibilityReason: requestMeta?.originalStrictIncompatibilityReason,
-            providerStrictIncompatibilityPath: requestMeta?.providerStrictIncompatibilityPath,
-            providerStrictIncompatibilityReason: requestMeta?.providerStrictIncompatibilityReason,
-            responseFormatBeforeCompat: requestMeta?.responseFormatBeforeCompat,
-            responseFormatAfterCompat: requestMeta?.responseFormatAfterCompat,
-        };
-        const genericPayload: Record<string, unknown> = {
-            messages: llmReq.messages,
-            model: llmReq.model,
-            temperature: llmReq.temperature,
-            maxTokens: llmReq.maxTokens,
-            jsonMode: llmReq.jsonMode,
-            apiType: providerApiType,
-            jsonSchema: llmReq.schema,
-            requestedOutputSchema,
-            normalizeMode,
-        };
-
-        const openAiLikePayload: Record<string, unknown> = {
-            model: llmReq.model,
-            messages: llmReq.messages,
-            temperature: llmReq.temperature ?? 0.7,
-            max_tokens: llmReq.maxTokens ?? 2048,
-            requested_output_schema: requestedOutputSchema,
-            normalize_mode: normalizeMode,
-            api_type: providerApiType,
-        };
-        if (llmReq.jsonMode) {
-            if ((providerApiType === 'openai' || providerApiType === 'gemini') && llmReq.schema && llmReq.preferredResponseFormat === 'json_schema') {
-                openAiLikePayload.response_format = {
-                    type: 'json_schema',
-                    json_schema: {
-                        name: llmReq.schemaName || 'structured_output',
-                        strict: true,
-                        schema: llmReq.schema,
-                    },
-                };
-            } else if (llmReq.preferredResponseFormat === 'system_json') {
-                openAiLikePayload.response_format = '[system_prompt_enforced_json_only]';
-            } else {
-                openAiLikePayload.response_format = { type: 'json_object' };
-            }
-        }
-
+        const plan = llmReq.structuredOutput;
         return {
             providerKind,
             resourceId,
-            requestFormat: providerKind === 'openai'
-                ? 'openai_chat_completions'
-                : providerKind === 'tavern'
-                    ? 'tavern_raw_messages'
-                    : 'generic_generation',
-            requestParams,
-            payload: providerKind === 'openai' ? openAiLikePayload : genericPayload,
+            requestFormat: providerKind === 'tavern'
+                ? (plan?.transport === 'prompt_only' ? 'tavern_generate_raw' : 'tavern_generate_quiet_prompt')
+                : `${providerKind}_generation`,
+            requestParams: {
+                model: llmReq.model,
+                temperature: llmReq.temperature,
+                maxTokens: llmReq.maxTokens,
+                maxTokensSource,
+                schemaSummary,
+                routeHint: args.routeHint,
+                budget: args.budget,
+                ...(plan === undefined ? {} : { structuredOutput: structuredOutputLogFields(plan) }),
+            },
+            payload: {
+                messages: llmReq.messages,
+                model: llmReq.model,
+                temperature: llmReq.temperature,
+                maxTokens: llmReq.maxTokens,
+                ...(plan === undefined ? {} : { structuredOutput: plan }),
+            },
             messageCount: llmReq.messages.length,
         };
     }
 
     private async executeGeneration(args: RunTaskArgs, record: RequestRecord): Promise<LLMRunResult<any>> {
+        const retryRepair = record.structuredRetryRepair;
+        record.structuredRetryRepair = undefined;
         // 预算检查
         const budgetCheck = this.budgetManager.canRequest(args.consumer);
         if (!budgetCheck.allowed) {
@@ -880,28 +779,29 @@ export class LLMSDKImpl {
         const settings = this.readSettings();
         const taskDescriptor = this.registry.getTaskDescriptor(args.consumer, args.taskKey);
         const taskAssignment = this.router.getTaskAssignment(args.consumer, args.taskKey);
-        const resolvedProvider = this.router.getProvider(resolved.resourceId) as ({ apiType?: ApiType } | undefined);
-        const resolvedApiType: ApiType = this.normalizeApiType(resolvedProvider?.apiType);
-
-        const hasCustomSchema = Boolean(args.schema);
-        const runtimeSchema = hasCustomSchema
-            ? args.schema
-            : args.taskKey === 'world.template.build'
-                ? WorldTemplateSchema
-                : (args.taskKey === 'memory.extract' || args.taskKey === 'world.update' || args.taskKey === 'memory.summarize')
-                    ? ProposalEnvelopeSchema
-                    : undefined;
-        const originalProviderSchema = hasCustomSchema && !this.isZodSchema(args.schema)
-            ? args.schema
-            : undefined;
-        const promptSchema = (originalProviderSchema ?? this.serializeSchemaForLog(args.schema ?? runtimeSchema)) as object | undefined;
-        const normalizeMode = hasCustomSchema
-            ? 'none'
-            : args.taskKey === 'world.template.build'
-                ? 'world_template'
-                : (args.taskKey === 'memory.extract' || args.taskKey === 'world.update' || args.taskKey === 'memory.summarize')
-                    ? 'proposal'
-                    : 'none';
+        const resolvedProvider = this.router.getProvider(resolved.resourceId);
+        if (!resolvedProvider) {
+            const error = `资源 "${resolved.resourceId}" 未找到`;
+            this.emitLifecycle(args, record, { stage: 'failed', message: error, error, reasonCode: 'provider_unavailable' });
+            return { ok: false, error, retryable: false, reasonCode: 'provider_unavailable' };
+        }
+        const schema = args.schema && typeof args.schema === 'object' && !Array.isArray(args.schema) ? args.schema : undefined;
+        const providerKind = resolvedProvider.kind;
+        const identity: StructuredOutputIdentity | undefined = schema === undefined ? undefined : (resolvedProvider.getStructuredOutputIdentity
+            ? await resolvedProvider.getStructuredOutputIdentity(resolved.model)
+            : detectStructuredOutputIdentity({
+                manualVendor: providerKind === 'openai' ? 'openai' : 'auto',
+                provider: providerKind,
+                model: resolved.model,
+            }));
+        const structuredName = schema === undefined ? undefined : this.sanitizeSchemaName(args.taskKey);
+        const strictCacheKey = `${resolved.resourceId}:${resolved.model || identity?.model || ''}`;
+        const structuredOutput = schema === undefined || identity === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
+            providerKind,
+            identity,
+            spec: { schema, name: structuredName },
+            strictSchemaUnavailable: this.unsupportedStrictSchemaResources.has(strictCacheKey),
+        });
 
         const resolvedMaxTokens = resolveMaxTokens(args, {
             globalControl: settings.maxTokensControl,
@@ -910,69 +810,7 @@ export class LLMSDKImpl {
             consumerBudgetMaxTokens: consumerBudget?.maxTokens,
             profileMaxTokens: profile?.maxTokens,
         });
-        const schemaCompat: SchemaCompatOptions = {
-            strictAutofill: args.schemaCompat?.strictAutofill ?? 'default',
-            onIncompatible: args.schemaCompat?.onIncompatible ?? 'downgrade',
-        };
-        const responseFormatBeforeCompat = (resolvedApiType === 'openai' || resolvedApiType === 'gemini')
-            ? (runtimeSchema ? 'json_schema' : 'none')
-            : (runtimeSchema ? 'system_json' : 'none');
-        const strictSchemaProcessing = (resolvedApiType === 'openai' || resolvedApiType === 'gemini') && originalProviderSchema
-            ? processProviderStrictJsonSchema(originalProviderSchema as object, schemaCompat)
-            : {
-                schema: originalProviderSchema as object | undefined,
-                originalCompatible: originalProviderSchema ? isStrictJsonSchemaCompatible(originalProviderSchema) : false,
-                autofillApplied: false,
-                providerCompatible: originalProviderSchema ? isStrictJsonSchemaCompatible(originalProviderSchema) : false,
-                originalDiagnostic: {
-                    compatible: originalProviderSchema ? isStrictJsonSchemaCompatible(originalProviderSchema) : false,
-                },
-                providerDiagnostic: {
-                    compatible: originalProviderSchema ? isStrictJsonSchemaCompatible(originalProviderSchema) : false,
-                },
-            };
-        const providerSchema = strictSchemaProcessing.schema;
-        const canUseStrictJsonSchema = providerSchema
-            ? strictSchemaProcessing.providerCompatible
-            : false;
-        const responseFormatAfterCompat = resolvedApiType === 'openai' || resolvedApiType === 'gemini'
-            ? (canUseStrictJsonSchema ? 'json_schema' : (runtimeSchema ? 'json_object' : 'none'))
-            : (runtimeSchema ? 'system_json' : 'none');
-
-        if (
-            (resolvedApiType === 'openai' || resolvedApiType === 'gemini')
-            && originalProviderSchema
-            && !canUseStrictJsonSchema
-            && schemaCompat.onIncompatible === 'error'
-        ) {
-            const diagnostic = strictSchemaProcessing.providerDiagnostic.compatible
-                ? strictSchemaProcessing.originalDiagnostic
-                : strictSchemaProcessing.providerDiagnostic;
-            const diagnosticSuffix = diagnostic.reason
-                ? ` (${diagnostic.path || '$'} -> ${diagnostic.reason})`
-                : '';
-            const reasonCode = strictSchemaProcessing.autofillApplied
-                ? 'schema_strict_autofill_incompatible'
-                : 'schema_strict_incompatible';
-            const error = strictSchemaProcessing.autofillApplied
-                ? 'Schema 自动填充后仍不兼容严格 json_schema，已按请求配置阻止降级'
-                : 'Schema 不兼容严格 json_schema，已按请求配置阻止降级';
-            this.emitLifecycle(args, record, {
-                stage: 'failed',
-                message: error,
-                error,
-                reasonCode,
-            });
-            return {
-                ok: false,
-                error,
-                retryable: false,
-                reasonCode,
-            };
-        }
-
-        const llmReq: LLMRequest = {
-            messages: Array.isArray(args.input?.messages)
+        const baseMessages = Array.isArray(args.input?.messages)
                 ? args.input.messages
                 : [
                     {
@@ -983,21 +821,23 @@ export class LLMSDKImpl {
                         role: 'user',
                         content: buildGenerationUserContent(args.input),
                     },
-                ],
+                ];
+        const buildStructuredMessages = (plan: NonNullable<LLMRequest['structuredOutput']>) => {
+            const messages = withStructuredOutputInstruction(baseMessages, plan);
+            return retryRepair === undefined
+                ? messages
+                : [...messages, { role: 'system' as const, content: retryRepair.instruction }];
+        };
+        const llmReq: LLMRequest = {
+            messages: structuredOutput === undefined ? baseMessages : buildStructuredMessages(structuredOutput),
             model: resolved.model,
             maxTokens: resolvedMaxTokens.value,
-            jsonMode: !!runtimeSchema || profile?.jsonMode === true,
-            schema: providerSchema ?? promptSchema,
-            schemaName: this.sanitizeSchemaName(this.summarizeSchema(args.schema ?? runtimeSchema)),
-            preferredResponseFormat: resolvedApiType === 'openai' || resolvedApiType === 'gemini'
-                ? (canUseStrictJsonSchema ? 'json_schema' : (runtimeSchema ? 'json_object' : undefined))
-                : (runtimeSchema ? 'system_json' : undefined),
-            schemaCompat,
+            structuredOutput,
             temperature: args.input?.temperature ?? profile?.temperature ?? 0.3,
         };
 
-        const schemaSummary = this.summarizeSchema(args.schema ?? runtimeSchema);
-        const schemaForLog = this.serializeSchemaForLog(originalProviderSchema ?? args.schema ?? runtimeSchema);
+        const schemaSummary = schema === undefined ? undefined : this.summarizeSchema(schema);
+        const schemaForLog = schema === undefined ? undefined : this.serializeSchemaForLog(schema);
         const schemaCharCount = schemaForLog ? JSON.stringify(schemaForLog).length : 0;
         const inputCharCount = llmReq.messages.reduce((sum, msg) => sum + String(msg.content || '').length, 0);
         record.requestLogSnapshot = {
@@ -1007,45 +847,18 @@ export class LLMSDKImpl {
             }),
             schemaSummary,
             schema: schemaForLog,
-            jsonMode: llmReq.jsonMode,
-            strictSchemaCompatible: canUseStrictJsonSchema,
-            originalStrictSchemaCompatible: strictSchemaProcessing.originalCompatible,
-            providerSchemaCompatible: strictSchemaProcessing.providerCompatible,
-            schemaAutofillApplied: strictSchemaProcessing.autofillApplied,
-            schemaCompatMode: `${schemaCompat.strictAutofill}:${schemaCompat.onIncompatible}`,
-            originalStrictIncompatibilityPath: strictSchemaProcessing.originalDiagnostic.path,
-            originalStrictIncompatibilityReason: strictSchemaProcessing.originalDiagnostic.reason,
-            providerStrictIncompatibilityPath: strictSchemaProcessing.providerDiagnostic.path,
-            providerStrictIncompatibilityReason: strictSchemaProcessing.providerDiagnostic.reason,
-            responseFormatResolved: llmReq.preferredResponseFormat || 'none',
-            responseFormatBeforeCompat,
-            responseFormatAfterCompat,
+            ...(structuredOutput === undefined ? {} : { structuredOutput: structuredOutputLogFields(structuredOutput, retryRepair) }),
             resolvedMaxTokens: {
                 value: resolvedMaxTokens.value,
                 source: resolvedMaxTokens.source,
                 detail: resolvedMaxTokens.detail,
             },
-            normalizeMode,
             providerRequest: this.buildGenerationProviderRequestSnapshot(
                 resolved.resourceId,
                 llmReq,
-                runtimeSchema,
-                normalizeMode,
                 args,
                 schemaSummary,
                 resolvedMaxTokens.source,
-                {
-                    originalStrictSchemaCompatible: strictSchemaProcessing.originalCompatible,
-                    providerSchemaCompatible: strictSchemaProcessing.providerCompatible,
-                    schemaAutofillApplied: strictSchemaProcessing.autofillApplied,
-                    schemaCompatMode: `${schemaCompat.strictAutofill}:${schemaCompat.onIncompatible}`,
-                    originalStrictIncompatibilityPath: strictSchemaProcessing.originalDiagnostic.path,
-                    originalStrictIncompatibilityReason: strictSchemaProcessing.originalDiagnostic.reason,
-                    providerStrictIncompatibilityPath: strictSchemaProcessing.providerDiagnostic.path,
-                    providerStrictIncompatibilityReason: strictSchemaProcessing.providerDiagnostic.reason,
-                    responseFormatBeforeCompat,
-                    responseFormatAfterCompat,
-                },
             ),
             metrics: {
                 ...(record.requestLogSnapshot?.metrics || {}),
@@ -1067,16 +880,15 @@ export class LLMSDKImpl {
         const primaryResult = await this.tryProvider(
             resolved.resourceId,
             llmReq,
-            runtimeSchema,
-            normalizeMode,
+            schema,
             args.consumer,
-            args.taskKey,
             maxLatencyMs,
             args.signal,
         );
 
         this.attachProviderRequestSnapshot(record, primaryResult.providerRequest);
         this.attachRecordDebug(record, primaryResult);
+        this.rememberStructuredOutputFallback(resolved.resourceId, resolved.model, primaryResult);
 
         if (primaryResult.ok) {
             const meta: LLMRunMeta = {
@@ -1117,18 +929,30 @@ export class LLMSDKImpl {
                 fallbackUsed: true,
                 progress: 0.85,
             });
+            const fallbackProvider = this.router.getProvider(resolved.fallbackResourceId);
+            const fallbackIdentity = schema === undefined ? undefined : (fallbackProvider?.getStructuredOutputIdentity
+                ? await fallbackProvider.getStructuredOutputIdentity(resolved.model)
+                : detectStructuredOutputIdentity({ manualVendor: fallbackProvider?.kind === 'openai' ? 'openai' : 'auto', provider: fallbackProvider?.kind, model: resolved.model }));
+            const fallbackPlan = schema === undefined || fallbackIdentity === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
+                providerKind: fallbackProvider?.kind || 'unknown',
+                identity: fallbackIdentity,
+                spec: { schema, name: structuredName },
+                strictSchemaUnavailable: this.unsupportedStrictSchemaResources.has(`${resolved.fallbackResourceId}:${resolved.model || fallbackIdentity.model || ''}`),
+            });
+            const fallbackReq: LLMRequest = fallbackPlan === undefined
+                ? llmReq
+                : { ...llmReq, messages: buildStructuredMessages(fallbackPlan), structuredOutput: fallbackPlan };
             const fallbackResult = await this.tryProvider(
                 resolved.fallbackResourceId,
-                llmReq,
-                runtimeSchema,
-                normalizeMode,
+                fallbackReq,
+                schema,
                 args.consumer,
-                args.taskKey,
                 maxLatencyMs,
                 args.signal,
             );
             this.attachProviderRequestSnapshot(record, fallbackResult.providerRequest);
             this.attachRecordDebug(record, fallbackResult);
+            this.rememberStructuredOutputFallback(resolved.fallbackResourceId, resolved.model, fallbackResult);
             if (fallbackResult.ok) {
                 const meta: LLMRunMeta = {
                     requestId: this.getActiveAttemptRequestId(record),
@@ -1180,6 +1004,14 @@ export class LLMSDKImpl {
             retryable: primaryResult.retryable,
             reasonCode: primaryResult.reasonCode,
         };
+    }
+
+    private rememberStructuredOutputFallback(resourceId: string, model: string | undefined, result: { structuredOutput?: { plannedTransport: string; actualTransport: string; fallbackReason?: string } }): void {
+        if (result.structuredOutput?.plannedTransport === 'json_schema'
+            && result.structuredOutput.actualTransport === 'json_object'
+            && result.structuredOutput.fallbackReason === 'response_format_unsupported') {
+            this.unsupportedStrictSchemaResources.add(`${resourceId}:${model || ''}`);
+        }
     }
 
     private attachRecordDebug(record: RequestRecord, result: {
@@ -1531,10 +1363,8 @@ export class LLMSDKImpl {
     private async tryProvider(
         resourceId: string,
         req: LLMRequest,
-        schema: unknown,
-        normalizeMode: 'proposal' | 'world_template' | 'none',
+        schema: object | undefined,
         consumer: string,
-        taskKey: string,
         maxLatencyMs?: number,
         signal?: AbortSignal,
     ): Promise<{
@@ -1550,6 +1380,7 @@ export class LLMSDKImpl {
         normalizedResponse?: unknown;
         validationErrors?: string[];
         providerRequest?: Record<string, unknown>;
+        structuredOutput?: { plannedTransport: string; actualTransport: string; fallbackReason?: string };
     }> {
         try {
             const provider = this.router.getProvider(resourceId);
@@ -1565,7 +1396,6 @@ export class LLMSDKImpl {
                 ])
                 : await provider.request({ ...req, signal });
 
-            const runtimeSchema = schema;
             const finishReason = String((response as { finishReason?: unknown }).finishReason ?? '').trim().toLowerCase();
 
             if (finishReason === 'length') {
@@ -1574,67 +1404,74 @@ export class LLMSDKImpl {
                     ok: false,
                     error: `模型输出被截断：已触发 max_tokens=${Number(req.maxTokens ?? 0) || 0} 上限，返回的 JSON 未完整结束`,
                     retryable: true,
-                    reasonCode: 'token_limit_exceeded',
+                    reasonCode: schema === undefined ? 'token_limit_exceeded' : 'structured_output_truncated',
                     rawResponseText: response.content,
                     providerResponse: response,
                     providerRequest: response.debugRequest,
                 };
             }
 
-            if (runtimeSchema) {
-                const parsed = parseJsonOutput(response.content);
-                if (!parsed.ok) {
-                    this.budgetManager.recordFailure(consumer);
-                    return {
-                        ok: false,
-                        error: `JSON 解析失败: ${parsed.error}`,
-                        retryable: true,
-                        reasonCode: 'invalid_json',
-                        rawResponseText: response.content,
-                        providerResponse: response,
-                        providerRequest: response.debugRequest,
-                    };
-                }
-
-                const normalizedInput = normalizeMode === 'proposal'
-                    ? normalizeProposalEnvelopeInput(parsed.data)
-                    : normalizeMode === 'world_template'
-                        ? normalizeWorldTemplateInput(parsed.data)
-                        : parsed.data;
-                const postProcessedInput = normalizeStructuredCategoryBuckets(normalizedInput);
-
-                if (this.isZodSchema(runtimeSchema)) {
-                    const validation = validateZodSchema(postProcessedInput, runtimeSchema);
-                    if (!validation.valid) {
-                        this.budgetManager.recordFailure(consumer);
-                        return {
-                            ok: false,
-                            error: `Schema Zod 校验失败: ${validation.errors.join('; ')}`,
-                            retryable: true,
-                            reasonCode: 'schema_validation_failed',
-                            rawResponseText: response.content,
-                            providerResponse: response,
-                            parsedResponse: parsed.data,
-                            normalizedResponse: postProcessedInput,
-                            validationErrors: validation.errors,
-                            providerRequest: response.debugRequest,
-                        };
-                    }
-
-                    this.budgetManager.recordSuccess(consumer);
-                    return {
-                        ok: true,
-                        data: validation.data,
-                        rawResponseText: response.content,
-                        providerResponse: response,
-                        parsedResponse: parsed.data,
-                        normalizedResponse: postProcessedInput,
-                        providerRequest: response.debugRequest,
-                    };
-                }
-
+            if (schema === undefined) {
                 this.budgetManager.recordSuccess(consumer);
                 return {
+                    ok: true,
+                    data: response.content,
+                    rawResponseText: response.content,
+                    providerResponse: response,
+                    providerRequest: response.debugRequest,
+                    structuredOutput: response.structuredOutput,
+                };
+            }
+
+            if (!String(response.content || '').trim()) {
+                this.budgetManager.recordFailure(consumer);
+                return {
+                    ok: false,
+                    error: '模型返回空内容，未生成结构化 JSON。',
+                    retryable: true,
+                    reasonCode: 'structured_output_empty',
+                    providerResponse: response,
+                    providerRequest: response.debugRequest,
+                    structuredOutput: response.structuredOutput,
+                };
+            }
+
+            const parsed = parseJsonOutput(response.content);
+            if (!parsed.ok) {
+                this.budgetManager.recordFailure(consumer);
+                return {
+                    ok: false,
+                    error: `JSON 解析失败: ${parsed.error}`,
+                    retryable: true,
+                    reasonCode: 'invalid_json',
+                    rawResponseText: response.content,
+                    providerResponse: response,
+                    providerRequest: response.debugRequest,
+                    structuredOutput: response.structuredOutput,
+                };
+            }
+
+            const postProcessedInput = normalizeStructuredCategoryBuckets(parsed.data);
+            const validation = validateJsonSchema(postProcessedInput, schema);
+            if (!validation.valid) {
+                this.budgetManager.recordFailure(consumer);
+                return {
+                    ok: false,
+                    error: `Schema 校验失败: ${validation.errors.join('; ')}`,
+                    retryable: true,
+                    reasonCode: 'schema_validation_failed',
+                    rawResponseText: response.content,
+                    providerResponse: response,
+                    parsedResponse: parsed.data,
+                    normalizedResponse: postProcessedInput,
+                    validationErrors: validation.errors,
+                    providerRequest: response.debugRequest,
+                    structuredOutput: response.structuredOutput,
+                };
+            }
+
+            this.budgetManager.recordSuccess(consumer);
+            return {
                 ok: true,
                 data: postProcessedInput,
                 rawResponseText: response.content,
@@ -1642,16 +1479,7 @@ export class LLMSDKImpl {
                 parsedResponse: parsed.data,
                 normalizedResponse: postProcessedInput,
                 providerRequest: response.debugRequest,
-            };
-            }
-
-            this.budgetManager.recordSuccess(consumer);
-            return {
-                ok: true,
-                data: response.content,
-                rawResponseText: response.content,
-                providerResponse: response,
-                providerRequest: response.debugRequest,
+                structuredOutput: response.structuredOutput,
             };
         } catch (error) {
             this.budgetManager.recordFailure(consumer);

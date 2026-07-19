@@ -1,40 +1,10 @@
 /**
- * 功能：定义严格 schema 自动填充模式。
- */
-export type StrictSchemaAutofillMode = 'default' | 'off' | 'force';
-
-/**
- * 功能：定义严格 schema 不兼容时的处理策略。
- */
-export type StrictSchemaOnIncompatible = 'downgrade' | 'error';
-
-/**
- * 功能：定义请求级 schema 兼容控制项。
- */
-export interface SchemaCompatOptions {
-    strictAutofill?: StrictSchemaAutofillMode;
-    onIncompatible?: StrictSchemaOnIncompatible;
-}
-
-/**
  * 功能：描述严格 schema 兼容性检查的诊断结果。
  */
 export interface StrictSchemaCompatibilityDiagnostic {
     compatible: boolean;
     path?: string;
     reason?: string;
-}
-
-/**
- * 功能：定义严格 schema 处理结果。
- */
-export interface StrictSchemaProcessingResult {
-    schema: object | undefined;
-    originalCompatible: boolean;
-    autofillApplied: boolean;
-    providerCompatible: boolean;
-    originalDiagnostic: StrictSchemaCompatibilityDiagnostic;
-    providerDiagnostic: StrictSchemaCompatibilityDiagnostic;
 }
 
 /**
@@ -54,83 +24,6 @@ export function isStrictJsonSchemaCompatible(schema: unknown): boolean {
 export function inspectStrictJsonSchemaCompatibility(schema: unknown): StrictSchemaCompatibilityDiagnostic {
     const diagnostic = checkStrictJsonSchemaNode(schema, '$', 0);
     return diagnostic || { compatible: true };
-}
-
-/**
- * 功能：将普通 JSON Schema 规整成更兼容严格 json_schema 的版本。
- * @param schema 原始 schema。
- * @returns 规整后的 schema；无法处理时返回原值的安全副本。
- */
-export function sanitizeStrictJsonSchemaForProvider(schema: unknown): object | undefined {
-    if (!schema || typeof schema !== 'object' || Array.isArray(schema)) {
-        return undefined;
-    }
-    const cloned = deepCloneSchema(schema as object);
-    sanitizeStrictJsonSchemaNode(cloned, 0);
-    return cloned;
-}
-
-/**
- * 功能：按请求级选项处理 provider 专用 schema。
- * @param schema 原始 schema。
- * @param options 兼容选项。
- * @returns 处理结果。
- */
-export function processProviderStrictJsonSchema(
-    schema: object | undefined,
-    options?: SchemaCompatOptions,
-): StrictSchemaProcessingResult {
-    const originalDiagnostic = inspectStrictJsonSchemaCompatibility(schema);
-    const originalCompatible = originalDiagnostic.compatible;
-    const strictAutofill = options?.strictAutofill ?? 'default';
-
-    if (!schema) {
-        return {
-            schema: undefined,
-            originalCompatible,
-            autofillApplied: false,
-            providerCompatible: false,
-            originalDiagnostic,
-            providerDiagnostic: {
-                compatible: false,
-                path: '$',
-                reason: 'schema_missing',
-            },
-        };
-    }
-
-    if (strictAutofill === 'off') {
-        return {
-            schema,
-            originalCompatible,
-            autofillApplied: false,
-            providerCompatible: originalCompatible,
-            originalDiagnostic,
-            providerDiagnostic: originalDiagnostic,
-        };
-    }
-
-    if (strictAutofill === 'default' && originalCompatible) {
-        return {
-            schema,
-            originalCompatible,
-            autofillApplied: false,
-            providerCompatible: true,
-            originalDiagnostic,
-            providerDiagnostic: originalDiagnostic,
-        };
-    }
-
-    const sanitized = sanitizeStrictJsonSchemaForProvider(schema);
-    const providerDiagnostic = inspectStrictJsonSchemaCompatibility(sanitized);
-    return {
-        schema: sanitized ?? schema,
-        originalCompatible,
-        autofillApplied: true,
-        providerCompatible: providerDiagnostic.compatible,
-        originalDiagnostic,
-        providerDiagnostic,
-    };
 }
 
 /**
@@ -220,43 +113,3 @@ function checkStrictJsonSchemaNode(
     return null;
 }
 
-/**
- * 功能：递归规整 schema 节点。
- * @param node 当前 schema 节点。
- * @param depth 当前递归深度。
- */
-function sanitizeStrictJsonSchemaNode(node: unknown, depth: number): void {
-    if (!node || typeof node !== 'object' || Array.isArray(node)) {
-        return;
-    }
-    if (depth >= 20) {
-        return;
-    }
-
-    const record = node as Record<string, unknown>;
-    if (record.type === 'object' && record.properties && typeof record.properties === 'object' && !Array.isArray(record.properties)) {
-        const properties = record.properties as Record<string, unknown>;
-        record.additionalProperties = false;
-        record.required = Object.keys(properties);
-        for (const child of Object.values(properties)) {
-            sanitizeStrictJsonSchemaNode(child, depth + 1);
-        }
-    }
-
-    if (record.items !== undefined) {
-        sanitizeStrictJsonSchemaNode(record.items, depth + 1);
-    }
-
-    if (record.additionalProperties && typeof record.additionalProperties === 'object' && !Array.isArray(record.additionalProperties)) {
-        sanitizeStrictJsonSchemaNode(record.additionalProperties, depth + 1);
-    }
-}
-
-/**
- * 功能：深拷贝 schema 对象，避免修改调用方原始引用。
- * @param schema 原始 schema。
- * @returns 深拷贝后的 schema。
- */
-function deepCloneSchema<T extends object>(schema: T): T {
-    return JSON.parse(JSON.stringify(schema)) as T;
-}

@@ -9,9 +9,11 @@ import { GeminiProvider } from '../providers/gemini-provider';
 import { OpenAIProvider } from '../providers/openai-provider';
 import { TavernProvider } from '../providers/tavern-provider';
 import type { LLMProvider } from '../providers/types';
+import { detectStructuredOutputIdentity } from '../schema/structured-output-plan';
 import { ConsumerRegistry } from '../registry/consumer-registry';
 import { BUILTIN_TAVERN_RESOURCE_ID, TaskRouter } from '../router/router';
 import { LLMSDKImpl } from '../sdk/llm-sdk';
+import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
 import { createLlmSdkServiceHandlers, publishRouteChanged, type LlmServiceHandlers } from './services';
 import { LlmWorkspaceRepository, type PreparedSettingsRuntime, type SettingsRuntimePrepareOptions } from '../storage/llm-workspace-repository';
@@ -31,15 +33,19 @@ export interface ProductionLlmServiceOptions {
 }
 
 export function createProviderFromResource(resource: ResourceConfig, apiKey: string): LLMProvider {
+    const identity = resource.apiType === 'generic'
+        ? { vendor: 'unknown' as const, evidence: 'manual' as const, confidence: 'high' as const, ...(resource.model ? { model: resource.model } : {}) }
+        : detectStructuredOutputIdentity({ manualVendor: resource.apiType, baseUrl: resource.baseUrl, model: resource.model });
+    const resolvedApiType = identity.vendor === 'unknown' ? 'generic' : identity.vendor;
     const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl: fetch };
     if (resource.type === 'rerank') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath });
-    if (resource.apiType === 'claude') return new ClaudeProvider(base);
-    if (resource.apiType === 'gemini') return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
-    return new OpenAIProvider({ ...base, apiType: resource.apiType, enableRerank: resource.capabilities?.includes('rerank') });
+    if (resolvedApiType === 'claude') return new ClaudeProvider(base);
+    if (resolvedApiType === 'gemini') return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
+    return new OpenAIProvider({ ...base, apiType: resolvedApiType, structuredOutputIdentity: identity, enableRerank: resource.capabilities?.includes('rerank') });
 }
 
 export function createProductionLlmServices(
-    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events'>,
+    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1'>,
     options: ProductionLlmServiceOptions = {},
 ): LlmServiceHandlers {
     const router = new TaskRouter();
@@ -47,7 +53,8 @@ export function createProductionLlmServices(
     const budget = new BudgetManager();
     const display = new DisplayController();
     const repository = options.repository;
-    const settingsState: { value: LLMHubSettings } = { value: options.settings?.() ?? { enabled: true, globalProfile: 'balanced', maxTokensControl: { mode: 'adaptive' } } };
+    const initialSettings = options.settings?.() ?? {};
+    const settingsState: { value: LLMHubSettings } = { value: { ...DEFAULT_LLM_SETTINGS, ...initialSettings, maxTokensControl: initialSettings.maxTokensControl ?? { mode: 'adaptive' } } };
     router.setRegistry(registry);
     registry.setResourceCapabilityQuery((resourceId) => router.getProviderCapabilities(resourceId));
     router.registerProvider(new TavernProvider({ id: BUILTIN_TAVERN_RESOURCE_ID, generation: session.host.generation }), 'generation', ['chat', 'json']);
@@ -56,7 +63,11 @@ export function createProductionLlmServices(
     let statusRevision = 0;
     const notifyCapabilityChange = (kinds: readonly LlmCapabilityKind[]): void => {
         statusRevision += 1;
-        session.events.publish(LLM_CAPABILITY_STATUS_CHANGED_V1, { revision: statusRevision, kinds: [...new Set(kinds)] });
+        try {
+            session.events.publish(LLM_CAPABILITY_STATUS_CHANGED_V1, { revision: statusRevision, kinds: [...new Set(kinds)] });
+        } catch {
+            // Event delivery is best effort and must not turn an applied runtime update into a failed save.
+        }
     };
     for (const registration of options.providers ?? []) {
         router.registerProvider(registration.provider, registration.resourceType, registration.capabilities === undefined ? undefined : [...registration.capabilities], registration.defaultModel);
@@ -70,7 +81,7 @@ export function createProductionLlmServices(
 
     const prepareRuntime = async (input: LLMHubSettings, options: SettingsRuntimePrepareOptions = {}): Promise<PreparedSettingsRuntime> => {
         const generation = ++applyGeneration;
-        const settings = validateLlmSettings(input);
+        const settings = { ...DEFAULT_LLM_SETTINGS, ...validateLlmSettings(input) };
         const resources = Array.isArray(settings.resources) ? settings.resources : [];
         const registrations: ProductionLlmProviderRegistration[] = [];
         const built: LLMProvider[] = [];
@@ -108,6 +119,7 @@ export function createProductionLlmServices(
                 const oldProviders = [...managed].map((id) => router.getProvider(id)).filter((provider): provider is LLMProvider => Boolean(provider));
                 settingsState.value = { ...settings };
                 sdk.setGlobalProfile(settings.globalProfile ?? 'balanced');
+                router.applyGenerationSource(settings.generationSource);
                 router.applyGlobalAssignments(settings.globalAssignments ?? {});
                 router.applyPluginAssignments(settings.pluginAssignments ?? []);
                 router.applyTaskAssignments(settings.taskAssignments ?? []);
@@ -117,8 +129,13 @@ export function createProductionLlmServices(
                 managed.clear();
                 for (const registration of registrations) managed.add(registration.provider.id);
                 for (const provider of oldProviders) provider.dispose?.();
-                const nextGenerationRoute = settings.globalAssignments?.generation?.resourceId;
-                if (nextGenerationRoute && nextGenerationRoute !== lastGenerationRoute) { publishRouteChanged(session, lastGenerationRoute, nextGenerationRoute, 'configured'); lastGenerationRoute = nextGenerationRoute; }
+                const nextGenerationRoute = settings.generationSource === 'tavern' ? BUILTIN_TAVERN_RESOURCE_ID : settings.globalAssignments?.generation?.resourceId;
+                if (nextGenerationRoute && nextGenerationRoute !== lastGenerationRoute) {
+                    try { publishRouteChanged(session, lastGenerationRoute, nextGenerationRoute, 'configured'); } catch {
+                        // A failing subscriber must not roll back an already applied route update.
+                    }
+                    lastGenerationRoute = nextGenerationRoute;
+                }
                 notifyCapabilityChange(['generation', 'embedding', 'rerank']);
                 committed = true;
             },
@@ -135,7 +152,10 @@ export function createProductionLlmServices(
         const settings = settingsState.value;
         const resources = Array.isArray(settings.resources) ? settings.resources : [];
         const entries = await Promise.all(request.checks.map(async (check) => {
-            const base = { id: check.id };
+            const base = {
+                id: check.id,
+                ...(check.taskKind === 'generation' ? { source: settings.generationSource } : {}),
+            };
             if (settings.enabled === false) return { ...base, configured: false, available: false, reason: 'llm_disabled' as const };
             const required = [...(check.requiredCapabilities ?? (check.taskKind === 'generation' ? ['chat', 'json'] : check.taskKind === 'embedding' ? ['embeddings'] : ['rerank']))] as LLMCapability[];
             const candidates = resources.filter((resource) => {
@@ -156,7 +176,7 @@ export function createProductionLlmServices(
             try { route = router.resolveRoute({ consumer: 'ss-helper.memory', taskKind: check.taskKind, taskKey: check.taskKey, requiredCapabilities: required as never }); } catch {
                 if (missingCredential) return { ...base, configured: false, available: false, reason: 'credential_missing' as const };
                 if (candidates.length > 0 && enabledCandidates.length === 0) return { ...base, configured: false, available: false, reason: 'resource_disabled' as const };
-                if (candidates.length === 0 && check.taskKind !== 'generation') return { ...base, configured: false, available: false, reason: 'no_resource' as const };
+                if (candidates.length === 0 && (check.taskKind !== 'generation' || settings.generationSource === 'custom')) return { ...base, configured: false, available: false, reason: 'no_resource' as const };
                 return { ...base, configured: false, available: false, reason: 'route_unavailable' as const };
             }
             if (route.resourceId === BUILTIN_TAVERN_RESOURCE_ID) {
@@ -165,8 +185,8 @@ export function createProductionLlmServices(
                     const current = await session.host.generation.current();
                     const model = current.model ?? route.model;
                     const provider = current.provider;
-                    if (!available || !provider || !model) return { ...base, configured: false, available: false, reason: 'tavern_unavailable' as const };
-                    return { ...base, configured: true, available: true, source: 'tavern' as const, model };
+                    if (!available || !provider) return { ...base, configured: false, available: false, reason: 'tavern_unavailable' as const };
+                    return { ...base, configured: true, available: true, source: 'tavern' as const, ...(model === undefined ? {} : { model }) };
                 } catch { return { ...base, configured: false, available: false, reason: 'status_unavailable' as const }; }
             }
             const resource = resources.find((item) => item.id === route.resourceId);

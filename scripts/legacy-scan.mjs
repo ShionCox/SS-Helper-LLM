@@ -13,6 +13,13 @@ const forbidden = [
   /MemoryOS/i,
   /ss-helper-plugins-container/,
   /#extensions_settings/,
+  /\bjsonMode\b/,
+  /\bpreferredResponseFormat\b/,
+  /\bschemaCompat\b/,
+  /\bsystem_json\b/,
+  /legacyGenerate/,
+  /Generate\('quiet'/,
+  /tavernSource\s*===\s*['"]custom['"]\s*&&/,
 ];
 const shippedGuideForbidden = [
   /window\.STX/,

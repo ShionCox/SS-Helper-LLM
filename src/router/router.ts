@@ -7,6 +7,7 @@ import type {
     ResourceType,
     GlobalAssignments,
     AssignmentEntry,
+    GenerationSource,
     PluginAssignment,
     TaskAssignment,
 } from '../schema/types';
@@ -26,7 +27,7 @@ export interface ProviderRegistration {
  * 资源感知任务路由器
  *
  * 路由优先级：
- *   routeHint → 任务分配 → 插件注册推荐 → 插件分配 → 全局分配 → 内置酒馆(仅生成) → fallback
+ *   generation 来源门控 → routeHint → 任务分配 → 插件注册推荐 → 插件分配 → 全局分配 → fallback
  */
 export class TaskRouter {
     private providers: Map<string, LLMProvider> = new Map();
@@ -37,6 +38,7 @@ export class TaskRouter {
     private globalAssignments: GlobalAssignments = {};
     private pluginAssignments: Map<string, PluginAssignment> = new Map();
     private taskAssignments: Map<string, TaskAssignment> = new Map();
+    private generationSource: GenerationSource = 'tavern';
 
     private registry: ConsumerRegistry | null = null;
 
@@ -125,6 +127,10 @@ export class TaskRouter {
 
     // ─── 分配设置管理 ───
 
+    applyGenerationSource(source: GenerationSource): void {
+        this.generationSource = source;
+    }
+
     applyGlobalAssignments(assignments: GlobalAssignments): void {
         this.globalAssignments = { ...assignments };
     }
@@ -150,7 +156,7 @@ export class TaskRouter {
 
         // 1. routeHint
         if (routeHint?.resourceId) {
-            if (this.providerSatisfies(routeHint.resourceId, requiredCapabilities)) {
+            if (this.providerSatisfiesTask(routeHint.resourceId, taskKind, requiredCapabilities)) {
                 return {
                     resourceId: routeHint.resourceId,
                     model: routeHint.model || this.resolveDefaultModel(routeHint.resourceId),
@@ -164,7 +170,7 @@ export class TaskRouter {
         if (taskKey) {
             const assignment = this.taskAssignments.get(`${consumer}::${taskKey}`);
             if (assignment?.resourceId && !assignment.isStale) {
-                if (this.providerSatisfies(assignment.resourceId, requiredCapabilities)) {
+                if (this.providerSatisfiesTask(assignment.resourceId, taskKind, requiredCapabilities)) {
                     return {
                         resourceId: assignment.resourceId,
                         model: assignment.model || this.resolveDefaultModel(assignment.resourceId),
@@ -178,7 +184,7 @@ export class TaskRouter {
         if (taskKey && this.registry) {
             const taskDesc = this.registry.getTaskDescriptor(consumer, taskKey);
             if (taskDesc?.recommendedRoute?.resourceId) {
-                if (this.providerSatisfies(taskDesc.recommendedRoute.resourceId, requiredCapabilities)) {
+                if (this.providerSatisfiesTask(taskDesc.recommendedRoute.resourceId, taskKind, requiredCapabilities)) {
                     return {
                         resourceId: taskDesc.recommendedRoute.resourceId,
                         model: this.resolveDefaultModel(taskDesc.recommendedRoute.resourceId),
@@ -193,7 +199,7 @@ export class TaskRouter {
         const pluginAssignment = this.pluginAssignments.get(consumer);
         const pluginEntry = pluginAssignment?.[taskKind] as AssignmentEntry | undefined;
         if (pluginEntry?.resourceId) {
-            if (this.providerSatisfies(pluginEntry.resourceId, requiredCapabilities)) {
+            if (this.providerSatisfiesTask(pluginEntry.resourceId, taskKind, requiredCapabilities)) {
                 return {
                     resourceId: pluginEntry.resourceId,
                     model: pluginEntry.model || this.resolveDefaultModel(pluginEntry.resourceId),
@@ -205,7 +211,7 @@ export class TaskRouter {
         // 5. 全局分配
         const globalEntry = this.globalAssignments[taskKind] as AssignmentEntry | undefined;
         if (globalEntry?.resourceId) {
-            if (this.providerSatisfies(globalEntry.resourceId, requiredCapabilities)) {
+            if (this.providerSatisfiesTask(globalEntry.resourceId, taskKind, requiredCapabilities)) {
                 return {
                     resourceId: globalEntry.resourceId,
                     model: globalEntry.model || this.resolveDefaultModel(globalEntry.resourceId),
@@ -214,10 +220,10 @@ export class TaskRouter {
             }
         }
 
-        // 6. 内置酒馆回退（仅生成类）
-        if (taskKind === 'generation') {
+        // 6. 酒馆模式只允许内置酒馆；自定义模式会在这里跳过。
+        if (taskKind === 'generation' && this.generationSource === 'tavern') {
             if (this.providers.has(BUILTIN_TAVERN_RESOURCE_ID)) {
-                if (this.providerSatisfies(BUILTIN_TAVERN_RESOURCE_ID, requiredCapabilities)) {
+                if (this.providerSatisfiesTask(BUILTIN_TAVERN_RESOURCE_ID, taskKind, requiredCapabilities)) {
                     return {
                         resourceId: BUILTIN_TAVERN_RESOURCE_ID,
                         model: this.resolveDefaultModel(BUILTIN_TAVERN_RESOURCE_ID),
@@ -230,7 +236,7 @@ export class TaskRouter {
         // 7. 终极 fallback: 先找同类型资源
         for (const [rid] of this.providers) {
             const rType = this.resourceTypes.get(rid);
-            if (rType === taskKind && this.providerSatisfies(rid, requiredCapabilities)) {
+            if (rType === taskKind && this.providerSatisfiesTask(rid, taskKind, requiredCapabilities)) {
                 return {
                     resourceId: rid,
                     model: this.resolveDefaultModel(rid),
@@ -241,7 +247,7 @@ export class TaskRouter {
 
         // 8. 跨类型 fallback：允许具备所需能力的资源参与，例如 generation 资源承担 rerank
         for (const [rid] of this.providers) {
-            if (this.providerSatisfies(rid, requiredCapabilities)) {
+            if (this.providerSatisfiesTask(rid, taskKind, requiredCapabilities)) {
                 return {
                     resourceId: rid,
                     model: this.resolveDefaultModel(rid),
@@ -287,6 +293,16 @@ export class TaskRouter {
         const caps = this.providerCapabilities.get(resourceId);
         if (!caps) return false;
         return required.every(c => caps.includes(c));
+    }
+
+    private providerSatisfiesTask(resourceId: string, taskKind: CapabilityKind, required?: LLMCapability[]): boolean {
+        const tavern = resourceId === BUILTIN_TAVERN_RESOURCE_ID;
+        if (taskKind === 'generation') {
+            if (this.generationSource === 'tavern' ? !tavern : tavern) return false;
+        } else if (tavern) {
+            return false;
+        }
+        return this.providerSatisfies(resourceId, required);
     }
 
     private resolveDefaultModel(resourceId: string): string | undefined {

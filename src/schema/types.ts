@@ -223,19 +223,20 @@ export interface LLMRequestLogRequestSnapshot {
     enqueue?: unknown;
     schemaSummary?: string;
     schema?: unknown;
-    jsonMode?: boolean;
-    strictSchemaCompatible?: boolean;
-    originalStrictSchemaCompatible?: boolean;
-    providerSchemaCompatible?: boolean;
-    schemaAutofillApplied?: boolean;
-    schemaCompatMode?: string;
-    originalStrictIncompatibilityPath?: string;
-    originalStrictIncompatibilityReason?: string;
-    providerStrictIncompatibilityPath?: string;
-    providerStrictIncompatibilityReason?: string;
-    responseFormatResolved?: string;
-    responseFormatBeforeCompat?: string;
-    responseFormatAfterCompat?: string;
+    structuredOutput?: {
+        vendor: string;
+        detectionEvidence: string;
+        confidence: 'high' | 'medium' | 'low';
+        transport: string;
+        strictSchemaCompatible: boolean;
+        contextMode?: 'chat' | 'isolated';
+        nativeJsonMode?: boolean;
+        nativeSchemaSent?: boolean;
+        manualRetryRepair?: {
+            reasonCode: string;
+            state: 'queued' | 'applied';
+        };
+    };
     resolvedMaxTokens?: {
         value: number;
         source: string;
@@ -294,6 +295,16 @@ export interface LLMRequestLogEntry {
     truncated?: Record<string, unknown>;
 }
 
+export type LLMLogDetailMode = 'full' | 'failed-full' | 'summary' | 'off';
+
+export interface LLMRequestLoggingSettings {
+    enabled?: boolean;
+    detailMode?: LLMLogDetailMode;
+    maxEntries?: number;
+    retentionDays?: number;
+    maxBytes?: number;
+}
+
 export interface LLMRequestLogQueryOptions {
     limit?: number;
     offset?: number;
@@ -331,6 +342,11 @@ export interface RequestRecord<T = unknown> {
     meta?: LLMRunMeta;
     debug?: RequestDebugInfo;
     requestLogSnapshot?: LLMRequestLogRequestSnapshot;
+    /** 用户确认结构化失败后，仅用于下一次手动重试的修正指令。 */
+    structuredRetryRepair?: {
+        reasonCode: string;
+        instruction: string;
+    };
 }
 
 // ═══════════════════════════════════════════
@@ -400,8 +416,11 @@ export type ResourceType = 'generation' | 'embedding' | 'rerank';
 /** 资源来源 */
 export type ResourceSource = 'tavern' | 'custom';
 
+/** 大语言模型生成来源策略 */
+export type GenerationSource = 'tavern' | 'custom';
+
 /** 自定义 API 协议类型 */
-export type ApiType = 'openai' | 'deepseek' | 'gemini' | 'claude' | 'generic';
+export type ApiType = 'auto' | 'openai' | 'deepseek' | 'gemini' | 'claude' | 'generic';
 
 /** 资源级自定义请求参数 */
 export type ResourceCustomParams = Record<string, unknown>;
@@ -411,7 +430,7 @@ export interface ResourceConfig {
     id: string;
     type: ResourceType;
     source: ResourceSource;
-    apiType?: ApiType;
+    apiType: ApiType;
     label: string;
     baseUrl?: string;
     model?: string;
@@ -490,11 +509,14 @@ export interface SilentPermissionGrant {
 /** LLMHub 完整设置 */
 export interface LLMHubSettings {
     enabled?: boolean;
+    /** 大语言模型生成来源；不影响 embedding 与 rerank */
+    generationSource?: GenerationSource;
     timeoutMs?: number;
     maxTokensMode?: MaxTokensMode;
     maxTokens?: number;
     resultDisplay?: 'auto' | 'silent' | 'compact' | 'fullscreen';
     detailedLogs?: boolean;
+    requestLogging?: LLMRequestLoggingSettings;
     globalProfile?: string;
     /** 全局 max_tokens 控制 */
     maxTokensControl?: GlobalMaxTokensControl;
@@ -571,8 +593,7 @@ export interface RunTaskArgs<T = unknown> {
     taskDescription?: string;
     taskKind: CapabilityKind;
     input: any;
-    schema?: any;
-    schemaCompat?: import('./strict-json-schema').SchemaCompatOptions;
+    schema?: object;
     routeHint?: { resource?: string; profile?: string; model?: string };
     budget?: { maxTokens?: number; maxLatencyMs?: number };
     enqueue?: RequestEnqueueOptions;

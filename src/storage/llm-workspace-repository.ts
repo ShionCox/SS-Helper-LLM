@@ -8,6 +8,7 @@ import type {
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMHubSettings } from '../schema/types';
 import { validateLlmSettings } from '../validation/settings';
+import { buildStoredLog } from '../log/log-sanitizer';
 
 export const LLM_WORKSPACE_ID = 'llm:global';
 export const LLM_WORKSPACE_OWNER = 'ss-helper.llm';
@@ -16,6 +17,9 @@ const MAX_PAGE_SIZE = 1_000;
 const MAX_TRANSACTION_OPERATIONS = 5_000;
 const MAX_ARCHIVE_BYTES = 1_024 * 1_024;
 const MAX_CONSUMERS = 1_000;
+const DEFAULT_LOG_MAX_ENTRIES = 500;
+const DEFAULT_LOG_RETENTION_DAYS = 30;
+const DEFAULT_LOG_MAX_BYTES = 100 * 1024 * 1024;
 type PersistedSettings = LLMHubSettings & { timeoutMs?: number; resultDisplay?: 'auto' | 'silent' | 'compact' | 'fullscreen' };
 type LogKind = 'generation' | 'embedding' | 'rerank';
 
@@ -54,29 +58,6 @@ function credentialId(resourceId: string): string { return `resource:${resourceI
 function operationKey(prefix: string, suffix?: string): string { return `${prefix}:${globalThis.crypto.randomUUID()}${suffix ? `:${suffix}` : ''}`; }
 function safeError(message: string, code: string, extra: Record<string, unknown> = {}): Error & { code: string } { return Object.assign(new Error(message), { code, ...extra }); }
 
-function redactLog(entry: Record<string, unknown>): PlainData {
-  const request = entry.request && typeof entry.request === 'object' && !Array.isArray(entry.request) ? entry.request as Record<string, unknown> : undefined;
-  const response = entry.response && typeof entry.response === 'object' && !Array.isArray(entry.response) ? entry.response as Record<string, unknown> : undefined;
-  const meta = response?.meta && typeof response.meta === 'object' && !Array.isArray(response.meta) ? response.meta as Record<string, unknown> : undefined;
-  const rawMetrics = request?.metrics && typeof request.metrics === 'object' && !Array.isArray(request.metrics) ? request.metrics as Record<string, unknown> : {};
-  const metrics = Object.fromEntries(['messageCount', 'embeddingTextCount', 'rerankDocCount', 'schemaCharCount', 'inputCharCount', 'outputCharCount']
-    .flatMap((key) => typeof rawMetrics[key] === 'number' && Number.isFinite(rawMetrics[key]) && rawMetrics[key] >= 0 ? [[key, rawMetrics[key]]] : []));
-  return asPlain({
-    logId: entry.logId,
-    requestId: entry.requestId,
-    sourcePluginId: entry.sourcePluginId,
-    taskKey: entry.taskKey,
-    state: entry.state,
-    createdAt: entry.createdAt ?? Date.now(),
-    startedAt: entry.startedAt,
-    completedAt: entry.completedAt,
-    latencyMs: entry.latencyMs,
-    resourceId: meta?.resourceId,
-    request: request ? { taskKind: request.taskKind, metrics } : undefined,
-    response: response ? { meta: meta ? { resourceId: meta.resourceId, model: meta.model, provider: meta.provider } : undefined, reasonCode: response.reasonCode } : undefined,
-  });
-}
-
 async function sha256Json(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
   const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
@@ -104,7 +85,7 @@ export class LlmWorkspaceRepository {
 
   private async initialize(): Promise<void> {
     await this.workspace.open({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, create: true, metadata: { owner: LLM_WORKSPACE_OWNER, purpose: 'LLM browser configuration and runtime state' } });
-    await Promise.all(COLLECTIONS.map((name) => this.workspace.defineCollection({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, name, indexes: name === 'request-logs' ? ['sourcePluginId', 'state', 'resourceId', 'taskKey', 'createdAt'] : [] })));
+    await Promise.all(COLLECTIONS.map((name) => this.workspace.defineCollection({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, name, indexes: name === 'request-logs' ? ['sourcePluginId', 'state', 'resourceId', 'taskKey', 'taskKind', 'model', 'reasonCode', 'createdAt'] : [] })));
     await this.loadSettings();
   }
 
@@ -140,7 +121,16 @@ export class LlmWorkspaceRepository {
     return records;
   }
 
-  private settingsFrom(value: LLMHubSettings): PersistedSettings { return { ...DEFAULT_LLM_SETTINGS, ...value }; }
+  private settingsFrom(value: LLMHubSettings): PersistedSettings {
+    return {
+      ...DEFAULT_LLM_SETTINGS,
+      ...value,
+      requestLogging: {
+        ...DEFAULT_LLM_SETTINGS.requestLogging,
+        ...(value.requestLogging ?? {}),
+      },
+    };
+  }
 
   async loadSettings(): Promise<PersistedSettings> {
     await this.workspace.open({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, create: true });
@@ -349,9 +339,54 @@ export class LlmWorkspaceRepository {
   }
 
   async saveLog(entry: PlainData): Promise<void> {
-    await this.ready();
-    const value = redactLog(entry as Record<string, unknown>);
-    await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-log'), operations: [{ action: 'upsert', collection: 'request-logs', recordId: globalThis.crypto.randomUUID(), value }] });
+    return this.enqueue(async () => {
+      await this.ready();
+      const raw = entry as Record<string, unknown>;
+      const settings = this.settingsFrom(this.settings);
+      const logging = settings.requestLogging ?? {};
+      const mode = logging.enabled === false ? 'off' : (logging.detailMode ?? 'full');
+      const stored = buildStoredLog(raw, mode);
+      if (!stored) return;
+      await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-log'), operations: [{ action: 'upsert', collection: 'request-logs', recordId: globalThis.crypto.randomUUID(), value: stored.value }] });
+      await this.pruneLogsLocked();
+    });
+  }
+
+  private async pruneLogsLocked(): Promise<number> {
+    const logging = this.settingsFrom(this.settings).requestLogging ?? {};
+    const maxEntries = Math.max(1, logging.maxEntries ?? DEFAULT_LOG_MAX_ENTRIES);
+    const retentionDays = Math.max(1, logging.retentionDays ?? DEFAULT_LOG_RETENTION_DAYS);
+    const maxBytes = Math.max(1, logging.maxBytes ?? DEFAULT_LOG_MAX_BYTES);
+    const now = Date.now();
+    const cutoff = now - retentionDays * 86_400_000;
+    const records = await this.queryAll('request-logs', { orderBy: { field: 'createdAt', direction: 'asc' } });
+    const recordsWithSize = records.map((record) => ({ record, createdAt: Number((record.value as Record<string, unknown>).createdAt ?? 0), size: Number((record.value as Record<string, unknown>).storageBytes ?? JSON.stringify(record.value).length) }));
+    const remove = new Set<WorkspaceRecord>();
+    let survivors = recordsWithSize.filter((item) => {
+      if (item.createdAt > 0 && item.createdAt < cutoff) { remove.add(item.record); return false; }
+      return true;
+    });
+    while (survivors.length > maxEntries) remove.add(survivors.shift()!.record);
+    let totalBytes = survivors.reduce((sum, item) => sum + item.size, 0);
+    while (totalBytes > maxBytes && survivors.length) {
+      const item = survivors.shift()!;
+      totalBytes -= item.size;
+      remove.add(item.record);
+    }
+    if (!remove.size) return 0;
+    const removed = [...remove];
+    let count = 0;
+    for (let index = 0; index < removed.length; index += MAX_TRANSACTION_OPERATIONS) {
+      const batch = removed.slice(index, index + MAX_TRANSACTION_OPERATIONS);
+      const result = await this.workspace.transaction({
+        workspaceId: LLM_WORKSPACE_ID,
+        ownerPluginId: LLM_WORKSPACE_OWNER,
+        idempotencyKey: operationKey('llm-prune-logs'),
+        operations: batch.map((record) => ({ action: 'delete' as const, collection: 'request-logs', recordId: record.recordId, expectedRevision: recordRevision(record) })),
+      });
+      count += result.results.filter((item) => item.removed !== false).length;
+    }
+    return count;
   }
 
   async clearLogs(): Promise<number> {
@@ -380,15 +415,54 @@ export class LlmWorkspaceRepository {
     });
   }
 
-  async queryLogs(input: { state?: string; sourcePluginId?: string; resourceId?: string; search?: string; limit?: number } = {}): Promise<readonly PlainData[]> {
+  async queryLogs(input: { state?: string; sourcePluginId?: string; resourceId?: string; taskKind?: string; model?: string; reasonCode?: string; search?: string; fromTs?: number; toTs?: number; limit?: number; offset?: number } = {}): Promise<readonly PlainData[]> {
     await this.ready();
     const filter: Record<string, PlainData> = {};
     if (input.state && input.state !== 'all') filter.state = input.state;
     if (input.sourcePluginId) filter.sourcePluginId = input.sourcePluginId;
     if (input.resourceId) filter.resourceId = input.resourceId;
-    const page = await this.workspace.query({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'request-logs', filter, orderBy: { field: 'createdAt', direction: 'desc' }, limit: Math.min(500, input.limit ?? 100) });
+    if (input.taskKind) filter.taskKind = input.taskKind;
+    if (input.model) filter.model = input.model;
+    if (input.reasonCode) filter.reasonCode = input.reasonCode;
+    const where = [
+      ...(input.fromTs === undefined ? [] : [{ field: 'createdAt', op: 'gte' as const, value: input.fromTs as PlainData }]),
+      ...(input.toTs === undefined ? [] : [{ field: 'createdAt', op: 'lte' as const, value: input.toTs as PlainData }]),
+    ];
+    const page = await this.workspace.query({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'request-logs', filter, ...(where.length ? { where } : {}), orderBy: { field: 'createdAt', direction: 'desc' }, limit: Math.min(500, input.limit ?? 100) });
     const search = String(input.search ?? '').trim().toLowerCase();
     return page.records.map((record) => record.value).filter((value) => !search || JSON.stringify(value).toLowerCase().includes(search));
+  }
+
+  async deleteLogs(logIds: readonly string[]): Promise<number> {
+    return this.enqueue(async () => {
+      await this.ready();
+      const wanted = new Set(logIds.filter(Boolean));
+      if (!wanted.size) return 0;
+      const records = (await this.queryAll('request-logs')).filter((record) => wanted.has(String((record.value as Record<string, unknown>).logId ?? '')));
+      let removed = 0;
+      for (let index = 0; index < records.length; index += MAX_TRANSACTION_OPERATIONS) {
+        const batch = records.slice(index, index + MAX_TRANSACTION_OPERATIONS);
+        const result = await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-delete-logs'), operations: batch.map((record) => ({ action: 'delete' as const, collection: 'request-logs', recordId: record.recordId, expectedRevision: recordRevision(record) })) });
+        removed += result.results.filter((item) => item.removed !== false).length;
+      }
+      return removed;
+    });
+  }
+
+  async getLogStats(): Promise<{ count: number; failed: number; bytes: number; latestAt?: number; oldestAt?: number; policy: { maxEntries: number; retentionDays: number; maxBytes: number } }> {
+    await this.ready();
+    const records = await this.queryAll('request-logs');
+    const values = records.map((record) => record.value as Record<string, unknown>);
+    const timestamps = values.map((value) => Number(value.createdAt ?? 0)).filter((value) => value > 0);
+    const logging = this.settingsFrom(this.settings).requestLogging ?? {};
+    return {
+      count: values.length,
+      failed: values.filter((value) => value.state === 'failed').length,
+      bytes: values.reduce((sum, value) => sum + Number(value.storageBytes ?? JSON.stringify(value).length), 0),
+      latestAt: timestamps.length ? Math.max(...timestamps) : undefined,
+      oldestAt: timestamps.length ? Math.min(...timestamps) : undefined,
+      policy: { maxEntries: logging.maxEntries ?? DEFAULT_LOG_MAX_ENTRIES, retentionDays: logging.retentionDays ?? DEFAULT_LOG_RETENTION_DAYS, maxBytes: logging.maxBytes ?? DEFAULT_LOG_MAX_BYTES },
+    };
   }
 
   async loadConsumers(): Promise<Record<string, PlainData>> {

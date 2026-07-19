@@ -12,7 +12,7 @@
   ],
   "scripts": {
     "clean": "node -e \"for(const p of ['dist','dist-server'])require('node:fs').rmSync(p,{recursive:true,force:true})\"",
-    "build:browser": "esbuild src/index.ts --bundle --format=esm --platform=browser --outfile=dist/index.js && esbuild src/runtime-entry.ts --bundle --format=esm --platform=browser --outfile=dist/runtime-entry.js && node scripts/verify-browser-artifact.mjs",
+    "build:browser": "esbuild src/index.ts --bundle --format=esm --platform=browser --outfile=dist/index.js && esbuild src/runtime-entry.ts --bundle --format=esm --platform=browser --outfile=dist/runtime-entry.js && esbuild src/ui/request-log-viewer.css --bundle --outfile=dist/style.css && node scripts/verify-browser-artifact.mjs",
     "build": "pnpm run clean && tsc && pnpm run build:browser",
     "typecheck": "tsc --noEmit --pretty false",
     "test": "pnpm run build && node --experimental-vm-modules --test test/**/*.test.mjs",

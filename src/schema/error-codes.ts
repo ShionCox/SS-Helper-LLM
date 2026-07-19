@@ -26,6 +26,14 @@ export enum ReasonCode {
     CONTENT_FILTERED = 'content_filtered',
     /** Token 超出限制 */
     TOKEN_LIMIT_EXCEEDED = 'token_limit_exceeded',
+    /** 结构化任务缺少输出 Schema */
+    OUTPUT_SCHEMA_REQUIRED = 'output_schema_required',
+    /** 结构化输出为空 */
+    STRUCTURED_OUTPUT_EMPTY = 'structured_output_empty',
+    /** 结构化输出被截断 */
+    STRUCTURED_OUTPUT_TRUNCATED = 'structured_output_truncated',
+    /** Provider 不支持请求的格式 */
+    RESPONSE_FORMAT_UNSUPPORTED = 'response_format_unsupported',
 }
 
 /**

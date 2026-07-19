@@ -269,7 +269,8 @@ export class RequestLogService {
                 attemptIndex: logEntry.attemptIndex,
                 error: String((error as Error)?.message || error),
             });
-            throw error;
+            // 日志属于诊断旁路；持久化失败不能让已经完成或失败的 LLM 请求再次失败。
+            return;
         }
     }
 }

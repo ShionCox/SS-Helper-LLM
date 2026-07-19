@@ -3,8 +3,7 @@
  * 将 Provider 抽象与具体实现解耦
  */
 
-import type { ApiType } from '../schema/types';
-import type { SchemaCompatOptions } from '../schema/strict-json-schema';
+import type { StructuredOutputIdentity, StructuredOutputPlan } from '../schema/structured-output-plan';
 
 export interface LLMProviderCapabilities {
     chat: boolean;
@@ -19,11 +18,7 @@ export interface LLMRequest {
     model?: string;
     temperature?: number;
     maxTokens?: number;
-    jsonMode?: boolean;
-    schema?: object;
-    schemaName?: string;
-    preferredResponseFormat?: 'json_object' | 'json_schema' | 'system_json';
-    schemaCompat?: SchemaCompatOptions;
+    structuredOutput?: StructuredOutputPlan;
     signal?: AbortSignal;
 }
 
@@ -32,6 +27,11 @@ export interface LLMResponse {
     usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
     finishReason?: string;
     debugRequest?: Record<string, unknown>;
+    structuredOutput?: {
+        plannedTransport: StructuredOutputPlan['transport'];
+        actualTransport: StructuredOutputPlan['transport'];
+        fallbackReason?: string;
+    };
 }
 
 export interface EmbedRequest {
@@ -93,4 +93,5 @@ export interface LLMProvider {
     testConnection?(): Promise<ProviderConnectionResult>;
     listModels?(): Promise<ProviderModelListResult>;
     dispose?(): void;
+    getStructuredOutputIdentity?(model?: string): Promise<StructuredOutputIdentity> | StructuredOutputIdentity;
 }

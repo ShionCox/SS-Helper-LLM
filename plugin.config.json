@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "kind": "frontend-extension",
   "directoryName": "SS-Helper-LLM",
-  "displayName": "SS-Helper [AI 调度中枢]",
+  "displayName": "AI调度中枢",
   "runtimeId": "ss-helper.llm",
   "settingsTitle": "SS-Helper [AI 调度中枢]",
   "manifest": {

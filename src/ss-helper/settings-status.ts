@@ -14,6 +14,7 @@ export type LlmSettingsStatusMap = Readonly<Record<string, SettingsStatusSnapsho
 export interface LlmSettingsStatusSource {
   loadStatus(): LlmSettingsStatusMap | Promise<LlmSettingsStatusMap>;
   subscribeStatus(listener: (status: LlmSettingsStatusMap) => void): () => void;
+  refreshNow(): Promise<void>;
 }
 
 type DiscoveryTarget = EventTarget & { [CORE_DISCOVERY_SYMBOL]?: CoreDiscoverySnapshot };
@@ -41,12 +42,25 @@ function serviceSnapshot(response: LlmCapabilityStatusResponse | undefined): Set
   const entries = new Map(response.checks.map((entry) => [entry.id, entry]));
   const generation = entries.get('generation');
   if (generation?.reason === 'llm_disabled') return neutral('已停用', 'LLM 已停用；其他插件不会发起 AI 请求。');
-  if (!generation?.available) return error('生成不可用', '当前路由没有可用的生成模型。');
+  if (!generation?.available) {
+    const descriptions = {
+      no_resource: '自定义 API 模式尚未配置可用的生成资源。',
+      resource_disabled: '自定义生成资源已停用。',
+      credential_missing: '自定义生成资源缺少密钥。',
+      route_unavailable: '当前来源内没有满足请求能力的生成路由。',
+      tavern_unavailable: '酒馆当前没有可用的来源和模型。',
+      status_unavailable: '暂时无法读取所选生成来源的状态。',
+    } as const;
+    const source = generation?.source === 'tavern' ? '酒馆' : generation?.source === 'custom' ? '自定义 API' : undefined;
+    return error(['生成不可用', source].filter(Boolean).join(' · '), descriptions[generation?.reason as keyof typeof descriptions] ?? '当前来源内没有可用的生成模型。');
+  }
+  const source = generation.source === 'tavern' ? '酒馆' : generation.source === 'custom' ? '自定义 API' : undefined;
+  const generationDetails = [source, generation.resourceId, generation.model].filter((item, index, values) => Boolean(item) && values.indexOf(item) === index);
   const optional = [
     entries.get('embedding')?.available ? '向量化可用' : '向量化未配置',
     entries.get('rerank')?.available ? '重排序可用' : '重排序未配置',
   ];
-  return success('生成可用', optional.join(' · '));
+  return success(['生成可用', ...generationDetails].join(' · '), optional.join(' · '));
 }
 
 /** Event-driven settings status bridge. It never exposes credentials or provider response bodies. */
@@ -62,7 +76,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
   private unsubscribeCapability: (() => void) | undefined;
 
   constructor(
-    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events'>,
+    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1'>,
     private readonly repository: LlmWorkspaceRepository,
     private readonly handlers: LlmServiceHandlers,
     private readonly target: DiscoveryTarget = globalThis as unknown as DiscoveryTarget,
@@ -112,7 +126,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       const model = current.model?.trim();
       const provider = current.provider?.trim();
       if (!model && !provider) return warning('未选择模型', '酒馆连接可用，但尚未报告来源或模型。');
-      return success([provider, model].filter(Boolean).join(' · '), '状态会随酒馆连接和模型切换实时更新。');
+      return success([provider, model].filter(Boolean).join(' · '), '用于文本整理。');
     }).catch(() => warning('状态不可用', '无法读取酒馆当前连接状态。'));
 
     const capabilityPromise = this.handlers.capabilityStatus

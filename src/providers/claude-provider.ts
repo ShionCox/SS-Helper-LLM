@@ -11,6 +11,7 @@ import type {
     ProviderModelListResult,
 } from './types';
 import { providerHttpError } from './provider-errors';
+import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 
 export class ClaudeProvider implements LLMProvider {
     id: string;
@@ -24,6 +25,7 @@ export class ClaudeProvider implements LLMProvider {
     private anthropicVersion: string;
     private customParams: Record<string, unknown>;
     private fetchImpl: typeof fetch;
+    private readonly structuredOutputIdentity: StructuredOutputIdentity;
 
     constructor(config: {
         id: string;
@@ -47,9 +49,14 @@ export class ClaudeProvider implements LLMProvider {
             rerank: false,
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
+        this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'claude', baseUrl: this.baseUrl, model: this.model });
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
+    }
+
+    getStructuredOutputIdentity(model?: string): StructuredOutputIdentity {
+        return model && model !== this.structuredOutputIdentity.model ? { ...this.structuredOutputIdentity, model } : this.structuredOutputIdentity;
     }
 
     private buildHeaders(): Record<string, string> {
@@ -111,12 +118,12 @@ export class ClaudeProvider implements LLMProvider {
             messages: split.messages,
             ...(split.system ? { system: split.system } : {}),
             ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
-            ...(req.jsonMode && req.schema
+            ...(req.structuredOutput?.transport === 'json_schema'
                 ? {
                     output_config: {
                         format: {
                             type: 'json_schema',
-                            schema: req.schema,
+                            schema: req.structuredOutput.spec.schema,
                         },
                     },
                 }
@@ -147,6 +154,7 @@ export class ClaudeProvider implements LLMProvider {
                 totalTokens: promptTokens + completionTokens,
             },
             finishReason: data?.stop_reason,
+            ...(req.structuredOutput === undefined ? {} : { structuredOutput: { plannedTransport: req.structuredOutput.transport, actualTransport: req.structuredOutput.transport } }),
             debugRequest: {
                 providerKind: this.kind,
                 apiType: this.apiType,

@@ -11,6 +11,7 @@ import type {
     ProviderModelListResult,
 } from './types';
 import { providerHttpError } from './provider-errors';
+import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 
 export class GeminiProvider implements LLMProvider {
     id: string;
@@ -23,6 +24,7 @@ export class GeminiProvider implements LLMProvider {
     private model: string;
     private customParams: Record<string, unknown>;
     private fetchImpl: typeof fetch;
+    private readonly structuredOutputIdentity: StructuredOutputIdentity;
 
     constructor(config: {
         id: string;
@@ -45,9 +47,14 @@ export class GeminiProvider implements LLMProvider {
             rerank: config.enableRerank === true,
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
+        this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'gemini', baseUrl: this.baseUrl, model: this.model });
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
+    }
+
+    getStructuredOutputIdentity(model?: string): StructuredOutputIdentity {
+        return model && model !== this.structuredOutputIdentity.model ? { ...this.structuredOutputIdentity, model } : this.structuredOutputIdentity;
     }
 
     private buildHeaders(): Record<string, string> {
@@ -105,8 +112,8 @@ export class GeminiProvider implements LLMProvider {
         const generationConfig: Record<string, unknown> = {
             ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
             ...(typeof req.maxTokens === 'number' ? { maxOutputTokens: req.maxTokens } : {}),
-            ...(req.jsonMode ? { responseMimeType: 'application/json' } : {}),
-            ...(req.schema && req.preferredResponseFormat === 'json_schema' ? { responseJsonSchema: req.schema } : {}),
+            ...(req.structuredOutput?.transport === 'json_object' ? { responseMimeType: 'application/json' } : {}),
+            ...(req.structuredOutput?.transport === 'json_schema' ? { responseMimeType: 'application/json', responseJsonSchema: req.structuredOutput.spec.schema } : {}),
         };
 
         const body = this.withCustomParams({
@@ -140,6 +147,7 @@ export class GeminiProvider implements LLMProvider {
                 totalTokens,
             },
             finishReason: data?.candidates?.[0]?.finishReason,
+            ...(req.structuredOutput === undefined ? {} : { structuredOutput: { plannedTransport: req.structuredOutput.transport, actualTransport: req.structuredOutput.transport } }),
             debugRequest: {
                 providerKind: this.kind,
                 apiType: this.apiType,

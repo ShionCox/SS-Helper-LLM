@@ -1,10 +1,11 @@
 import type { BudgetConfig } from '../budget/budget-manager';
-import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, PluginAssignment, ResourceConfig, SilentPermissionGrant, TaskAssignment } from '../schema/types';
+import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, PluginAssignment, ResourceConfig, SilentPermissionGrant, TaskAssignment } from '../schema/types';
 
-const TOP_LEVEL = new Set(['enabled', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'resultDisplay', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'silentPermissions']);
+const TOP_LEVEL = new Set(['enabled', 'generationSource', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'resultDisplay', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'silentPermissions', 'requestLogging']);
 const RESOURCE_KEYS = new Set(['id', 'type', 'source', 'apiType', 'label', 'baseUrl', 'model', 'enabled', 'rerankPath', 'capabilities', 'customParams']);
 const BUDGET_KEYS = new Set(['maxRPM', 'maxTokens', 'maxLatencyMs']);
 const MAX_JSON_BYTES = 256 * 1024;
+const LOG_DETAIL_MODES = ['full', 'failed-full', 'summary', 'off'] as const;
 
 function invalid(message: string, code = 'PAYLOAD_INVALID'): never {
   const error = new Error(message) as Error & { code?: string };
@@ -54,8 +55,8 @@ function validateResource(value: unknown): ResourceConfig {
   const type = string(record.type, 'resource.type', 32);
   const source = string(record.source, 'resource.source', 32);
   if (!['generation', 'embedding', 'rerank'].includes(type) || source !== 'custom') invalid('resource 类型无效');
-  const apiType = record.apiType === undefined ? 'openai' : string(record.apiType, 'resource.apiType', 32);
-  if (!['openai', 'deepseek', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
+  const apiType = string(record.apiType, 'resource.apiType', 32);
+  if (!['auto', 'openai', 'deepseek', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
   let baseUrl: string | undefined;
   if (record.baseUrl !== undefined) {
     baseUrl = string(record.baseUrl, 'resource.baseUrl', 2_048);
@@ -174,6 +175,23 @@ function validateSilentPermissions(value: unknown): SilentPermissionGrant[] {
   });
 }
 
+function validateRequestLogging(value: unknown): LLMRequestLoggingSettings {
+  const input = object(value, 'requestLogging');
+  for (const key of Object.keys(input)) if (!['enabled', 'detailMode', 'maxEntries', 'retentionDays', 'maxBytes'].includes(key)) invalid(`requestLogging.${key} 不受支持`);
+  if (input.enabled !== undefined && typeof input.enabled !== 'boolean') invalid('requestLogging.enabled 必须是布尔值');
+  const detailMode = input.detailMode === undefined ? undefined : enumString(input.detailMode, 'requestLogging.detailMode', LOG_DETAIL_MODES);
+  const maxEntries = input.maxEntries === undefined ? undefined : positiveInteger(input.maxEntries, 'requestLogging.maxEntries', 5_000);
+  const retentionDays = input.retentionDays === undefined ? undefined : positiveInteger(input.retentionDays, 'requestLogging.retentionDays', 3_650);
+  const maxBytes = input.maxBytes === undefined ? undefined : positiveInteger(input.maxBytes, 'requestLogging.maxBytes', 1_024 * 1_024 * 1_024);
+  return {
+    ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
+    ...(detailMode === undefined ? {} : { detailMode }),
+    ...(maxEntries === undefined ? {} : { maxEntries }),
+    ...(retentionDays === undefined ? {} : { retentionDays }),
+    ...(maxBytes === undefined ? {} : { maxBytes }),
+  };
+}
+
 export function validateBudgetConfigs(value: unknown): Record<string, BudgetConfig> {
   if (value === undefined) return {};
   const input = object(value, 'budgets'); const result: Record<string, BudgetConfig> = {};
@@ -196,11 +214,13 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
   for (const key of Object.keys(input)) if (!TOP_LEVEL.has(key)) invalid(`settings.${key} 不受支持`);
   const result = structuredClone(input) as LLMHubSettings;
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') invalid('enabled 必须是布尔值');
+  if (input.generationSource !== undefined) result.generationSource = enumString(input.generationSource, 'generationSource', ['tavern', 'custom'] as const);
   if (input.timeoutMs !== undefined) result.timeoutMs = positiveInteger(input.timeoutMs, 'timeoutMs', 600_000);
   if (input.maxTokens !== undefined) result.maxTokens = positiveInteger(input.maxTokens, 'maxTokens', 1_000_000);
   if (input.maxTokensMode !== undefined) result.maxTokensMode = enumString(input.maxTokensMode, 'maxTokensMode', ['inherit', 'manual', 'adaptive'] as const);
   if (input.resultDisplay !== undefined) result.resultDisplay = enumString(input.resultDisplay, 'resultDisplay', ['auto', 'silent', 'compact', 'fullscreen'] as const);
   if (input.globalProfile !== undefined) result.globalProfile = enumString(input.globalProfile, 'globalProfile', ['precise', 'creative', 'balanced', 'economy'] as const);
+  if (input.requestLogging !== undefined) result.requestLogging = validateRequestLogging(input.requestLogging);
   if (input.maxTokensControl !== undefined) result.maxTokensControl = validateMaxTokensControl(input.maxTokensControl);
   if (input.resources !== undefined) {
     if (!Array.isArray(input.resources) || input.resources.length > 200) invalid('resources 无效');

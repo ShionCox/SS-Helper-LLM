@@ -3,9 +3,9 @@ import type {
     RerankRequest, RerankResponse,
     ProviderConnectionResult, ProviderModelListResult,
 } from './types';
-import { providerHttpError } from './provider-errors';
+import { isResponseFormatUnsupported, providerHttpError } from './provider-errors';
 import type { ApiType } from '../schema/types';
-import { buildStructuredOutputSystemInstruction } from '../schema/structured-output';
+import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 
 /**
  * OpenAI 兼容 Provider 实现
@@ -22,6 +22,7 @@ export class OpenAIProvider implements LLMProvider {
     public readonly apiType: ApiType;
     private customParams: Record<string, unknown>;
     private fetchImpl: typeof fetch;
+    private structuredOutputIdentity: StructuredOutputIdentity;
 
     constructor(config: {
         id: string;
@@ -32,6 +33,7 @@ export class OpenAIProvider implements LLMProvider {
         enableRerank?: boolean;
         customParams?: Record<string, unknown>;
         fetchImpl?: typeof fetch;
+        structuredOutputIdentity?: StructuredOutputIdentity;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
@@ -54,6 +56,10 @@ export class OpenAIProvider implements LLMProvider {
             rerank: config.enableRerank === true,
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
+        const manualVendor = this.apiType === 'openai' || this.apiType === 'deepseek' || this.apiType === 'gemini' || this.apiType === 'claude'
+            ? this.apiType
+            : 'auto';
+        this.structuredOutputIdentity = config.structuredOutputIdentity ?? detectStructuredOutputIdentity({ manualVendor, baseUrl: this.baseUrl, model: this.model });
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -141,88 +147,24 @@ export class OpenAIProvider implements LLMProvider {
         };
     }
 
-    private sanitizeSchemaName(name?: string): string {
-        const normalized = String(name || 'structured_output')
-            .trim()
-            .replace(/[^a-zA-Z0-9_-]+/g, '_')
-            .replace(/^_+|_+$/g, '');
-        return normalized || 'structured_output';
-    }
-
-    private buildSystemStructuredOutputInstruction(req: LLMRequest): string {
-        return buildStructuredOutputSystemInstruction({
-            schema: req.schema,
-            schemaName: req.schemaName,
-        });
-    }
-
-    private ensureStructuredOutputMessages(
-        messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>,
-        req: LLMRequest,
-        mode: 'json_hint' | 'system_schema',
-    ): Array<{ role: 'system' | 'user' | 'assistant'; content: string }> {
-        const hasJsonHint = messages.some((message: { content: string }) => /json/i.test(String(message.content || '')));
-        const injectedSystem = mode === 'system_schema'
-            ? this.buildSystemStructuredOutputInstruction(req)
-            : '请始终输出合法 JSON（json）对象，不要输出额外说明。示例：{"ok":true}';
-
-        if (!hasJsonHint && messages.length > 0 && messages[0]?.role === 'system') {
-            return [{ ...messages[0], content: `${messages[0].content}\n\n${injectedSystem}` }, ...messages.slice(1)];
-        }
-
-        if (!hasJsonHint || mode === 'system_schema') {
-            return [
-                {
-                    role: 'system',
-                    content: injectedSystem,
+    private buildResponseFormat(req: LLMRequest, transport = req.structuredOutput?.transport): Record<string, unknown> | undefined {
+        if (transport === 'json_schema' && req.structuredOutput) {
+            return {
+                type: 'json_schema',
+                json_schema: {
+                    name: req.structuredOutput.spec.name,
+                    strict: true,
+                    schema: req.structuredOutput.spec.schema,
                 },
-                ...messages,
-            ];
+            };
         }
-
-        if (hasJsonHint) {
-            return messages;
-        }
-
-        return messages;
+        return transport === 'json_object' ? { type: 'json_object' } : undefined;
     }
 
-    private buildResponseFormat(req: LLMRequest): { payload?: Record<string, any>; formatType: 'none' | 'json_object' | 'json_schema' | 'system_json' } {
-        if (!req.jsonMode) {
-            return { formatType: 'none' };
-        }
-
-        if (this.apiType === 'deepseek') {
-            return {
-                payload: { type: 'json_object' },
-                formatType: 'json_object',
-            };
-        }
-
-        if (this.apiType === 'claude' || this.apiType === 'generic') {
-            return {
-                formatType: 'system_json',
-            };
-        }
-
-        if (req.schema && req.preferredResponseFormat === 'json_schema') {
-            return {
-                payload: {
-                    type: 'json_schema',
-                    json_schema: {
-                        name: this.sanitizeSchemaName(req.schemaName),
-                        strict: true,
-                        schema: req.schema,
-                    },
-                },
-                formatType: 'json_schema',
-            };
-        }
-
-        return {
-            payload: { type: 'json_object' },
-            formatType: 'json_object',
-        };
+    getStructuredOutputIdentity(model?: string): StructuredOutputIdentity {
+        return model && model !== this.structuredOutputIdentity.model
+            ? { ...this.structuredOutputIdentity, model }
+            : this.structuredOutputIdentity;
     }
 
     private async sendChatCompletion(body: Record<string, any>, signal?: AbortSignal): Promise<any> {
@@ -233,26 +175,20 @@ export class OpenAIProvider implements LLMProvider {
             signal,
         });
 
-        if (!response.ok) {
-            await response.text().catch(() => undefined);
-            throw providerHttpError('OpenAI', response.status);
-        }
+        if (!response.ok) throw providerHttpError('OpenAI', response.status, await response.text().catch(() => undefined));
 
         return response.json();
     }
 
     async request(req: LLMRequest): Promise<LLMResponse> {
-        const messages = (this.apiType === 'deepseek' || this.apiType === 'generic' || this.apiType === 'claude') && req.jsonMode
-                ? this.ensureStructuredOutputMessages(req.messages, req, 'system_schema')
-                : req.messages;
-
         const baseBody: Record<string, any> = {
             model: req.model || this.model,
-            messages,
+            messages: req.messages,
             temperature: req.temperature ?? 0.7,
             max_tokens: req.maxTokens ?? 2048,
         };
-        const { payload: responseFormat, formatType } = this.buildResponseFormat(req);
+        const plannedTransport = req.structuredOutput?.transport;
+        const responseFormat = this.buildResponseFormat(req);
         const body: Record<string, any> = this.withCustomParams({
             ...baseBody,
             ...(responseFormat ? { response_format: responseFormat } : {}),
@@ -263,7 +199,7 @@ export class OpenAIProvider implements LLMProvider {
         try {
             data = await this.sendChatCompletion(body, req.signal);
         } catch (error) {
-            if (formatType === 'json_schema' && req.jsonMode) {
+            if (plannedTransport === 'json_schema' && isResponseFormatUnsupported(error)) {
                 const fallbackBody = this.withCustomParams({
                     ...baseBody,
                     response_format: { type: 'json_object' },
@@ -284,6 +220,13 @@ export class OpenAIProvider implements LLMProvider {
                 totalTokens: data.usage.total_tokens,
             } : undefined,
             finishReason: choice?.finish_reason,
+            ...(req.structuredOutput === undefined ? {} : {
+                structuredOutput: {
+                    plannedTransport: req.structuredOutput.transport,
+                    actualTransport: finalBody.response_format?.type === 'json_object' ? 'json_object' : req.structuredOutput.transport,
+                    ...(finalBody.response_format?.type === 'json_object' && req.structuredOutput.transport === 'json_schema' ? { fallbackReason: 'response_format_unsupported' } : {}),
+                },
+            }),
             debugRequest: {
                 providerKind: this.kind,
                 apiType: this.apiType,

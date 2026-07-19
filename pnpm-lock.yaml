@@ -187,7 +187,7 @@ packages:
     os: [win32]
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-2.1.0.tgz':
-    resolution: {integrity: sha512-TO4IZVw6jqEZ4Qj82pCwbags8hpvsM7OZ9+xY4LLOMeprNVdK69uKC8DpZB/WZlQwPQ8w88d2ohOkiLBO0u6aQ==, tarball: file:vendor/ss-helper-sdk-2.1.0.tgz}
+    resolution: {integrity: sha512-3sY51tCUKG8C8d30nIXTI9tvWRBKEpflJtnGhHsdXzKbuOOZNiwPtsQIoeUTq/G3gYHN3MLeXp5iyFfYSDTyGA==, tarball: file:vendor/ss-helper-sdk-2.1.0.tgz}
     version: 2.1.0
     engines: {node: '>=20'}
 

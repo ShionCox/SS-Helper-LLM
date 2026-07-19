@@ -1,5 +1,8 @@
 export * from './providers/types';
 export { TavernProvider } from './providers/tavern-provider';
+export { OpenAIProvider } from './providers/openai-provider';
+export { createStructuredOutputPlan, detectStructuredOutputIdentity } from './schema/structured-output-plan';
+export type { StructuredOutputIdentity, StructuredOutputPlan, StructuredOutputSpec, StructuredOutputTransport, StructuredOutputVendor } from './schema/structured-output-plan';
 export { TaskRouter, BUILTIN_TAVERN_RESOURCE_ID } from './router/router';
 export { ConsumerRegistry } from './registry/consumer-registry';
 export { RequestOrchestrator } from './orchestrator/orchestrator';

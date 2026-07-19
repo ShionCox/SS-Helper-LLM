@@ -1,7 +1,7 @@
 import { logger } from '../runtime/logger';
 
 /**
- * Profile 配置层 —— 一套参数组合（温度、maxTokens、json 强制、重试等）
+ * Profile 配置层 —— 一套参数组合（温度、maxTokens、重试等）
  * 用于 LLM Hub 的 consumer+task → provider+profile 路由
  */
 
@@ -10,7 +10,6 @@ export interface LLMProfile {
     name: string;
     temperature: number;
     maxTokens: number;
-    jsonMode: boolean;
     retryCount: number;
     retryDelayMs: number;
     topP?: number;
@@ -22,13 +21,12 @@ export interface LLMProfile {
  * 预置 Profile 集合
  */
 export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
-    /** 精确模式：低温度、强 JSON、适合数据抽取 */
+    /** 精确模式：低温度、适合数据抽取 */
     precise: {
         id: 'precise',
         name: '精确模式',
         temperature: 0.1,
         maxTokens: 2048,
-        jsonMode: true,
         retryCount: 2,
         retryDelayMs: 1000,
     },
@@ -38,7 +36,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '创意模式',
         temperature: 0.8,
         maxTokens: 4096,
-        jsonMode: false,
         retryCount: 1,
         retryDelayMs: 500,
     },
@@ -48,7 +45,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '平衡模式',
         temperature: 0.5,
         maxTokens: 2048,
-        jsonMode: true,
         retryCount: 2,
         retryDelayMs: 800,
     },
@@ -58,7 +54,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '经济模式',
         temperature: 0.3,
         maxTokens: 1024,
-        jsonMode: true,
         retryCount: 1,
         retryDelayMs: 500,
     },

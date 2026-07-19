@@ -2,6 +2,7 @@
     "display_name": "SS-Helper [AI 调度中枢]",
     "loading_order": -900,
     "js": "index.js",
+    "css": "style.css",
     "author": "Shion",
   "version": "0.3.0",
     "auto_update": false,

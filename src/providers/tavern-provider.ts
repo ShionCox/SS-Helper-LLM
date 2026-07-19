@@ -1,10 +1,12 @@
 import type { GenerationRequest, GenerationResult } from '@ss-helper/sdk';
 import { inferReasonCode } from '../schema/error-codes';
+import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 import type { LLMProvider, LLMRequest, LLMResponse, ProviderConnectionResult, ProviderModelListResult } from './types';
 
 export interface TavernGenerationAdapter {
     available(): Promise<boolean>;
     models(): Promise<readonly string[]>;
+    current(): Promise<{ readonly provider?: string; readonly model?: string }>;
     generate(request: GenerationRequest): Promise<GenerationResult>;
     test(request: GenerationRequest): Promise<GenerationResult>;
 }
@@ -28,8 +30,48 @@ export class TavernProvider implements LLMProvider {
             throw error;
         }
         const prompt = req.messages.map((message) => `${message.role}: ${message.content}`).join('\n');
-        const result = await this.generation.generate({ prompt, model: req.model, quiet: true });
-        return { content: result.text, finishReason: 'stop', debugRequest: { providerKind: this.kind, resourceId: this.id } };
+        const model = typeof req.model === 'string' ? req.model.trim() : '';
+        const request: GenerationRequest = {
+            prompt,
+            quiet: true,
+            ...(req.structuredOutput?.transport === 'prompt_only' ? { contextMode: 'isolated' as const } : {}),
+            ...(model ? { model } : {}),
+            ...(req.structuredOutput?.transport === 'tavern_json_schema'
+                ? {
+                    jsonSchema: {
+                        name: req.structuredOutput.spec.name,
+                        value: req.structuredOutput.spec.schema as Record<string, never>,
+                        strict: true,
+                        returnInvalid: true,
+                    },
+                }
+                : {}),
+        };
+        let result: GenerationResult;
+        try {
+            result = await this.generation.generate(request);
+        } catch (error) {
+            const hostError = error as Error & { code?: string };
+            if (hostError.code === 'BRIDGE_CORRUPTED' || hostError.message === 'The Tavern host adapter failed') {
+                const diagnostic = new Error('酒馆生成调用失败：当前连接或模型后端拒绝了请求') as Error & { reasonCode?: string };
+                diagnostic.reasonCode = 'provider_unavailable';
+                throw diagnostic;
+            }
+            throw error;
+        }
+        return {
+            content: result.text,
+            finishReason: 'stop',
+            ...(req.structuredOutput === undefined ? {} : { structuredOutput: { plannedTransport: req.structuredOutput.transport, actualTransport: req.structuredOutput.transport } }),
+            debugRequest: {
+                providerKind: this.kind,
+                resourceId: this.id,
+                requestFormat: request.contextMode === 'isolated' ? 'tavern_generate_raw' : 'tavern_generate_quiet_prompt',
+                contextMode: request.contextMode ?? 'chat',
+                nativeSchemaSent: request.jsonSchema !== undefined,
+                ...(req.structuredOutput === undefined ? {} : { structuredOutput: req.structuredOutput }),
+            },
+        };
     }
 
     async testConnection(): Promise<ProviderConnectionResult> {
@@ -47,5 +89,10 @@ export class TavernProvider implements LLMProvider {
         if (!this.generation || !(await this.generation.available())) return { ok: false, models: [], message: '酒馆生成服务不可用' };
         const models = await this.generation.models();
         return { ok: true, models: models.map((id) => ({ id, label: id })), message: '读取成功' };
+    }
+
+    async getStructuredOutputIdentity(model?: string): Promise<StructuredOutputIdentity> {
+        const current = this.generation ? await this.generation.current() : {};
+        return detectStructuredOutputIdentity({ manualVendor: 'auto', provider: current.provider, model: model || current.model });
     }
 }

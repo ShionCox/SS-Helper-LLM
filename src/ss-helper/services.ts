@@ -32,7 +32,18 @@ export interface LlmSdkServicePort {
 
 const record = (value: unknown): Record<string, unknown> => typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
 const routeFrom = (value: unknown): LlmRouteMetadata => { const meta = record(record(value).meta); return { route: String(meta.resourceId || 'default'), ...(typeof meta.resourceId === 'string' ? { provider: meta.resourceId } : {}), ...(typeof meta.model === 'string' ? { model: meta.model } : {}), ...(meta.fallbackUsed === true ? { fallback: true } : {}) }; };
-const requireSuccess = <T>(value: unknown): T => { const result = record(value); if (result.ok !== true) throw new SSHelperError('PAYLOAD_INVALID', typeof result.error === 'string' ? result.error : 'LLM provider request failed', { phase: 'handler' }); return value as T; };
+const requireSuccess = <T>(value: unknown): T => {
+    const result = record(value);
+    if (result.ok !== true) {
+        const reasonCode = typeof result.reasonCode === 'string' ? result.reasonCode.trim() : '';
+        throw new SSHelperError(
+            'PAYLOAD_INVALID',
+            typeof result.error === 'string' ? result.error : 'LLM provider request failed',
+            { phase: 'handler', ...(reasonCode ? { reasonCode } : {}) },
+        );
+    }
+    return value as T;
+};
 const abortable = async <T>(signal: AbortSignal, operation: () => Promise<T>, notifyAbort?: () => void): Promise<T> => {
     if (signal.aborted) {
         notifyAbort?.();

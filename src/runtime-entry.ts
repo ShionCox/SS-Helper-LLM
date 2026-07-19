@@ -3,9 +3,11 @@ import { ensureHostedCore, type SessionBootstrap } from '@ss-helper/sdk';
 import { logger } from './runtime/logger';
 import { startLlmPlugin } from './ss-helper/plugin';
 
-let activeBootstrap: Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events'>> | undefined;
+type LlmRuntimeCapability = 'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1';
 
-export async function startLLMHubRuntime(): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events'>> {
+let activeBootstrap: Promise<SessionBootstrap<LlmRuntimeCapability>> | undefined;
+
+export async function startLLMHubRuntime(): Promise<SessionBootstrap<LlmRuntimeCapability>> {
     try {
         await ensureHostedCore();
         activeBootstrap ??= startLlmPlugin({ pluginVersion: config.manifest.version });
