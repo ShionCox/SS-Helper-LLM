@@ -1,5 +1,6 @@
 import type {
   PlainData,
+  SecretPort,
   WorkspacePort,
   WorkspaceQueryRequest,
   WorkspaceRecord,
@@ -57,6 +58,12 @@ function recordRevision(record: WorkspaceRecord | null): number { return record?
 function credentialId(resourceId: string): string { return `resource:${resourceId}`; }
 function operationKey(prefix: string, suffix?: string): string { return `${prefix}:${globalThis.crypto.randomUUID()}${suffix ? `:${suffix}` : ''}`; }
 function safeError(message: string, code: string, extra: Record<string, unknown> = {}): Error & { code: string } { return Object.assign(new Error(message), { code, ...extra }); }
+function migrationError(error: unknown): Error & { code: string } {
+  const code = error && typeof error === 'object' && 'code' in error && typeof (error as { code?: unknown }).code === 'string'
+    ? String((error as { code: string }).code)
+    : 'LLM_SECRET_MIGRATION_FAILED';
+  return safeError('旧版明文凭据尚未安全迁移，LLM 自定义资源已禁用', code === 'LLM_SECRET_MIGRATION_FAILED' ? code : 'LLM_SECRET_MIGRATION_FAILED');
+}
 
 async function sha256Json(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
@@ -75,7 +82,9 @@ export class LlmWorkspaceRepository {
   private readonly listeners = new Set<(settings: PersistedSettings) => void>();
   private readonly changeListeners = new Set<(kinds: readonly LogKind[]) => void>();
 
-  constructor(private readonly workspace: WorkspacePort) {}
+  private legacyMigrationError?: Error & { code?: string };
+
+  constructor(private readonly workspace: WorkspacePort, private readonly secrets?: SecretPort) {}
 
   private enqueue<T>(operation: () => Promise<T>): Promise<T> {
     const result = this.mutationQueue.then(operation, operation);
@@ -87,6 +96,8 @@ export class LlmWorkspaceRepository {
     await this.workspace.open({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, create: true, metadata: { owner: LLM_WORKSPACE_OWNER, purpose: 'LLM browser configuration and runtime state' } });
     await Promise.all(COLLECTIONS.map((name) => this.workspace.defineCollection({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, name, indexes: name === 'request-logs' ? ['sourcePluginId', 'state', 'resourceId', 'taskKey', 'taskKind', 'model', 'reasonCode', 'createdAt'] : [] })));
     await this.loadSettings();
+    try { await this.migrateLegacyCredentials(); }
+    catch (error) { this.legacyMigrationError = migrationError(error); }
   }
 
   async ready(): Promise<void> { this.initialized ??= this.initialize(); return this.initialized; }
@@ -113,12 +124,67 @@ export class LlmWorkspaceRepository {
   private async queryAll(collection: string, options: QueryOptions = {}): Promise<WorkspaceRecord[]> {
     const records: WorkspaceRecord[] = [];
     let cursor: string | undefined;
+    const seenCursors = new Set<string>();
     do {
       const page = await this.workspace.query({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection, ...options, ...(cursor ? { cursor } : {}), limit: MAX_PAGE_SIZE });
       records.push(...page.records);
       cursor = page.nextCursor ?? undefined;
+      if (cursor !== undefined && (seenCursors.has(cursor) || seenCursors.size >= MAX_PAGE_SIZE * 100)) {
+        throw safeError('存储分页游标异常', 'WORKSPACE_CURSOR_STALLED');
+      }
+      if (cursor !== undefined) seenCursors.add(cursor);
     } while (cursor);
     return records;
+  }
+
+  private requireSecrets(): SecretPort {
+    if (this.secrets === undefined) throw safeError('加密凭据服务不可用', 'LLM_SECRET_PORT_UNAVAILABLE');
+    return this.secrets;
+  }
+
+  private async ensureLegacyMigration(): Promise<void> {
+    if (this.legacyMigrationError === undefined) return;
+    try {
+      await this.migrateLegacyCredentials();
+      this.legacyMigrationError = undefined;
+    } catch (error) {
+      this.legacyMigrationError = migrationError(error);
+      throw this.legacyMigrationError;
+    }
+  }
+
+  private async migrateLegacyCredentials(): Promise<void> {
+    const secrets = this.requireSecrets();
+    const legacy = await this.queryAll('credentials');
+    for (const record of legacy) {
+      const value = record.value as { resourceId?: unknown; apiKey?: unknown; updatedAt?: unknown };
+      const resourceId = typeof value.resourceId === 'string' && value.resourceId.trim()
+        ? value.resourceId
+        : record.recordId.startsWith('resource:') ? record.recordId.slice('resource:'.length) : '';
+      const apiKey = typeof value.apiKey === 'string' ? value.apiKey.trim() : '';
+      if (resourceId && apiKey) {
+        const secretId = credentialId(resourceId);
+        const existing = await secrets.get({ workspaceId: LLM_WORKSPACE_ID, secretId });
+        if (existing === null) {
+          await secrets.set({ workspaceId: LLM_WORKSPACE_ID, secretId, value: apiKey, metadata: { resourceId } });
+          const verified = await secrets.get({ workspaceId: LLM_WORKSPACE_ID, secretId });
+          if (verified?.value !== apiKey) throw safeError('旧凭据迁移校验失败', 'LLM_SECRET_MIGRATION_FAILED');
+        }
+      }
+      await this.workspace.delete({
+        workspaceId: LLM_WORKSPACE_ID,
+        ownerPluginId: LLM_WORKSPACE_OWNER,
+        collection: 'credentials',
+        recordId: record.recordId,
+        expectedRevision: recordRevision(record),
+      });
+    }
+  }
+
+  private async deleteAllSecrets(): Promise<void> {
+    const secrets = this.requireSecrets();
+    const records = await secrets.list({ workspaceId: LLM_WORKSPACE_ID });
+    for (const record of records) await secrets.delete({ workspaceId: LLM_WORKSPACE_ID, secretId: record.secretId });
   }
 
   private settingsFrom(value: LLMHubSettings): PersistedSettings {
@@ -168,13 +234,15 @@ export class LlmWorkspaceRepository {
   async reset(): Promise<PersistedSettings> {
     return this.enqueue(async () => {
       await this.ready();
-      const credentials = await this.queryAll('credentials');
+      await this.ensureLegacyMigration();
       const prepared = await this.prepareRuntime(DEFAULT_LLM_SETTINGS, { emptyCredentials: true });
       const operations: WorkspaceTransactionOperation[] = [{ action: 'delete', collection: 'settings', recordId: 'global', expectedRevision: this.settingsRevision }];
-      credentials.forEach((record) => operations.push({ action: 'delete', collection: 'credentials', recordId: record.recordId, expectedRevision: recordRevision(record) }));
       if (operations.length > MAX_TRANSACTION_OPERATIONS) { prepared?.dispose(); throw safeError('重置数据过多，请先清理旧凭据', 'LLM_IMPORT_TOO_LARGE'); }
       try {
         await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-reset'), operations });
+        // The bridge does not expose a cross-port transaction. Persist the non-secret
+        // state first so a failed Workspace transaction can never discard credentials.
+        await this.deleteAllSecrets();
         this.settingsRevision = 0;
         this.settings = { ...DEFAULT_LLM_SETTINGS };
         prepared?.commit();
@@ -193,48 +261,40 @@ export class LlmWorkspaceRepository {
 
   async getResourceSecret(resourceId: string): Promise<string | null> {
     await this.ready();
-    const record = await this.workspace.get({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'credentials', recordId: credentialId(resourceId) });
-    const value = record?.value as { apiKey?: unknown } | undefined;
-    return typeof value?.apiKey === 'string' && value.apiKey.length > 0 ? value.apiKey : null;
+    await this.ensureLegacyMigration();
+    return (await this.requireSecrets().get({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId) }))?.value ?? null;
   }
   async hasResourceSecret(resourceId: string): Promise<boolean> { return (await this.getResourceSecret(resourceId)) !== null; }
 
   async setResourceSecret(resourceId: string, value: string, _metadata: PlainData = {}): Promise<WorkspaceCredentialMetadata> {
     return this.enqueue(async () => {
       await this.ready();
+      await this.ensureLegacyMigration();
       const normalized = value.trim();
       if (!normalized || normalized.length > 65_536) throw safeError('密钥无效', 'PAYLOAD_INVALID');
-      const current = await this.workspace.get({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'credentials', recordId: credentialId(resourceId) });
       const prepared = await this.prepareRuntime(this.settings, { credentialOverrides: { [resourceId]: normalized } });
-      const updatedAt = Date.now();
       try {
-        const result = await this.workspace.transaction({
-          workspaceId: LLM_WORKSPACE_ID,
-          ownerPluginId: LLM_WORKSPACE_OWNER,
-          idempotencyKey: operationKey('llm-credential-set'),
-          operations: [{ action: 'upsert', collection: 'credentials', recordId: credentialId(resourceId), value: asPlain({ resourceId, apiKey: normalized, updatedAt }), expectedRevision: recordRevision(current) }],
-        });
+        const result = await this.requireSecrets().set({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId), value: normalized, metadata: _metadata });
         prepared?.commit();
-        void result;
+        this.notifyChanges(['generation', 'embedding', 'rerank']);
+        return { secretId: result.secretId, maskedValue: result.maskedValue, updatedAt: result.updatedAt, keyVersion: 1 };
       } catch (error) {
         prepared?.dispose();
         throw error;
       }
-      this.notifyChanges(['generation', 'embedding', 'rerank']);
-      return { secretId: credentialId(resourceId), maskedValue: `••••${normalized.slice(-2)}`, updatedAt, keyVersion: 1 };
     });
   }
 
   async deleteResourceSecret(resourceId: string): Promise<boolean> {
     return this.enqueue(async () => {
       await this.ready();
-      const current = await this.workspace.get({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'credentials', recordId: credentialId(resourceId) });
-      if (!current) return false;
+      await this.ensureLegacyMigration();
+      const current = await this.requireSecrets().get({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId) });
+      if (current === null) return false;
       const prepared = await this.prepareRuntime(this.settings, { credentialOverrides: { [resourceId]: null } });
       try {
-        const result = await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-credential-delete'), operations: [{ action: 'delete', collection: 'credentials', recordId: credentialId(resourceId), expectedRevision: recordRevision(current) }] });
+        await this.requireSecrets().delete({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId) });
         prepared?.commit();
-        void result;
       } catch (error) {
         prepared?.dispose();
         throw error;
@@ -247,13 +307,15 @@ export class LlmWorkspaceRepository {
   async deleteResource(resourceId: string): Promise<boolean> {
     return this.enqueue(async () => {
       await this.ready();
+      await this.ensureLegacyMigration();
       const next = this.settingsFrom({ ...this.settings, resources: (this.settings.resources ?? []).filter((resource) => resource.id !== resourceId) });
-      const currentCredential = await this.workspace.get({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, collection: 'credentials', recordId: credentialId(resourceId) });
       const prepared = await this.prepareRuntime(next, { credentialOverrides: { [resourceId]: null } });
       const operations: WorkspaceTransactionOperation[] = [{ action: 'upsert', collection: 'settings', recordId: 'global', value: asPlain(next), expectedRevision: this.settingsRevision }];
-      if (currentCredential) operations.push({ action: 'delete', collection: 'credentials', recordId: credentialId(resourceId), expectedRevision: recordRevision(currentCredential) });
       try {
         const result = await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-resource-delete'), operations });
+        // See reset(): do not erase an encrypted credential before its associated
+        // settings mutation has committed successfully.
+        await this.requireSecrets().delete({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId) });
         this.settingsRevision = result.results[0]?.revision ?? result.results[0]?.version ?? this.settingsRevision + 1;
         this.settings = next;
         prepared?.commit();
@@ -269,8 +331,8 @@ export class LlmWorkspaceRepository {
 
   async listSecrets(): Promise<readonly WorkspaceCredentialMetadata[]> {
     await this.ready();
-    const records = await this.queryAll('credentials');
-    return records.map((record) => { const value = record.value as { apiKey?: unknown; updatedAt?: unknown }; const key = typeof value.apiKey === 'string' ? value.apiKey : ''; return { secretId: record.recordId, maskedValue: `••••${key.slice(-2)}`, updatedAt: Number(value.updatedAt ?? record.updatedAt), keyVersion: 1 as const }; });
+    await this.ensureLegacyMigration();
+    return (await this.requireSecrets().list({ workspaceId: LLM_WORKSPACE_ID })).map((record) => ({ ...record, keyVersion: 1 as const }));
   }
 
   async exportConfig(): Promise<{ archive: PlainData; sha256: string }> {
@@ -294,11 +356,10 @@ export class LlmWorkspaceRepository {
       const consumerInput = value.consumers as Record<string, PlainData>;
       const consumerIds = Object.keys(consumerInput);
       if (consumerIds.length > MAX_CONSUMERS || consumerIds.some((id) => !id.trim() || id.length > 256)) throw safeError('消费者快照过大或无效', 'LLM_IMPORT_TOO_LARGE');
-      const existingCredentials = await this.queryAll('credentials');
+      await this.ensureLegacyMigration();
       const existingConsumers = await this.queryAll('consumers');
       const existingById = new Map(existingConsumers.map((record) => [record.recordId, record]));
       const operations: WorkspaceTransactionOperation[] = [{ action: 'upsert', collection: 'settings', recordId: 'global', value: asPlain(settings), expectedRevision: this.settingsRevision }];
-      existingCredentials.forEach((record) => operations.push({ action: 'delete', collection: 'credentials', recordId: record.recordId, expectedRevision: recordRevision(record) }));
       const keep = new Set(consumerIds);
       existingConsumers.filter((record) => !keep.has(record.recordId)).forEach((record) => operations.push({ action: 'delete', collection: 'consumers', recordId: record.recordId, expectedRevision: recordRevision(record) }));
       for (const [recordId, consumer] of Object.entries(consumerInput)) operations.push({ action: 'upsert', collection: 'consumers', recordId, value: asPlain(consumer), expectedRevision: recordRevision(existingById.get(recordId) ?? null) });
@@ -306,6 +367,8 @@ export class LlmWorkspaceRepository {
       const prepared = await this.prepareRuntime(settings, { emptyCredentials: true });
       try {
         const result = await this.workspace.transaction({ workspaceId: LLM_WORKSPACE_ID, ownerPluginId: LLM_WORKSPACE_OWNER, idempotencyKey: operationKey('llm-import'), operations });
+        // A bad or conflicting import must leave the previous encrypted keys intact.
+        await this.deleteAllSecrets();
         this.settingsRevision = result.results[0]?.revision ?? result.results[0]?.version ?? this.settingsRevision + 1;
         this.settings = this.settingsFrom(settings);
         prepared?.commit();
@@ -324,6 +387,7 @@ export class LlmWorkspaceRepository {
       const prepared = await this.prepareRuntime(DEFAULT_LLM_SETTINGS, { emptyCredentials: true });
       try {
         await this.workspace.clearOwned({ idempotencyKey: operationKey('llm-clear') });
+        await this.deleteAllSecrets();
         this.initialized = undefined;
         this.settingsRevision = 0;
         this.settings = { ...DEFAULT_LLM_SETTINGS };

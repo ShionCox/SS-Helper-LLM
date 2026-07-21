@@ -28,6 +28,14 @@ class MemoryWorkspace {
   async clearOwned() { const count = this.records.size; this.records.clear(); return count; }
 }
 
+class MemorySecrets {
+  constructor() { this.records = new Map(); this.failRead = false; }
+  async set({ secretId, value, metadata }) { const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 1 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
+  async get({ secretId }) { if (this.failRead) { const error = new Error('secret read failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = this.records.get(secretId); return record ? structuredClone(record) : null; }
+  async delete({ secretId }) { return this.records.delete(secretId); }
+  async list() { return [...this.records.values()].map(({ value, ...record }) => structuredClone(record)); }
+}
+
 test('settings schema exposes five progressive pages and generic popup actions', () => {
   const sections = LLM_SETTINGS_SCHEMA.fields.filter((field) => field.kind === 'section');
   assert.deepEqual(sections.map((section) => section.label), ['开始', '资源', '路由', '运行', '诊断']);
@@ -80,7 +88,8 @@ test('settings schema exposes five progressive pages and generic popup actions',
 
 test('LLM browser repository stores complete sanitized logs and excludes credentials', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const secrets = new MemorySecrets();
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.ready();
   const expectedDefaults = { enabled: true, generationSource: 'tavern', globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000, resultDisplay: 'auto' };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
@@ -93,6 +102,8 @@ test('LLM browser repository stores complete sanitized logs and excludes credent
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
   assert.deepEqual(settingsDefaults(await repository.reset()), expectedDefaults);
   await repository.setResourceSecret('resource-test', 'secret-value', { label: 'Test' });
+  assert.equal([...workspace.records.values()].some((record) => JSON.stringify(record.value).includes('secret-value')), false, 'new keys must never be written to the plaintext workspace collection');
+  assert.equal(secrets.records.get('resource:resource-test')?.value, 'secret-value');
   assert.equal(await repository.hasResourceSecret('resource-test'), true);
   assert.equal(await repository.getResourceSecret('resource-test'), 'secret-value');
   await repository.saveLog({ request: { taskKind: 'generation', taskDescription: 'visible prompt', metrics: { total: 1 }, body: 'must persist', headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
@@ -121,6 +132,53 @@ test('LLM browser repository stores complete sanitized logs and excludes credent
   assert.equal((await repository.loadSettings()).globalProfile, 'precise');
 });
 
+test('legacy plaintext credentials migrate only after encrypted verification and retry safely', async () => {
+  const workspace = new MemoryWorkspace();
+  const secrets = new MemorySecrets();
+  workspace.records.set('credentials:resource:legacy', {
+    recordId: 'resource:legacy',
+    value: { resourceId: 'legacy', apiKey: 'legacy-secret' },
+    version: 1,
+    revision: 1,
+    updatedAt: Date.now(),
+  });
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
+  await repository.ready();
+  assert.equal(await repository.getResourceSecret('legacy'), 'legacy-secret');
+  assert.equal(workspace.records.has('credentials:resource:legacy'), false);
+
+  await secrets.set({ workspaceId: LLM_WORKSPACE_ID, secretId: 'resource:preferred', value: 'encrypted-key', metadata: {} });
+  workspace.records.set('credentials:resource:preferred', {
+    recordId: 'resource:preferred',
+    value: { resourceId: 'preferred', apiKey: 'old-plaintext-key' },
+    version: 1,
+    revision: 1,
+    updatedAt: Date.now(),
+  });
+  const preferEncrypted = new LlmWorkspaceRepository(workspace, secrets);
+  await preferEncrypted.ready();
+  assert.equal(await preferEncrypted.getResourceSecret('preferred'), 'encrypted-key');
+  assert.equal(workspace.records.has('credentials:resource:preferred'), false);
+
+  const retryWorkspace = new MemoryWorkspace();
+  retryWorkspace.records.set('credentials:resource:retry', {
+    recordId: 'resource:retry',
+    value: { resourceId: 'retry', apiKey: 'retry-secret' },
+    version: 1,
+    revision: 1,
+    updatedAt: Date.now(),
+  });
+  const retrySecrets = new MemorySecrets();
+  retrySecrets.failRead = true;
+  const retry = new LlmWorkspaceRepository(retryWorkspace, retrySecrets);
+  await retry.ready();
+  await assert.rejects(retry.getResourceSecret('retry'), { code: 'LLM_SECRET_MIGRATION_FAILED' });
+  assert.equal(retryWorkspace.records.has('credentials:resource:retry'), true, 'failed migration must retain the original record');
+  retrySecrets.failRead = false;
+  assert.equal(await retry.getResourceSecret('retry'), 'retry-secret');
+  assert.equal(retryWorkspace.records.has('credentials:resource:retry'), false);
+});
+
 test('provider factory covers direct browser generation and rerank resources', () => {
   const openai = createProviderFromResource({ id: 'openai', type: 'generation', source: 'custom', apiType: 'openai', label: 'OpenAI', baseUrl: 'https://example.invalid/v1', model: 'gpt' }, 'secret-value');
   const rerank = createProviderFromResource({ id: 'rerank', type: 'rerank', source: 'custom', apiType: 'generic', label: 'Rerank', baseUrl: 'https://example.invalid', model: 'rank' }, 'secret-value');
@@ -131,7 +189,7 @@ test('provider factory covers direct browser generation and rerank resources', (
 
 test('request log policy supports summary mode and prunes by count', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.saveSettings({ requestLogging: { enabled: true, detailMode: 'summary', maxEntries: 2, retentionDays: 3650, maxBytes: 1024 * 1024 } });
   for (let index = 0; index < 3; index += 1) {
     await repository.saveLog({ logId: `log-${index}`, requestId: `request-${index}`, state: 'completed', sourcePluginId: 'fixture', taskKey: 'memory.extract', taskKind: 'generation', request: { taskKind: 'generation', generationInput: { messages: [{ content: `private-${index}` }] }, metrics: { inputCharCount: 10 } }, response: { rawResponseText: `raw-${index}`, meta: { resourceId: 'resource-test', model: 'model-test' } }, createdAt: Date.now() + index });
@@ -148,7 +206,7 @@ test('request log policy supports summary mode and prunes by count', async () =>
 
 test('Workspace mutations use unique idempotency keys even when the clock is frozen', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   const originalNow = Date.now;
   Date.now = () => 1_700_000_000_000;
   try {
@@ -162,7 +220,7 @@ test('Workspace mutations use unique idempotency keys even when the clock is fro
 });
 
 test('settings validation rejects coercion and malformed nested routing values', async () => {
-  const repository = new LlmWorkspaceRepository(new MemoryWorkspace());
+  const repository = new LlmWorkspaceRepository(new MemoryWorkspace(), new MemorySecrets());
   await assert.rejects(repository.saveSettings({ enabled: 'false' }), { code: 'PAYLOAD_INVALID' });
   await assert.rejects(repository.saveSettings({ globalProfile: 'unknown' }), { code: 'PAYLOAD_INVALID' });
   await assert.rejects(repository.saveSettings({ generationSource: 'automatic' }), { code: 'PAYLOAD_INVALID' });
@@ -173,7 +231,7 @@ test('settings validation rejects coercion and malformed nested routing values',
 
 test('clearLogs paginates beyond one thousand records and can resume after a failed batch', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.ready();
   for (let index = 0; index < 2_501; index += 1) workspace.records.set(`request-logs:seed-${index}`, { recordId: `seed-${index}`, value: { state: 'completed' }, version: 1, revision: 1, updatedAt: index });
   assert.equal(await repository.clearLogs(), 2_501);
@@ -186,7 +244,7 @@ test('clearLogs paginates beyond one thousand records and can resume after a fai
 
 test('config import is atomic and resource deletion removes its credential in one transaction', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', apiType: 'auto', label: 'A', enabled: false }] });
   await repository.setResourceSecret('resource-a', 'secret-value');
   const exported = await repository.exportConfig();
@@ -201,7 +259,8 @@ test('config import is atomic and resource deletion removes its credential in on
 
 test('runtime preparation failure leaves persisted settings and the active runtime unchanged', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const secrets = new MemorySecrets();
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
   const session = {
     host: { generation: { available: async () => false, current: async () => ({}) }, has: () => false },
     events: { publish() {}, subscribe() { return () => {}; } },
@@ -212,9 +271,9 @@ test('runtime preparation failure leaves persisted settings and the active runti
   const resource = { id: 'resource-runtime', type: 'generation', source: 'custom', apiType: 'openai', label: 'Runtime', baseUrl: 'https://provider.example/v1', model: 'gpt', enabled: true, capabilities: ['chat', 'json'] };
   await repository.saveSettings({ enabled: true, globalProfile: 'balanced', resources: [resource], globalAssignments: { generation: { resourceId: resource.id } } });
   await repository.setResourceSecret(resource.id, 'runtime-secret');
-  workspace.failCredentialRead = true;
+  secrets.failRead = true;
   await assert.rejects(repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'economy' }), { code: 'LLM_RUNTIME_APPLY_FAILED' });
-  workspace.failCredentialRead = false;
+  secrets.failRead = false;
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
   handlers.dispose?.();
 });
@@ -227,7 +286,7 @@ test('generation source hot-switches Tavern to custom and back without crossing 
     return new Response(JSON.stringify({ choices: [{ message: { content: 'custom-ok' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   let tavernCurrent = { provider: 'openai', model: 'tavern-model' };
   const session = {
     host: {
@@ -273,7 +332,7 @@ test('generation source hot-switches Tavern to custom and back without crossing 
 
 test('event listener failures cannot turn an applied generation source change into a failed save', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   const session = {
     host: {
       generation: {

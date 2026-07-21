@@ -37,6 +37,21 @@ function safePopupCause(error: unknown): string {
     return normalized ? normalized.slice(0, 180) : '未能取得具体原因';
 }
 
+function reportBackgroundFailure(session: PluginSession, stage: string, error: unknown): void {
+    const code = safeDiagnostic(error, 'LLM_BACKGROUND_FAILED');
+    logger.error(`LLM ${stage} failed`, { code });
+    try {
+        session.ui.showToast({
+            level: 'error',
+            title: 'LLM 后台任务失败',
+            message: 'LLM 已安全降级；可稍后在设置中重新检查连接。',
+            code,
+        });
+    } catch {
+        // The Core may be disposing. The structured console diagnostic is enough.
+    }
+}
+
 async function renderPopup(container: HTMLElement, name: PopupName, repository: LlmWorkspaceRepository, ui?: PopupUiContext, notify?: (notification: { level: 'info' | 'success' | 'warning' | 'error'; title: string; message: string; code: string }) => void): Promise<() => void> {
     const title = document.createElement('h3'); title.textContent = ({ 'resource-wizard': '添加资源', 'resource-manager': '资源管理', 'rerank-test': 'Rerank 测试', 'route-manager': '路由分配', 'route-preview': '路由预览', 'advanced-routing': '高级规则', 'budget-manager': '额度与熔断', 'queue-manager': '请求队列', 'permission-manager': '后台权限', 'display-rules': '展示规则', diagnostics: '服务检查', 'request-logs': '请求日志', backup: '配置导入导出', 'reset-confirm': '全局重置' } as Record<PopupName, string>)[name];
     const body = document.createElement('div'); body.className = `ss-helper-llm-popup-body${name === 'request-logs' ? ' ss-helper-llm-popup-body--workspace' : ''}`;
@@ -91,19 +106,26 @@ export function registerLlmPopups(session: PluginSession, repository: LlmWorkspa
     return () => cleanups.reverse().forEach((cleanup) => cleanup());
 }
 
-export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1'>> {
-    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, settingsDisplayName: 'AI调度中枢', pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v1'] }, (session) => {
-        const repository = new LlmWorkspaceRepository(session.workspace);
+export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>> {
+    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, settingsDisplayName: 'AI调度中枢', pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v1', 'secrets.read', 'secrets.write'] }, (session) => {
+        const repository = new LlmWorkspaceRepository(session.workspace, session.secrets);
         const cleanups: Array<() => void> = [];
         try {
             const services = options.services ?? createProductionLlmServices(session, { repository });
             const statusMonitor = new LlmSettingsStatusMonitor(session, repository, services, (options.target ?? globalThis) as EventTarget & Record<PropertyKey, unknown>);
-            void statusMonitor.start().catch(() => undefined);
+            void statusMonitor.start().catch((error) => reportBackgroundFailure(session, 'status monitor startup', error));
             cleanups.push(session.registerSettings(LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter(repository, statusMonitor, (notification) => session.ui.showToast(notification))));
             cleanups.push(registerLlmPopups(session, repository));
             cleanups.push(exposeLlmServices(session, services));
             cleanups.push(() => statusMonitor.dispose());
-        } catch (error) { cleanups.reverse().forEach((cleanup) => cleanup()); session.dispose(); throw error; }
-        void session.closed.then(() => cleanups.reverse().forEach((cleanup) => cleanup())).catch((error) => logger.error('Session cleanup failed', error));
+        } catch (error) {
+            reportBackgroundFailure(session, 'session activation', error);
+            cleanups.reverse().forEach((cleanup) => cleanup());
+            session.dispose();
+            throw error;
+        }
+        void session.closed
+            .then(() => cleanups.reverse().forEach((cleanup) => cleanup()))
+            .catch((error) => logger.error('Session cleanup failed', { code: safeDiagnostic(error, 'LLM_SESSION_CLEANUP_FAILED') }));
     }, { target: options.target });
 }

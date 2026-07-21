@@ -76,7 +76,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
   private unsubscribeCapability: (() => void) | undefined;
 
   constructor(
-    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1'>,
+    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>,
     private readonly repository: LlmWorkspaceRepository,
     private readonly handlers: LlmServiceHandlers,
     private readonly target: DiscoveryTarget = globalThis as unknown as DiscoveryTarget,
@@ -144,7 +144,12 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       serviceStatus: serviceSnapshot(capabilities),
       about: this.versionSnapshot(),
     });
-    for (const listener of this.listeners) listener(this.status);
+    for (const listener of this.listeners) {
+      try { listener(this.status); } catch {
+        // Settings observers are untrusted plugin UI callbacks. One broken
+        // listener must not reject a background refresh or destabilise Core.
+      }
+    }
   }
 
   dispose(): void {
@@ -175,7 +180,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
     if (this.timer !== undefined) clearTimeout(this.timer);
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.refreshNow();
+      void this.refreshNow().catch(() => undefined);
     }, 80);
   }
 }

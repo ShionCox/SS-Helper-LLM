@@ -45,7 +45,7 @@ export function createProviderFromResource(resource: ResourceConfig, apiKey: str
 }
 
 export function createProductionLlmServices(
-    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1'>,
+    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>,
     options: ProductionLlmServiceOptions = {},
 ): LlmServiceHandlers {
     const router = new TaskRouter();

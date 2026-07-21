@@ -138,3 +138,28 @@ test('adapter exposes live status and disposed monitors ignore later host events
   await wait();
   assert.equal(monitor.loadStatus().tavernStatus.value, before);
 });
+
+test('background status refresh isolates broken observers and never leaks an unhandled rejection', async () => {
+  const value = fixture();
+  const monitor = new LlmSettingsStatusMonitor(value.session, value.repository, value.handlers, value.target);
+  await monitor.start();
+  let failObserver = false;
+  const unsubscribe = monitor.subscribeStatus(() => {
+    if (failObserver) throw new Error('observer failure must be isolated');
+  });
+  const unhandled = [];
+  const onUnhandled = (reason) => unhandled.push(reason);
+  process.on('unhandledRejection', onUnhandled);
+  try {
+    failObserver = true;
+    value.changeRepository();
+    value.changeModel({ provider: 'openai', model: 'after-observer-error' });
+    await wait(160);
+    assert.equal(unhandled.length, 0);
+    assert.equal(monitor.loadStatus().tavernStatus.value, 'openai · after-observer-error');
+  } finally {
+    process.off('unhandledRejection', onUnhandled);
+    unsubscribe();
+    monitor.dispose();
+  }
+});
