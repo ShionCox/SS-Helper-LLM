@@ -24,4 +24,5 @@ export { LlmSettingsStatusMonitor, type LlmSettingsStatusMap, type LlmSettingsSt
 export { createLlmSdkServiceHandlers, exposeLlmServices, publishRouteChanged } from './ss-helper/services';
 export type { LlmSdkServicePort, LlmServiceHandlers } from './ss-helper/services';
 export { createProductionLlmServices, createProviderFromResource } from './ss-helper/llm-service-runtime';
+export { registerLlmChatIndicator } from './ss-helper/chat-indicator';
 export { LlmWorkspaceRepository, LLM_WORKSPACE_ID, LLM_WORKSPACE_OWNER } from './storage/llm-workspace-repository';

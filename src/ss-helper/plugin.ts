@@ -5,6 +5,7 @@ import { exposeLlmServices, type LlmServiceHandlers } from './services';
 import { createProductionLlmServices, createProviderFromResource } from './llm-service-runtime';
 import { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type { LLMCapability, ResourceConfig } from '../schema/types';
+import { registerLlmChatIndicator } from './chat-indicator';
 import config from '../../plugin.config.json' with { type: 'json' };
 import { LlmSettingsStatusMonitor } from './settings-status';
 import { renderRequestLogViewer } from '../ui/request-log-viewer';
@@ -115,6 +116,7 @@ export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<Se
             const statusMonitor = new LlmSettingsStatusMonitor(session, repository, services, (options.target ?? globalThis) as EventTarget & Record<PropertyKey, unknown>);
             void statusMonitor.start().catch((error) => reportBackgroundFailure(session, 'status monitor startup', error));
             cleanups.push(session.registerSettings(LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter(repository, statusMonitor, (notification) => session.ui.showToast(notification))));
+            cleanups.push(registerLlmChatIndicator(session, repository));
             cleanups.push(registerLlmPopups(session, repository));
             cleanups.push(exposeLlmServices(session, services));
             cleanups.push(() => statusMonitor.dispose());
