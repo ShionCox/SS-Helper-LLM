@@ -271,6 +271,17 @@ export class LLMSDKImpl {
         return this.isReasonCodeRetryable(inferredReasonCode);
     }
 
+    /**
+     * Memory Capture/Dream are background jobs.  An interactive confirm() here
+     * blocks the host page and leaves the Memory capture-job in `running` until
+     * somebody dismisses a native dialog.  Those consumers already persist
+     * their own paused/failed state and apply backoff, so retry must be decided
+     * by the caller rather than by a browser modal.
+     */
+    private allowsInteractiveRetry(record: RequestRecord): boolean {
+        return record.consumer !== 'ss-helper.memory' && !String(record.taskKey || '').startsWith('memory_');
+    }
+
     private buildStructuredRetryRepair(record: RequestRecord, result: LLMRunResult<unknown>): StructuredRetryRepair | undefined {
         if (result.ok) {
             return undefined;
@@ -351,7 +362,7 @@ export class LLMSDKImpl {
                 return { ok: false, error: '请求结果已作废', reasonCode: 'cancelled' };
             }
             const shouldOfferRetry = !currentResult.ok && this.shouldOfferRetry(currentResult);
-            const shouldRetry = shouldOfferRetry
+            const shouldRetry = shouldOfferRetry && this.allowsInteractiveRetry(record)
                 ? this.confirmRetryableFailure(record, currentResult, retryCount)
                 : false;
 
