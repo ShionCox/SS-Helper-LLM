@@ -5,9 +5,11 @@ import type { LLMHubSettings } from '../schema/types';
 import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type { LlmSettingsStatusSource } from './settings-status';
 
-export const LLM_SETTINGS_KEY = 'ss-helper.llm.settings.v2';
+export const LLM_SETTINGS_KEY = 'ss-helper.llm.settings.v0';
 
-const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', name, version: 2 } as const);
+export const LLM_POPUP_VERSION = 0 as const;
+
+const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', name, version: LLM_POPUP_VERSION } as const);
 
 export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
     id: 'ss-helper.llm',

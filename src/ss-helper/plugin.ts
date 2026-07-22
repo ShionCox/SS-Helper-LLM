@@ -1,6 +1,6 @@
 import { bootstrapSSHelper, type PluginSession, type PopupUiContext, type SessionBootstrap } from '@ss-helper/sdk';
 import { logger } from '../runtime/logger';
-import { createWorkspaceLlmSettingsAdapter, LLM_SETTINGS_SCHEMA } from './settings';
+import { createWorkspaceLlmSettingsAdapter, LLM_POPUP_VERSION, LLM_SETTINGS_SCHEMA } from './settings';
 import { exposeLlmServices, type LlmServiceHandlers } from './services';
 import { createProductionLlmServices, createProviderFromResource } from './llm-service-runtime';
 import { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
@@ -103,7 +103,7 @@ async function renderPopup(container: HTMLElement, name: PopupName, repository: 
 }
 
 export function registerLlmPopups(session: PluginSession, repository: LlmWorkspaceRepository): () => void {
-    const cleanups = POPUP_NAMES.map((name) => session.registerPopup({ token: { kind: 'popup', provider: 'ss-helper.llm', name, version: 0 }, title: 'SS-Helper LLM', ariaLabel: `LLM ${name}`, ...(name === 'request-logs' ? { presentation: 'workspace' as const, closeLabel: '关闭请求日志' } : {}), render: (container, _input, ui) => { let disposed = false; void renderPopup(container, name, repository, ui, (notification) => session.ui.showToast(notification)).catch((error) => { if (!disposed) container.textContent = `加载失败（${safeDiagnostic(error, 'POPUP_LOAD_FAILED')}）：${safePopupCause(error)}`; }); return () => { disposed = true; container.replaceChildren(); }; } }));
+    const cleanups = POPUP_NAMES.map((name) => session.registerPopup({ token: { kind: 'popup', provider: 'ss-helper.llm', name, version: LLM_POPUP_VERSION }, title: 'SS-Helper LLM', ariaLabel: `LLM ${name}`, ...(name === 'request-logs' ? { presentation: 'workspace' as const, closeLabel: '关闭请求日志' } : {}), render: (container, _input, ui) => { let disposed = false; void renderPopup(container, name, repository, ui, (notification) => session.ui.showToast(notification)).catch((error) => { if (!disposed) container.textContent = `加载失败（${safeDiagnostic(error, 'POPUP_LOAD_FAILED')}）：${safePopupCause(error)}`; }); return () => { disposed = true; container.replaceChildren(); }; } }));
     return () => cleanups.reverse().forEach((cleanup) => cleanup());
 }
 

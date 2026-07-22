@@ -19,7 +19,7 @@ export type { LLMError } from './schema/error-codes';
 export type * from './schema/types';
 export { logger } from './runtime/logger';
 export { startLlmPlugin } from './ss-helper/plugin';
-export { LLM_SETTINGS_KEY, LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter } from './ss-helper/settings';
+export { LLM_POPUP_VERSION, LLM_SETTINGS_KEY, LLM_SETTINGS_SCHEMA, createWorkspaceLlmSettingsAdapter } from './ss-helper/settings';
 export { LlmSettingsStatusMonitor, type LlmSettingsStatusMap, type LlmSettingsStatusSource } from './ss-helper/settings-status';
 export { createLlmSdkServiceHandlers, exposeLlmServices, publishRouteChanged } from './ss-helper/services';
 export type { LlmSdkServicePort, LlmServiceHandlers } from './ss-helper/services';

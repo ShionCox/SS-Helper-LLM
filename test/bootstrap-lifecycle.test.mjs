@@ -5,7 +5,7 @@ import {
   CORE_DISCOVERY_SYMBOL,
   CORE_LIFECYCLE_EVENT,
 } from '@ss-helper/sdk';
-import { startLlmPlugin } from '../dist/index.js';
+import { LLM_SETTINGS_SCHEMA, startLlmPlugin } from '../dist/index.js';
 
 const services = {
   completion: async () => ({ text: 'ok', route: 'fixture', model: 'fixture' }),
@@ -25,7 +25,7 @@ function coreDescriptor(generation, overrides = {}) {
   };
 }
 
-function fixtureCore(generation, active) {
+function fixtureCore(generation, active, popupRegistrations = []) {
   let close;
   const closed = new Promise((resolve) => { close = resolve; });
   const add = () => {
@@ -42,11 +42,21 @@ function fixtureCore(generation, active) {
     events: { publish() {}, subscribe: add },
     ui: { showToast() {} },
     registerSettings: add,
-    registerPopup: add,
+    registerPopup(registration) { popupRegistrations.push(registration); return add(); },
     dispose() { close({ reason: 'consumer_dispose', generation }); },
   };
   return { session, close };
 }
+
+function collectPopupTokens(fields, output = []) {
+  for (const field of fields) {
+    if (field.popup) output.push(field.popup);
+    if (Array.isArray(field.children)) collectPopupTokens(field.children, output);
+  }
+  return output;
+}
+
+const popupKey = (token) => `${token.provider}:${token.name}:v${token.version}`;
 
 function installSnapshot(target, descriptor, fixture) {
   target[CORE_DISCOVERY_SYMBOL] = {
@@ -68,11 +78,24 @@ async function waitFor(predicate, timeoutMs = 2_000) {
 test('Core replacement cleans the old generation and registers one fresh typed surface', async () => {
   const target = new EventTarget();
   const active = new Set();
-  const first = fixtureCore(1, active);
+  const firstPopupRegistrations = [];
+  const first = fixtureCore(1, active, firstPopupRegistrations);
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
   assert.equal(active.size, 24, 'settings, status listener, popup, and typed services register once');
+  const registeredPopupTokens = firstPopupRegistrations.map(({ token }) => token);
+  const schemaPopupTokens = collectPopupTokens(LLM_SETTINGS_SCHEMA.fields);
+  assert.equal(registeredPopupTokens.length, 14);
+  assert.deepEqual(
+    registeredPopupTokens.map(popupKey).sort(),
+    schemaPopupTokens.map(popupKey).sort(),
+    'every settings popup action must resolve to a registered popup token',
+  );
+  assert.ok(registeredPopupTokens.every(({ version }) => version === 0));
+  const requestLogs = firstPopupRegistrations.find(({ token }) => token.name === 'request-logs');
+  assert.equal(requestLogs?.presentation, 'workspace');
+  assert.equal(requestLogs?.closeLabel, '关闭请求日志');
 
   const second = fixtureCore(2, active);
   installSnapshot(target, coreDescriptor(2), second);
