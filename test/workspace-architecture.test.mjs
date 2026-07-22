@@ -11,7 +11,7 @@ import {
 class MemoryWorkspace {
   constructor() { this.records = new Map(); this.collections = []; this.version = 1; this.transactionKeys = []; this.failNextTransaction = false; this.failCredentialRead = false; }
   key(collection, recordId) { return `${collection}:${recordId}`; }
-  async health() { return { ready: true, database: 'ss-helper.sqlite3', schemaVersion: 4 }; }
+  async health() { return { ready: true, database: 'ss-helper.sqlite3', schemaVersion: 0 }; }
   async integrity() { return { ok: true, messages: ['ok'] }; }
   async open({ workspaceId }) { assert.equal(workspaceId, LLM_WORKSPACE_ID); return { ownerPluginId: 'ss-helper.llm', workspaceId, created: true, version: this.version }; }
   async defineCollection({ name }) { this.collections.push(name); }
@@ -30,7 +30,7 @@ class MemoryWorkspace {
 
 class MemorySecrets {
   constructor() { this.records = new Map(); this.failRead = false; }
-  async set({ secretId, value, metadata }) { const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 1 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
+  async set({ secretId, value, metadata }) { const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 0 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
   async get({ secretId }) { if (this.failRead) { const error = new Error('secret read failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = this.records.get(secretId); return record ? structuredClone(record) : null; }
   async delete({ secretId }) { return this.records.delete(secretId); }
   async list() { return [...this.records.values()].map(({ value, ...record }) => structuredClone(record)); }

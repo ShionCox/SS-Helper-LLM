@@ -4,8 +4,8 @@
 
 ## 依赖与安装
 
-- SDK 包身份：`@ss-helper/sdk@2.2.0`
-- 本地依赖来源：`vendor/ss-helper-sdk-2.2.0.tgz`
+- SDK 包身份：`@ss-helper/sdk@0.0.1`
+- 本地依赖来源：`vendor/ss-helper-sdk-0.0.1.tgz`
 - `package.json` 的 pnpm override 将 SDK 固定为该 tgz；不使用 workspace、软链接、sibling 源码或开发机绝对路径。
 - Core 负责会话连接、服务/事件注册、设置中心和 popup 宿主；LLM 插件不嵌入 Core 或宿主适配层。
 
@@ -21,12 +21,12 @@ pnpm build
 
 消费者仅从 `@ss-helper/sdk` 包根导入并通过 Core session 调用：
 
-- `LLM_COMPLETION_V1`
-- `LLM_STRUCTURED_TASK_V1`
-- `LLM_EMBEDDING_V1`
-- `LLM_RERANK_V1`
-- `LLM_ROUTE_DIAGNOSTICS_V1`
-- `LLM_ROUTE_CHANGED_V1`
+- `LLM_COMPLETION_V0`
+- `LLM_STRUCTURED_TASK_V0`
+- `LLM_EMBEDDING_V0`
+- `LLM_RERANK_V0`
+- `LLM_ROUTE_DIAGNOSTICS_V0`
+- `LLM_ROUTE_CHANGED_V0`
 
 普通设置由 `LLM_SETTINGS_SCHEMA` 经 Core Settings Host 注册，设置中心包含“开始、资源、路由、运行、诊断”五页；资源向导、日志、备份和高级路由编辑器通过 Core popup 打开。完整消费者示例见 [docs/integration-manual.md](docs/integration-manual.md)。
 

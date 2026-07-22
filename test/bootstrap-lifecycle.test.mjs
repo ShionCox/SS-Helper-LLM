@@ -1,8 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  API_MAJOR,
-  API_MINOR,
+  API_VERSION,
   CORE_DISCOVERY_SYMBOL,
   CORE_LIFECYCLE_EVENT,
 } from '@ss-helper/sdk';
@@ -18,9 +17,9 @@ const services = {
 
 function coreDescriptor(generation, overrides = {}) {
   return {
-    kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: '1.0.0', sdkPackageVersion: '1.0.0',
-    apiMajor: API_MAJOR, apiMinor: API_MINOR, generation, state: 'ready',
-    capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v1', 'secrets.read', 'secrets.write'],
+    kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: '0.0.1', sdkPackageVersion: '0.0.1',
+    apiVersion: API_VERSION, generation, state: 'ready',
+    capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v0', 'secrets.read', 'secrets.write'],
     artifact: { buildId: `fixture-${generation}`, contentDigest: 'a'.repeat(64) },
     ...overrides,
   };
@@ -35,7 +34,7 @@ function fixtureCore(generation, active) {
     return () => active.delete(marker);
   };
   const session = {
-    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: '1.0.0', sdkPackageVersion: '2.0.0', apiMajor: 2, minApiMinor: 0, capabilities: [] },
+    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: '0.0.1', sdkPackageVersion: '0.0.1', apiVersion: API_VERSION, minApiVersion: API_VERSION, capabilities: [] },
     generation,
     closed,
     host: { generation: {} },
@@ -72,7 +71,7 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   const first = fixtureCore(1, active);
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
-  const bootstrap = await startLlmPlugin({ pluginVersion: '1.0.0', target, storage, services });
+  const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
   assert.equal(active.size, 24, 'settings, status listener, popup, and typed services register once');
 
   const second = fixtureCore(2, active);
@@ -90,10 +89,10 @@ test('incompatible Core fails before any settings, popup, or service registratio
   const target = new EventTarget();
   const active = new Set();
   const fixture = fixtureCore(1, active);
-  installSnapshot(target, coreDescriptor(1, { apiMajor: API_MAJOR + 1 }), fixture);
+  installSnapshot(target, coreDescriptor(1, { apiVersion: '0.0.0' }), fixture);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   await assert.rejects(
-    startLlmPlugin({ pluginVersion: '1.0.0', target, storage, services }),
+    startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services }),
     (error) => error?.code === 'API_INCOMPATIBLE',
   );
   assert.equal(active.size, 0);

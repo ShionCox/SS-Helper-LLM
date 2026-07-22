@@ -31,9 +31,9 @@ export interface WorkspaceCredentialMetadata {
   readonly keyVersion: 1;
 }
 
-export interface LLMConfigArchiveV1 {
+export interface LLMConfigArchiveV0 {
   readonly format: 'ss-helper-llm-config';
-  readonly version: 1;
+  readonly version: 0;
   readonly settings: PlainData;
   readonly consumers: PlainData;
 }
@@ -338,7 +338,7 @@ export class LlmWorkspaceRepository {
   async exportConfig(): Promise<{ archive: PlainData; sha256: string }> {
     await this.ready();
     const consumers = await this.loadConsumers();
-    const archive: LLMConfigArchiveV1 = { format: 'ss-helper-llm-config', version: 1, settings: asPlain(this.settings), consumers: asPlain(consumers) };
+    const archive: LLMConfigArchiveV0 = { format: 'ss-helper-llm-config', version: 0, settings: asPlain(this.settings), consumers: asPlain(consumers) };
     const archiveBytes = new TextEncoder().encode(JSON.stringify(archive)).byteLength;
     if (archiveBytes > MAX_ARCHIVE_BYTES) throw safeError('配置归档过大', 'LLM_IMPORT_TOO_LARGE');
     return { archive: asPlain(archive), sha256: await sha256Json(archive) };
@@ -348,8 +348,8 @@ export class LlmWorkspaceRepository {
     return this.enqueue(async () => {
       await this.ready();
       if (await sha256Json(archive) !== sha256) throw safeError('备份校验失败', 'BACKUP_HASH_MISMATCH');
-      const value = archive as unknown as Partial<LLMConfigArchiveV1>;
-      if (value.format !== 'ss-helper-llm-config' || value.version !== 1 || !value.settings || !value.consumers || typeof value.consumers !== 'object' || Array.isArray(value.consumers)) throw safeError('备份格式无效', 'BACKUP_INVALID');
+      const value = archive as unknown as Partial<LLMConfigArchiveV0>;
+      if (value.format !== 'ss-helper-llm-config' || value.version !== 0 || !value.settings || !value.consumers || typeof value.consumers !== 'object' || Array.isArray(value.consumers)) throw safeError('备份格式无效', 'BACKUP_INVALID');
       const archiveBytes = new TextEncoder().encode(JSON.stringify(archive)).byteLength;
       if (archiveBytes > MAX_ARCHIVE_BYTES) throw safeError('配置归档过大', 'LLM_IMPORT_TOO_LARGE');
       const settings = validateLlmSettings(value.settings);

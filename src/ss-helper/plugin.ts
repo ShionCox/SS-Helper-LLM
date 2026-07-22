@@ -103,12 +103,12 @@ async function renderPopup(container: HTMLElement, name: PopupName, repository: 
 }
 
 export function registerLlmPopups(session: PluginSession, repository: LlmWorkspaceRepository): () => void {
-    const cleanups = POPUP_NAMES.map((name) => session.registerPopup({ token: { kind: 'popup', provider: 'ss-helper.llm', name, version: 2 }, title: 'SS-Helper LLM', ariaLabel: `LLM ${name}`, ...(name === 'request-logs' ? { presentation: 'workspace' as const, closeLabel: '关闭请求日志' } : {}), render: (container, _input, ui) => { let disposed = false; void renderPopup(container, name, repository, ui, (notification) => session.ui.showToast(notification)).catch((error) => { if (!disposed) container.textContent = `加载失败（${safeDiagnostic(error, 'POPUP_LOAD_FAILED')}）：${safePopupCause(error)}`; }); return () => { disposed = true; container.replaceChildren(); }; } }));
+    const cleanups = POPUP_NAMES.map((name) => session.registerPopup({ token: { kind: 'popup', provider: 'ss-helper.llm', name, version: 0 }, title: 'SS-Helper LLM', ariaLabel: `LLM ${name}`, ...(name === 'request-logs' ? { presentation: 'workspace' as const, closeLabel: '关闭请求日志' } : {}), render: (container, _input, ui) => { let disposed = false; void renderPopup(container, name, repository, ui, (notification) => session.ui.showToast(notification)).catch((error) => { if (!disposed) container.textContent = `加载失败（${safeDiagnostic(error, 'POPUP_LOAD_FAILED')}）：${safePopupCause(error)}`; }); return () => { disposed = true; container.replaceChildren(); }; } }));
     return () => cleanups.reverse().forEach((cleanup) => cleanup());
 }
 
-export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>> {
-    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, settingsDisplayName: 'AI调度中枢', pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v1', 'secrets.read', 'secrets.write'] }, (session) => {
+export async function startLlmPlugin(options: StartLlmPluginOptions): Promise<SessionBootstrap<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>> {
+    return bootstrapSSHelper({ id: 'ss-helper.llm', displayName: config.displayName, settingsDisplayName: 'AI调度中枢', pluginVersion: options.pluginVersion, capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v0', 'secrets.read', 'secrets.write'] }, (session) => {
         const repository = new LlmWorkspaceRepository(session.workspace, session.secrets);
         const cleanups: Array<() => void> = [];
         try {

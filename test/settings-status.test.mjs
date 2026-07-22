@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { API_MAJOR, API_MINOR, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
+import { API_VERSION, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
 import { LlmSettingsStatusMonitor, createWorkspaceLlmSettingsAdapter } from '../dist/index.js';
 
 const wait = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -16,7 +16,7 @@ function fixture() {
     kind: 'ss-helper-core-discovery',
     descriptor: {
       kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: CORE_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION,
-      apiMajor: API_MAJOR, apiMinor: API_MINOR, generation: 7, state: 'ready', capabilities: [],
+      apiVersion: API_VERSION, generation: 7, state: 'ready', capabilities: [],
       artifact: { buildId: 'fixture', contentDigest: 'a'.repeat(64) },
     },
     port: {},
@@ -34,7 +34,7 @@ function fixture() {
     async reset() { settings = { enabled: true, generationSource: 'tavern' }; return structuredClone(settings); },
   };
   const session = {
-    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: LLM_PLUGIN_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION, apiMajor: API_MAJOR, minApiMinor: API_MINOR, capabilities: [] },
+    descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: LLM_PLUGIN_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION, apiVersion: API_VERSION, minApiVersion: API_VERSION, capabilities: [] },
     generation: 7,
     host: {
       generation: { available: async () => true, current: async () => current },
@@ -69,7 +69,7 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   await monitor.start();
   assert.equal(monitor.loadStatus().tavernStatus.value, 'openai · gpt-test');
   assert.equal(monitor.loadStatus().serviceStatus.value, '生成可用 · 酒馆 · gpt-test');
-  assert.equal(monitor.loadStatus().about.value, `LLM v${LLM_PLUGIN_VERSION} · Core v${CORE_VERSION} · SDK v${SDK_PACKAGE_VERSION} · API ${API_MAJOR}.${API_MINOR}`);
+  assert.equal(monitor.loadStatus().about.value, `LLM v${LLM_PLUGIN_VERSION} · Core v${CORE_VERSION} · SDK v${SDK_PACKAGE_VERSION} · API ${API_VERSION}`);
 
   value.changeModel({ provider: 'claude', model: 'claude-test' });
   await wait();

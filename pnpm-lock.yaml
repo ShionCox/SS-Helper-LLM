@@ -5,15 +5,15 @@ settings:
   excludeLinksFromLockfile: false
 
 overrides:
-  '@ss-helper/sdk': file:vendor/ss-helper-sdk-2.2.0.tgz
+  '@ss-helper/sdk': file:vendor/ss-helper-sdk-0.0.1.tgz
 
 importers:
 
   .:
     dependencies:
       '@ss-helper/sdk':
-        specifier: file:vendor/ss-helper-sdk-2.2.0.tgz
-        version: file:vendor/ss-helper-sdk-2.2.0.tgz
+        specifier: file:vendor/ss-helper-sdk-0.0.1.tgz
+        version: file:vendor/ss-helper-sdk-0.0.1.tgz
       zod:
         specifier: ^4.3.6
         version: 4.4.3
@@ -186,9 +186,9 @@ packages:
     cpu: [x64]
     os: [win32]
 
-  '@ss-helper/sdk@file:vendor/ss-helper-sdk-2.2.0.tgz':
-    resolution: {integrity: sha512-UCuK3CzQOrOEhL5jY/FhLUbktq9J3BASV+VwQoeE603bsk/XE9vKG7Fw7Jrct3W2x9ZpKW5v4MY+rxrr76Q8dA==, tarball: file:vendor/ss-helper-sdk-2.2.0.tgz}
-    version: 2.2.0
+  '@ss-helper/sdk@file:vendor/ss-helper-sdk-0.0.1.tgz':
+    resolution: {integrity: sha512-Jv+ryVvPrZSLpBAWJsQFpDoMnfJG7Wnuvo8Kw44XdVLu8w9kZHIQf9Ovp26ktY3vlHI2WUdeTZ3Z8LulyxxZnw==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
+    version: 0.0.1
     engines: {node: '>=20'}
 
   '@types/node@25.3.3':
@@ -290,7 +290,7 @@ snapshots:
   '@esbuild/win32-x64@0.25.12':
     optional: true
 
-  '@ss-helper/sdk@file:vendor/ss-helper-sdk-2.2.0.tgz': {}
+  '@ss-helper/sdk@file:vendor/ss-helper-sdk-0.0.1.tgz': {}
 
   '@types/node@25.3.3':
     dependencies:

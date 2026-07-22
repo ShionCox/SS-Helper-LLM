@@ -1,5 +1,11 @@
 # SS-Helper LLM 项目约束
 
+## 版本规则
+
+- LLM 发布版本唯一来源是 `plugin.config.json` 的 `manifest.version`，本次断代基线为 `0.0.1`；构建产物 `manifest.json`、SDK 依赖和 API descriptor 必须由该来源派生。
+- 公共 API 使用 SemVer 字符串 `apiVersion`/`minApiVersion`，当前为 `0.0.1`；SS-Helper 自有事件、归档和桥接协议使用 v0，不保留旧 v1/v2 运行时兼容链路。
+- Node.js、SillyTavern、npm 依赖及第三方 provider URL 的版本属于外部约束，不随插件版本重置。
+
 ## 图标
 
 - LLM 只能使用 SDK Core 注册的 `<ss-helper-icon name="...">` 或声明式 Chat Indicator 图标名称；名称不带 `fa-` 前缀且必须存在于 SDK Solid 图标清单。

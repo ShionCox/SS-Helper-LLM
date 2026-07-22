@@ -1,6 +1,6 @@
 import {
   CORE_DISCOVERY_SYMBOL,
-  LLM_CAPABILITY_STATUS_CHANGED_V1,
+  LLM_CAPABILITY_STATUS_CHANGED_V0,
   type CoreDiscoverySnapshot,
   type LlmCapabilityStatusResponse,
   type PluginSession,
@@ -76,7 +76,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
   private unsubscribeCapability: (() => void) | undefined;
 
   constructor(
-    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>,
+    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
     private readonly repository: LlmWorkspaceRepository,
     private readonly handlers: LlmServiceHandlers,
     private readonly target: DiscoveryTarget = globalThis as unknown as DiscoveryTarget,
@@ -96,7 +96,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       this.unsubscribeHost = undefined;
     }
     try {
-      this.unsubscribeCapability = this.session.events.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V1, () => this.scheduleRefresh());
+      this.unsubscribeCapability = this.session.events.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, () => this.scheduleRefresh());
     } catch {
       this.unsubscribeCapability = undefined;
     }
@@ -171,7 +171,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       `LLM ${releaseVersion(plugin.pluginVersion)}`,
       `Core ${releaseVersion(core?.coreVersion)}`,
       `SDK ${releaseVersion(plugin.sdkPackageVersion)}`,
-      `API ${plugin.apiMajor}.${plugin.minApiMinor}`,
+      `API ${plugin.apiVersion}`,
     ].join(' · '), `Core generation ${core?.generation ?? this.session.generation}`);
   }
 

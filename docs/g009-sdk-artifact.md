@@ -4,8 +4,8 @@
 
 This plugin consumes the public SS-Helper SDK package below:
 
-- Package: `@ss-helper/sdk@2.2.0`
-- Local artifact: `vendor/ss-helper-sdk-2.2.0.tgz`
+- Package: `@ss-helper/sdk@0.0.1`
+- Local artifact: `vendor/ss-helper-sdk-0.0.1.tgz`
 - SHA-256: produced and verified by the root release manifest for each build; it is intentionally not duplicated in this guide.
 - Resolution: the root pnpm override pins `@ss-helper/sdk` to the vendored tgz.
 

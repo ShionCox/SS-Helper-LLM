@@ -1,6 +1,6 @@
 import {
-    LLM_COMPLETION_V1, LLM_EMBEDDING_V1, LLM_RERANK_V1, LLM_ROUTE_CHANGED_V1, LLM_CAPABILITY_STATUS_V1,
-    LLM_ROUTE_DIAGNOSTICS_V1, LLM_STRUCTURED_TASK_V1, LLM_CONSUMER_REGISTER_V1, LLM_CONSUMER_UNREGISTER_V1, LLM_WAIT_FOR_DISPLAY_V1, SSHelperError,
+    LLM_COMPLETION_V0, LLM_EMBEDDING_V0, LLM_RERANK_V0, LLM_ROUTE_CHANGED_V0, LLM_CAPABILITY_STATUS_V0,
+    LLM_ROUTE_DIAGNOSTICS_V0, LLM_STRUCTURED_TASK_V0, LLM_CONSUMER_REGISTER_V0, LLM_CONSUMER_UNREGISTER_V0, LLM_WAIT_FOR_DISPLAY_V0, SSHelperError,
     type LlmCompletionRequest, type LlmCompletionResponse, type LlmEmbeddingRequest,
     type LlmEmbeddingResponse, type LlmRerankRequest, type LlmRerankResponse,
     type LlmRouteDiagnostic, type LlmRouteDiagnosticsResponse, type LlmRouteMetadata,
@@ -103,15 +103,15 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort, displayModeR
 
 export function exposeLlmServices(session: PluginSession, handlers: LlmServiceHandlers): () => void {
     const cleanups = [
-        session.services.expose(LLM_COMPLETION_V1, (request, context) => handlers.completion(request, context.signal, context.callerPluginId)),
-        session.services.expose(LLM_STRUCTURED_TASK_V1, (request, context) => handlers.runTask(request, context.signal, context.callerPluginId)),
-        session.services.expose(LLM_EMBEDDING_V1, (request, context) => handlers.embed(request, context.signal, context.callerPluginId)),
-        session.services.expose(LLM_RERANK_V1, (request, context) => handlers.rerank(request, context.signal, context.callerPluginId)),
-        session.services.expose(LLM_ROUTE_DIAGNOSTICS_V1, () => handlers.diagnostics()),
-        ...(handlers.capabilityStatus === undefined ? [] : [session.services.expose(LLM_CAPABILITY_STATUS_V1, (request, context) => handlers.capabilityStatus!(request, context.signal, context.callerPluginId))]),
-        session.services.expose(LLM_CONSUMER_REGISTER_V1, (request, context) => { handlers.registerConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
-        session.services.expose(LLM_CONSUMER_UNREGISTER_V1, (request, context) => { handlers.unregisterConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
-        session.services.expose(LLM_WAIT_FOR_DISPLAY_V1, (request) => handlers.waitForDisplay ? handlers.waitForDisplay(request) : Promise.resolve({ closed: true })),
+        session.services.expose(LLM_COMPLETION_V0, (request, context) => handlers.completion(request, context.signal, context.callerPluginId)),
+        session.services.expose(LLM_STRUCTURED_TASK_V0, (request, context) => handlers.runTask(request, context.signal, context.callerPluginId)),
+        session.services.expose(LLM_EMBEDDING_V0, (request, context) => handlers.embed(request, context.signal, context.callerPluginId)),
+        session.services.expose(LLM_RERANK_V0, (request, context) => handlers.rerank(request, context.signal, context.callerPluginId)),
+        session.services.expose(LLM_ROUTE_DIAGNOSTICS_V0, () => handlers.diagnostics()),
+        ...(handlers.capabilityStatus === undefined ? [] : [session.services.expose(LLM_CAPABILITY_STATUS_V0, (request, context) => handlers.capabilityStatus!(request, context.signal, context.callerPluginId))]),
+        session.services.expose(LLM_CONSUMER_REGISTER_V0, (request, context) => { handlers.registerConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
+        session.services.expose(LLM_CONSUMER_UNREGISTER_V0, (request, context) => { handlers.unregisterConsumer?.(request, context.callerPluginId); return { ok: true } as const; }),
+        session.services.expose(LLM_WAIT_FOR_DISPLAY_V0, (request) => handlers.waitForDisplay ? handlers.waitForDisplay(request) : Promise.resolve({ closed: true })),
     ];
     let disposed = false;
     return () => {
@@ -123,5 +123,5 @@ export function exposeLlmServices(session: PluginSession, handlers: LlmServiceHa
 }
 
 export function publishRouteChanged(session: PluginSession, previousRoute: string | undefined, route: string, reason: 'configured' | 'fallback' | 'availability'): void {
-    session.events.publish(LLM_ROUTE_CHANGED_V1, { previousRoute, route, reason });
+    session.events.publish(LLM_ROUTE_CHANGED_V0, { previousRoute, route, reason });
 }

@@ -1,4 +1,4 @@
-import { LLM_CAPABILITY_STATUS_CHANGED_V1, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
+import { LLM_CAPABILITY_STATUS_CHANGED_V0, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
 import { BudgetManager } from '../budget/budget-manager';
 import { DisplayController } from '../display/display-controller';
 import { RequestLogService } from '../log/requestLogService';
@@ -45,7 +45,7 @@ export function createProviderFromResource(resource: ResourceConfig, apiKey: str
 }
 
 export function createProductionLlmServices(
-    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write'>,
+    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
     options: ProductionLlmServiceOptions = {},
 ): LlmServiceHandlers {
     const router = new TaskRouter();
@@ -64,7 +64,7 @@ export function createProductionLlmServices(
     const notifyCapabilityChange = (kinds: readonly LlmCapabilityKind[]): void => {
         statusRevision += 1;
         try {
-            session.events.publish(LLM_CAPABILITY_STATUS_CHANGED_V1, { revision: statusRevision, kinds: [...new Set(kinds)] });
+            session.events.publish(LLM_CAPABILITY_STATUS_CHANGED_V0, { revision: statusRevision, kinds: [...new Set(kinds)] });
         } catch {
             // Event delivery is best effort and must not turn an applied runtime update into a failed save.
         }

@@ -3,7 +3,7 @@ import { ensureHostedCore, waitForTavernReady, type SessionBootstrap } from '@ss
 import { logger } from './runtime/logger';
 import { startLlmPlugin } from './ss-helper/plugin';
 
-type LlmRuntimeCapability = 'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v1' | 'secrets.read' | 'secrets.write';
+type LlmRuntimeCapability = 'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write';
 
 let activeBootstrap: Promise<SessionBootstrap<LlmRuntimeCapability>> | undefined;
 

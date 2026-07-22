@@ -8,17 +8,17 @@ Use a Core-managed plugin session and a typed service token. The session owns ti
 
 ```ts
 import {
-  LLM_STRUCTURED_TASK_V1,
+  LLM_STRUCTURED_TASK_V0,
   bootstrapSSHelper,
 } from '@ss-helper/sdk';
 
 const bootstrap = await bootstrapSSHelper({
   id: 'example.consumer',
   displayName: 'Example consumer',
-  pluginVersion: '0.3.0',
+  pluginVersion: '0.0.1',
   capabilities: [],
 }, async (session) => {
-  const result = await session.services.call(LLM_STRUCTURED_TASK_V1, {
+  const result = await session.services.call(LLM_STRUCTURED_TASK_V0, {
     task: 'summarize',
     input: { text: 'Plain-data input' },
     outputSchema: {
@@ -43,21 +43,21 @@ Every request and response is plain data. Do not place DOM nodes, functions, sto
 
 Import tokens from the package root only:
 
-- `LLM_COMPLETION_V1` — chat-style text completion.
-- `LLM_STRUCTURED_TASK_V1` — schema-constrained structured tasks.
-- `LLM_EMBEDDING_V1` — one or more embedding inputs.
-- `LLM_RERANK_V1` — provider-backed document reranking.
-- `LLM_ROUTE_DIAGNOSTICS_V1` — payload-safe route diagnostics.
-- `LLM_ROUTE_CHANGED_V1` — typed route-change event.
+- `LLM_COMPLETION_V0` — chat-style text completion.
+- `LLM_STRUCTURED_TASK_V0` — schema-constrained structured tasks.
+- `LLM_EMBEDDING_V0` — one or more embedding inputs.
+- `LLM_RERANK_V0` — provider-backed document reranking.
+- `LLM_ROUTE_DIAGNOSTICS_V0` — payload-safe route diagnostics.
+- `LLM_ROUTE_CHANGED_V0` — typed route-change event.
 
 Calls accept the SDK-provided `AbortSignal` through the service context. Provider timeout, cancellation, disposal, late results, and Core replacement are handled by the typed service/session lifecycle; consumers must not build a second RPC bus or global compatibility bridge.
 
 ## Embedding example
 
 ```ts
-import { LLM_EMBEDDING_V1 } from '@ss-helper/sdk';
+import { LLM_EMBEDDING_V0 } from '@ss-helper/sdk';
 
-const response = await session.services.call(LLM_EMBEDDING_V1, {
+const response = await session.services.call(LLM_EMBEDDING_V0, {
   input: ['first document', 'second document'],
 });
 
@@ -67,9 +67,9 @@ console.log(response.embeddings);
 ## Rerank example
 
 ```ts
-import { LLM_RERANK_V1 } from '@ss-helper/sdk';
+import { LLM_RERANK_V0 } from '@ss-helper/sdk';
 
-const response = await session.services.call(LLM_RERANK_V1, {
+const response = await session.services.call(LLM_RERANK_V0, {
   query: 'matching query',
   documents: [
     { id: 'a', text: 'first document' },
