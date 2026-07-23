@@ -5,7 +5,7 @@ import {
   CORE_DISCOVERY_SYMBOL,
   CORE_LIFECYCLE_EVENT,
 } from '@ss-helper/sdk';
-import { LLM_SETTINGS_SCHEMA, startLlmPlugin } from '../dist/index.js';
+import { LLM_REQUEST_LOGS_POPUP, LLM_SETTINGS_SCHEMA, startLlmPlugin } from '../dist/index.js';
 
 const services = {
   completion: async () => ({ text: 'ok', route: 'fixture', model: 'fixture' }),
@@ -25,9 +25,10 @@ function coreDescriptor(generation, overrides = {}) {
   };
 }
 
-function fixtureCore(generation, active, popupRegistrations = []) {
+function fixtureCore(generation, active, popupRegistrations = [], menuRegistrations = [], includeMenu = true) {
   let close;
   const closed = new Promise((resolve) => { close = resolve; });
+  const openedPopups = [];
   const add = () => {
     const marker = {};
     active.add(marker);
@@ -40,12 +41,15 @@ function fixtureCore(generation, active, popupRegistrations = []) {
     host: { generation: {} },
     services: { expose: add },
     events: { publish() {}, subscribe: add },
-    ui: { showToast() {} },
+    ui: { showToast() {}, openPopup(token, input) { openedPopups.push({ token, input }); } },
     registerSettings: add,
     registerPopup(registration) { popupRegistrations.push(registration); return add(); },
+    ...(includeMenu ? {
+      registerExtensionMenuItem(registration) { menuRegistrations.push(registration); return add(); },
+    } : {}),
     dispose() { close({ reason: 'consumer_dispose', generation }); },
   };
-  return { session, close };
+  return { session, close, openedPopups };
 }
 
 function collectPopupTokens(fields, output = []) {
@@ -79,11 +83,12 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   const target = new EventTarget();
   const active = new Set();
   const firstPopupRegistrations = [];
-  const first = fixtureCore(1, active, firstPopupRegistrations);
+  const firstMenuRegistrations = [];
+  const first = fixtureCore(1, active, firstPopupRegistrations, firstMenuRegistrations);
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
-  assert.equal(active.size, 24, 'settings, status listener, popup, and typed services register once');
+  assert.equal(active.size, 25, 'settings, menu item, status listener, popup, and typed services register once');
   const registeredPopupTokens = firstPopupRegistrations.map(({ token }) => token);
   const schemaPopupTokens = collectPopupTokens(LLM_SETTINGS_SCHEMA.fields);
   assert.equal(registeredPopupTokens.length, 14);
@@ -96,13 +101,33 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   const requestLogs = firstPopupRegistrations.find(({ token }) => token.name === 'request-logs');
   assert.equal(requestLogs?.presentation, 'workspace');
   assert.equal(requestLogs?.closeLabel, '关闭请求日志');
+  assert.equal(firstMenuRegistrations.length, 1);
+  assert.deepEqual(
+    { ...firstMenuRegistrations[0], onActivate: undefined },
+    { id: 'request-logs', label: 'LLM 请求日志', icon: 'clipboard-list', order: 200, onActivate: undefined },
+  );
+  firstMenuRegistrations[0].onActivate();
+  assert.deepEqual(first.openedPopups, [{ token: LLM_REQUEST_LOGS_POPUP, input: {} }]);
 
   const second = fixtureCore(2, active);
   installSnapshot(target, coreDescriptor(2), second);
   first.close({ reason: 'core_replaced', generation: 1 });
   target.dispatchEvent(new Event(CORE_LIFECYCLE_EVENT));
-  await waitFor(() => bootstrap.current.generation === 2 && active.size === 24);
+  await waitFor(() => bootstrap.current.generation === 2 && active.size === 25);
 
+  bootstrap.dispose();
+  await bootstrap.closed;
+  await waitFor(() => active.size === 0);
+});
+
+test('older Core sessions without extension menu registration remain usable', async () => {
+  const target = new EventTarget();
+  const active = new Set();
+  const fixture = fixtureCore(1, active, [], [], false);
+  installSnapshot(target, coreDescriptor(1), fixture);
+  const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
+  const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
+  assert.equal(active.size, 24);
   bootstrap.dispose();
   await bootstrap.closed;
   await waitFor(() => active.size === 0);

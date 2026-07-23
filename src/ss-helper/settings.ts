@@ -11,6 +11,8 @@ export const LLM_POPUP_VERSION = 0 as const;
 
 const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', name, version: LLM_POPUP_VERSION } as const);
 
+export const LLM_REQUEST_LOGS_POPUP = popup('request-logs');
+
 export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
     id: 'ss-helper.llm',
     title: config.settingsTitle,
@@ -63,7 +65,7 @@ export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
         { kind: 'section', id: 'diagnostics', label: '诊断', children: [
             { kind: 'section', id: 'diagnosticsChecks', label: '检查与日志', children: [
                 { kind: 'action', id: 'serviceDiagnostics', label: '服务检查', description: '检查数据库、酒馆连接和外部资源是否正常。', actionId: 'open-diagnostics', placement: 'inline', buttonLabel: '运行检查', popup: popup('diagnostics') },
-                { kind: 'action', id: 'requestLogs', label: '请求日志', description: '查看请求经过了哪个资源，以及成功或失败的原因。', actionId: 'open-request-logs', placement: 'inline', buttonLabel: '查看', popup: popup('request-logs') },
+                { kind: 'action', id: 'requestLogs', label: '请求日志', description: '查看请求经过了哪个资源，以及成功或失败的原因。', actionId: 'open-request-logs', placement: 'inline', buttonLabel: '查看', popup: LLM_REQUEST_LOGS_POPUP },
             ] },
             { kind: 'section', id: 'requestLogPolicy', label: '日志记录策略', children: [
                 { kind: 'toggle', id: 'requestLogging.enabled', label: '保存请求日志', description: '保存请求诊断链路；关闭后不再写入新的日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.enabled },
