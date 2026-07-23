@@ -5,7 +5,7 @@ import {
     parseJsonOutput,
 } from '../schema/validator';
 import { normalizeStructuredCategoryBuckets } from '../schema/structured-output-classifier';
-import { validateJsonSchema } from '../schema/json-schema-validator';
+import { normalizeJsonSchemaEnumFallbacks, validateJsonSchema } from '../schema/json-schema-validator';
 import { ProfileManager } from '../profile/profile-manager';
 import { inferReasonCode } from '../schema/error-codes';
 import { detectStructuredOutputIdentity, createStructuredOutputPlan, withStructuredOutputInstruction, type StructuredOutputIdentity } from '../schema/structured-output-plan';
@@ -251,13 +251,7 @@ export class LLMSDKImpl {
             || normalizedReasonCode === 'rate_limited'
             || normalizedReasonCode === 'network_error'
             || normalizedReasonCode === 'circuit_open'
-            || normalizedReasonCode === 'provider_unavailable'
-            || normalizedReasonCode === 'unknown'
-            || normalizedReasonCode === 'token_limit_exceeded'
-            || normalizedReasonCode === 'structured_output_empty'
-            || normalizedReasonCode === 'structured_output_truncated'
-            || normalizedReasonCode === 'invalid_json'
-            || normalizedReasonCode === 'schema_validation_failed';
+            || normalizedReasonCode === 'provider_unavailable';
     }
 
     private shouldOfferRetry(result: LLMRunResult<unknown>): boolean {
@@ -361,14 +355,13 @@ export class LLMSDKImpl {
             if (record.validity.isCancelled || record.validity.isSuperseded || record.validity.isObsolete) {
                 return { ok: false, error: '请求结果已作废', reasonCode: 'cancelled' };
             }
-            const shouldOfferRetry = !currentResult.ok && this.shouldOfferRetry(currentResult);
-            const shouldRetry = shouldOfferRetry && this.allowsInteractiveRetry(record)
-                ? this.confirmRetryableFailure(record, currentResult, retryCount)
-                : false;
-
-            if (shouldRetry) {
-                this.queueStructuredRetryRepair(record, currentResult);
-            }
+            const reasonCode = currentResult.ok
+                ? ''
+                : String(currentResult.reasonCode || '').trim() || inferReasonCode(String(currentResult.error || ''));
+            const shouldRetry = !currentResult.ok
+                && retryCount < 1
+                && currentResult.retryable !== false
+                && this.isReasonCodeRetryable(reasonCode);
 
             await this.recordAttemptLog(record, attemptRequestId, currentResult, !shouldRetry);
 
@@ -379,9 +372,7 @@ export class LLMSDKImpl {
             retryCount += 1;
             this.emitLifecycle(args, record, {
                 stage: 'running',
-                message: retryCount === 1
-                    ? '用户已确认重试，正在重新请求'
-                    : `用户已确认第 ${retryCount} 次重试，正在重新请求`,
+                message: '检测到临时故障，正在自动重试一次',
                 progress: 0.35,
             });
             this.orchestrator.advanceAttempt(record);
@@ -1462,7 +1453,9 @@ export class LLMSDKImpl {
                 };
             }
 
-            const postProcessedInput = normalizeStructuredCategoryBuckets(parsed.data);
+            const categoryNormalizedInput = normalizeStructuredCategoryBuckets(parsed.data);
+            const enumNormalization = normalizeJsonSchemaEnumFallbacks(categoryNormalizedInput, schema);
+            const postProcessedInput = enumNormalization.data;
             const validation = validateJsonSchema(postProcessedInput, schema);
             if (!validation.valid) {
                 this.budgetManager.recordFailure(consumer);

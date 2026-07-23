@@ -34,7 +34,9 @@ export function validateZodSchema<T>(data: any, schema: ZodType<T>): ValidationR
  */
 export function parseJsonOutput(raw: string | object): { ok: boolean; data: any; error?: string } {
     if (raw && typeof raw === 'object') {
-        return { ok: true, data: raw };
+        return Array.isArray(raw)
+            ? { ok: false, data: null, error: '结构化输出必须是唯一根对象，不能是根数组' }
+            : { ok: true, data: raw };
     }
     if (!raw || typeof raw !== 'string') {
         return { ok: false, data: null, error: '返回内容为空或格式非字符串' };
@@ -46,105 +48,39 @@ export function parseJsonOutput(raw: string | object): { ok: boolean; data: any;
     // 1. 尝试去除 DeepSeek / Claude 等喜欢附带的 <think> 标签内容
     cleanStr = cleanStr.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
 
-    // 2. 尝试直接解析
-    try {
-        return { ok: true, data: JSON.parse(cleanStr) };
-    } catch (error) {
-        lastError = (error as Error).message;
-        // 继续尝试提取代码块中的 JSON
-    }
-
-    // 3. 尝试提取 ```json ... ``` 或 ``` ... ``` 块
-    const jsonBlockMatch = cleanStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?\s*```/);
-    if (jsonBlockMatch) {
+    const parseRootObject = (value: string): { ok: boolean; data: any; error?: string } => {
         try {
-            return { ok: true, data: JSON.parse(jsonBlockMatch[1].trim()) };
-        } catch (e) {
-            lastError = `代码块中的 JSON 解析失败: ${(e as Error).message}`;
+            const parsed = JSON.parse(value);
+            return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+                ? { ok: true, data: parsed }
+                : { ok: false, data: null, error: '结构化输出必须是唯一根对象' };
+        } catch (error) {
+            return { ok: false, data: null, error: (error as Error).message };
         }
-    }
-
-    const extractBalancedJsonCandidate = (value: string): string | null => {
-        const start = value.search(/[\[{]/);
-        if (start < 0) return null;
-
-        const stack: string[] = [];
-        let inString = false;
-        let escaped = false;
-
-        for (let index = start; index < value.length; index += 1) {
-            const ch = value[index];
-            if (inString) {
-                if (escaped) {
-                    escaped = false;
-                    continue;
-                }
-                if (ch === '\\') {
-                    escaped = true;
-                    continue;
-                }
-                if (ch === '"') {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch === '"') {
-                inString = true;
-                continue;
-            }
-
-            if (ch === '{' || ch === '[') {
-                stack.push(ch);
-                continue;
-            }
-
-            if (ch === '}' || ch === ']') {
-                if (stack.length === 0) {
-                    return null;
-                }
-                const top = stack[stack.length - 1];
-                const matched = (top === '{' && ch === '}') || (top === '[' && ch === ']');
-                if (!matched) {
-                    return null;
-                }
-                stack.pop();
-                if (stack.length === 0) {
-                    return value.slice(start, index + 1);
-                }
-            }
-        }
-
-        return null;
     };
 
-    const balancedCandidate = extractBalancedJsonCandidate(cleanStr)
-        || (jsonBlockMatch?.[1] ? extractBalancedJsonCandidate(jsonBlockMatch[1].trim()) : null);
-    if (balancedCandidate) {
-        try {
-            return { ok: true, data: JSON.parse(balancedCandidate) };
-        } catch (e) {
-            lastError = `平衡括号提取 JSON 解析失败: ${(e as Error).message}`;
-        }
+    // 2. 直接解析唯一根对象
+    try {
+        const parsed = parseRootObject(cleanStr);
+        if (parsed.ok) return parsed;
+        lastError = parsed.error ?? '';
+    } catch (error) {
+        lastError = (error as Error).message;
     }
 
-    // 4. 暴力搜索第一个 { 和最后一个 } 之间的内容
-    const firstBrace = cleanStr.indexOf('{');
-    const lastBrace = cleanStr.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
-        try {
-            const manualExtract = cleanStr.substring(firstBrace, lastBrace + 1);
-            return { ok: true, data: JSON.parse(manualExtract) };
-        } catch (e) {
-            lastError = `暴力括号提取 JSON 解析失败: ${(e as Error).message}`;
-        }
+    // 3. 只允许整个输出由一个 ```json ... ``` 或 ``` ... ``` 块组成
+    const jsonBlockMatch = cleanStr.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/);
+    if (jsonBlockMatch) {
+        const parsed = parseRootObject(jsonBlockMatch[1].trim());
+        if (parsed.ok) return parsed;
+        lastError = `代码块中的 JSON 解析失败: ${parsed.error ?? '未知错误'}`;
     }
 
     if (/[\[{]/.test(cleanStr)) {
         return {
             ok: false,
             data: null,
-            error: lastError || '疑似输出截断或 JSON 未闭合，无法提取完整结构',
+            error: lastError || '只接受一个完整 JSON 根对象；输出可能截断、未闭合或包含多个根对象',
         };
     }
 
