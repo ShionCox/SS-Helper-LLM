@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
 import { OpenAIProvider, createStructuredOutputPlan, detectStructuredOutputIdentity } from '../dist/index.js';
 
 const strictSchema = {
@@ -10,101 +9,163 @@ const strictSchema = {
   required: ['value'],
 };
 
-test('structured output planner identifies DeepSeek and preserves its JSON-object requirements', () => {
-  const identity = detectStructuredOutputIdentity({ manualVendor: 'auto', baseUrl: 'https://api.deepseek.com/v1', model: 'deepseek-chat' });
-  const plan = createStructuredOutputPlan({ providerKind: 'openai', identity, spec: { name: 'extract', schema: strictSchema } });
-  assert.equal(identity.vendor, 'deepseek');
-  assert.equal(identity.evidence, 'api_url');
-  assert.equal(plan.transport, 'json_object');
-  assert.match(plan.promptInstruction, /json/u);
-  assert.match(plan.promptInstruction, /"value"/u);
-  const routed = detectStructuredOutputIdentity({ manualVendor: 'auto', provider: 'openrouter', model: 'deepseek-chat' });
-  assert.deepEqual({ vendor: routed.vendor, evidence: routed.evidence }, { vendor: 'deepseek', evidence: 'model_name' });
-});
+const identity = detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' });
 
-test('planner uses strict OpenAI schema only for compatible schemas and prompt-only for unknown providers', () => {
-  const openai = createStructuredOutputPlan({
-    providerKind: 'openai',
-    identity: detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' }),
+test('planner follows explicit provider capability instead of URL or model-name guessing', () => {
+  const strict = createStructuredOutputPlan({
+    identity,
+    capability: { transports: ['json_schema', 'json_object', 'prompt_only'], preferred: 'json_schema' },
     spec: { name: 'extract', schema: strictSchema },
   });
+  const jsonObject = createStructuredOutputPlan({
+    identity,
+    capability: { transports: ['json_object', 'prompt_only'], preferred: 'json_object' },
+    spec: { name: 'extract', schema: strictSchema },
+  });
+  const promptOnly = createStructuredOutputPlan({
+    identity,
+    capability: { transports: ['prompt_only'], preferred: 'prompt_only' },
+    spec: { name: 'extract', schema: strictSchema },
+  });
+  assert.equal(strict.transport, 'json_schema');
+  assert.equal(jsonObject.transport, 'json_object');
+  assert.equal(promptOnly.transport, 'prompt_only');
+});
+
+test('planner deterministically falls back when strict schema transport cannot represent the schema', () => {
   const incompatible = createStructuredOutputPlan({
-    providerKind: 'openai',
-    identity: detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' }),
+    identity,
+    capability: { transports: ['json_schema', 'json_object', 'prompt_only'], preferred: 'json_schema' },
     spec: { name: 'extract', schema: { type: 'object', properties: { value: { type: 'string' } } } },
   });
-  const unknown = createStructuredOutputPlan({
-    providerKind: 'openai',
-    identity: detectStructuredOutputIdentity({ manualVendor: 'auto', baseUrl: 'https://proxy.example/v1', model: 'oracle-x' }),
-    spec: { name: 'extract', schema: strictSchema },
-  });
-  assert.equal(openai.transport, 'json_schema');
   assert.equal(incompatible.transport, 'json_object');
-  assert.equal(unknown.transport, 'prompt_only');
 });
 
-test('Tavern Custom and unknown sources always use isolated Schema Prompt output', () => {
-  for (const model of ['deepseek-v4-flash', 'gpt-4o-mini', 'claude-sonnet', 'gemini-2.5-flash', 'oracle-x']) {
-    const plan = createStructuredOutputPlan({
-      providerKind: 'tavern',
-      identity: detectStructuredOutputIdentity({ manualVendor: 'auto', provider: 'custom', model }),
-      spec: { name: 'memory_extract', schema: strictSchema },
-    });
-    assert.equal(plan.transport, 'prompt_only', `Custom ${model} must not receive Tavern native schema`);
-    assert.match(plan.promptInstruction, /JSON Schema/u);
-    assert.match(plan.promptInstruction, /"value"/u);
-  }
-
-  const unknownOfficialSource = createStructuredOutputPlan({
-    providerKind: 'tavern',
-    identity: detectStructuredOutputIdentity({ manualVendor: 'auto', provider: 'koboldcpp', model: 'local-model' }),
-    spec: { name: 'memory_extract', schema: strictSchema },
+test('Tavern capability selects the host native schema transport regardless of model identity', () => {
+  const plan = createStructuredOutputPlan({
+    identity: detectStructuredOutputIdentity({ manualVendor: 'auto', provider: 'custom', model: 'oracle-x' }),
+    capability: { transports: ['tavern_json_schema', 'prompt_only'], preferred: 'tavern_json_schema' },
+    spec: { name: 'memory_capture', schema: strictSchema },
   });
-  assert.equal(unknownOfficialSource.transport, 'prompt_only');
+  assert.equal(plan.transport, 'tavern_json_schema');
 });
 
-test('Tavern official provider sources retain native Schema transport', () => {
-  for (const [provider, model] of [['deepseek', 'deepseek-chat'], ['openai', 'gpt-4o-mini'], ['claude', 'claude-sonnet'], ['gemini', 'gemini-2.5-flash']]) {
-    const plan = createStructuredOutputPlan({
-      providerKind: 'tavern',
-      identity: detectStructuredOutputIdentity({ manualVendor: 'auto', provider, model }),
-      spec: { name: 'memory_extract', schema: strictSchema },
-    });
-    assert.equal(plan.transport, 'tavern_json_schema', `${provider} should use Tavern native schema`);
-  }
-});
-
-test('static gate prevents Tavern Custom from returning to native schema translation', async () => {
-  const source = await readFile(new URL('../src/schema/structured-output-plan.ts', import.meta.url), 'utf8');
-  assert.match(source, /tavernSource === 'custom' \|\| input\.identity\.vendor === 'unknown'/u);
-  assert.doesNotMatch(source, /tavernSource === 'custom' && input\.identity\.vendor === 'deepseek'/u);
-});
-
-test('OpenAI falls back to JSON object only after an explicit format rejection', async () => {
-  const requests = [];
-  const provider = new OpenAIProvider({
-    id: 'openai', apiKey: 'secret', model: 'gpt-4o-mini',
-    fetchImpl: async (_url, init) => {
-      requests.push(JSON.parse(String(init.body)));
-      if (requests.length === 1) return new Response('{"error":{"message":"response_format json_schema is unsupported"}}', { status: 400 });
-      return new Response(JSON.stringify({ choices: [{ message: { content: '{"value":"ok"}' }, finish_reason: 'stop' }] }), { status: 200 });
-    },
-  });
-  const plan = createStructuredOutputPlan({ providerKind: 'openai', identity: detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' }), spec: { name: 'extract', schema: strictSchema } });
-  const result = await provider.request({ messages: [{ role: 'system', content: 'Return JSON.' }], structuredOutput: plan });
-  assert.equal(requests.length, 2);
-  assert.equal(requests[0].response_format.type, 'json_schema');
-  assert.deepEqual(requests[1].response_format, { type: 'json_object' });
-  assert.deepEqual(result.structuredOutput, { plannedTransport: 'json_schema', actualTransport: 'json_object', fallbackReason: 'response_format_unsupported' });
-});
-
-test('OpenAI does not downgrade non-format errors', async () => {
+test('OpenAI provider performs exactly one HTTP call and leaves transport fallback to the coordinator', async () => {
   let calls = 0;
   const provider = new OpenAIProvider({
     id: 'openai', apiKey: 'secret', model: 'gpt-4o-mini',
-    fetchImpl: async () => { calls += 1; return new Response('{"error":{"message":"invalid API key"}}', { status: 401 }); },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({
+        error: {
+          message: 'private provider explanation must not cross the boundary',
+          type: 'invalid_request_error',
+          param: 'response_format',
+          code: 'unsupported_response_format',
+        },
+      }), { status: 400 });
+    },
   });
-  const plan = createStructuredOutputPlan({ providerKind: 'openai', identity: detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' }), spec: { name: 'extract', schema: strictSchema } });
-  await assert.rejects(provider.request({ messages: [{ role: 'system', content: 'Return JSON.' }], structuredOutput: plan }));
+  const plan = createStructuredOutputPlan({
+    identity,
+    capability: provider.capabilities.structuredOutput,
+    spec: { name: 'extract', schema: strictSchema },
+  });
+  await assert.rejects(
+    provider.request({ messages: [{ role: 'system', content: 'Return JSON.' }], structuredOutput: plan }),
+    (error) => error?.details?.reasonCode === 'RESPONSE_FORMAT_UNSUPPORTED'
+      && error?.details?.providerErrorCode === 'unsupported_response_format'
+      && error?.details?.providerErrorType === 'invalid_request_error'
+      && error?.details?.providerErrorParam === 'response_format'
+      && !JSON.stringify(error).includes('private provider explanation'),
+  );
   assert.equal(calls, 1);
+});
+
+test('OpenAI provider distinguishes a missing model from a missing endpoint without exposing response text', async () => {
+  const missingModel = new OpenAIProvider({
+    id: 'missing-model', apiKey: 'secret', model: 'retired-model',
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: {
+        message: 'private model inventory detail',
+        type: 'invalid_request_error',
+        param: 'model',
+        code: 'model_not_found',
+      },
+    }), { status: 404 }),
+  });
+  await assert.rejects(
+    missingModel.request({ messages: [{ role: 'user', content: 'hello' }] }),
+    (error) => error?.details?.reasonCode === 'MODEL_NOT_FOUND'
+      && error?.details?.providerErrorParam === 'model'
+      && !JSON.stringify(error).includes('private model inventory detail'),
+  );
+
+  const missingEndpoint = new OpenAIProvider({
+    id: 'missing-endpoint', apiKey: 'secret', model: 'model-a',
+    fetchImpl: async () => new Response('not found', { status: 404 }),
+  });
+  await assert.rejects(
+    missingEndpoint.request({ messages: [{ role: 'user', content: 'hello' }] }),
+    (error) => error?.details?.reasonCode === 'ENDPOINT_NOT_FOUND'
+      && !JSON.stringify(error).includes('not found'),
+  );
+});
+
+test('Provider does not infer DeepSeek response_format support from an unsafe message', async () => {
+  const provider = new OpenAIProvider({
+    id: 'deepseek-v4', apiKey: 'secret', model: 'deepseek-v4', apiType: 'deepseek',
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: {
+        message: 'This response_format type is unavailable now',
+        type: 'invalid_request_error',
+        param: null,
+        code: 'invalid_request_error',
+      },
+    }), { status: 400 }),
+  });
+  const plan = createStructuredOutputPlan({
+    identity: detectStructuredOutputIdentity({ manualVendor: 'deepseek', model: 'deepseek-v4' }),
+    capability: provider.capabilities.structuredOutput,
+    spec: { name: 'extract', schema: strictSchema },
+  });
+
+  await assert.rejects(
+    provider.request({ messages: [{ role: 'system', content: 'Return JSON.' }], structuredOutput: plan }),
+    (error) => error?.details?.reasonCode === 'PROVIDER_HTTP_ERROR'
+      && error?.details?.providerErrorCode === 'invalid_request_error'
+      && !JSON.stringify(error).includes('This response_format type is unavailable now'),
+  );
+});
+
+test('Provider recognizes response_format rejection from structured param evidence', async () => {
+  const provider = new OpenAIProvider({
+    id: 'structured-evidence', apiKey: 'secret', model: 'model-a',
+    fetchImpl: async () => new Response(JSON.stringify({
+      error: {
+        message: 'private provider prose',
+        type: 'invalid_request_error',
+        param: 'response_format.type',
+        code: 'invalid_request_error',
+      },
+    }), { status: 400 }),
+  });
+  await assert.rejects(
+    provider.request({ messages: [{ role: 'user', content: 'hello' }] }),
+    (error) => error?.details?.reasonCode === 'RESPONSE_FORMAT_UNSUPPORTED'
+      && error?.details?.providerErrorParam === 'response_format.type'
+      && !JSON.stringify(error).includes('private provider prose'),
+  );
+});
+
+test('Provider keeps a bare HTTP 415 as a generic HTTP failure', async () => {
+  const provider = new OpenAIProvider({
+    id: 'bare-415', apiKey: 'secret', model: 'model-a',
+    fetchImpl: async () => new Response('', { status: 415 }),
+  });
+  await assert.rejects(
+    provider.request({ messages: [{ role: 'user', content: 'hello' }] }),
+    (error) => error?.details?.reasonCode === 'PROVIDER_HTTP_ERROR'
+      && error?.details?.httpStatus === 415,
+  );
 });

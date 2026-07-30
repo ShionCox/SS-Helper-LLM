@@ -2,9 +2,9 @@
 
 SS-Helper LLM is consumed only through the public `@ss-helper/sdk` contracts exposed by SS-Helper Core. Consumers must not read a legacy cross-plugin global, import LLM internals, mount LLM settings, or call raw SillyTavern APIs.
 
-## Connect and call a service
+## Connect and request a contract
 
-Use a Core-managed plugin session and a typed service token. The session owns timeout, abort, Core reload, and disposal behavior.
+Use a Core-managed plugin session and a typed Bus contract. The session owns timeout, abort, Core reload, and disposal behavior.
 
 ```ts
 import {
@@ -18,7 +18,7 @@ const bootstrap = await bootstrapSSHelper({
   pluginVersion: '0.0.1',
   capabilities: [],
 }, async (session) => {
-  const result = await session.services.call(LLM_STRUCTURED_TASK_V0, {
+  const result = await session.bus.request(LLM_STRUCTURED_TASK_V0, {
     task: 'summarize',
     input: { text: 'Plain-data input' },
     outputSchema: {
@@ -28,7 +28,7 @@ const bootstrap = await bootstrapSSHelper({
       additionalProperties: false,
     },
     timeoutMs: 30_000,
-  });
+  }, { timeoutMs: 30_000 });
 
   console.log(result.output);
 });
@@ -47,17 +47,17 @@ Import tokens from the package root only:
 - `LLM_STRUCTURED_TASK_V0` — schema-constrained structured tasks.
 - `LLM_EMBEDDING_V0` — one or more embedding inputs.
 - `LLM_RERANK_V0` — provider-backed document reranking.
-- `LLM_ROUTE_DIAGNOSTICS_V0` — payload-safe route diagnostics.
+- `LLM_CAPABILITY_STATUS_V0` — current provider capability status.
 - `LLM_ROUTE_CHANGED_V0` — typed route-change event.
 
-Calls accept the SDK-provided `AbortSignal` through the service context. Provider timeout, cancellation, disposal, late results, and Core replacement are handled by the typed service/session lifecycle; consumers must not build a second RPC bus or global compatibility bridge.
+Calls accept `signal` and `timeoutMs` in `session.bus.request` options. Provider timeout, cancellation, disposal, late results, and Core replacement are handled by the Bus/session lifecycle; consumers must not build a second RPC bus or global compatibility bridge.
 
 ## Embedding example
 
 ```ts
 import { LLM_EMBEDDING_V0 } from '@ss-helper/sdk';
 
-const response = await session.services.call(LLM_EMBEDDING_V0, {
+const response = await session.bus.request(LLM_EMBEDDING_V0, {
   input: ['first document', 'second document'],
 });
 
@@ -69,7 +69,7 @@ console.log(response.embeddings);
 ```ts
 import { LLM_RERANK_V0 } from '@ss-helper/sdk';
 
-const response = await session.services.call(LLM_RERANK_V0, {
+const response = await session.bus.request(LLM_RERANK_V0, {
   query: 'matching query',
   documents: [
     { id: 'a', text: 'first document' },
@@ -87,4 +87,4 @@ Ordinary LLM settings are registered by the LLM plugin through the single Core S
 
 ## Availability and cleanup
 
-Use SDK connection/reconnect behavior rather than polling globals. Keep the returned bootstrap handle for shutdown, and register listeners/services through the session so Core replacement or plugin disposal releases them deterministically.
+Use SDK connection/reconnect behavior rather than polling globals. Keep the returned bootstrap handle for shutdown, and register handlers/listeners through `session.bus` so Core replacement or plugin disposal releases them deterministically.

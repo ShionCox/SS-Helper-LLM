@@ -19,13 +19,13 @@ function coreDescriptor(generation, overrides = {}) {
   return {
     kind: 'ss-helper-core', id: 'ss-helper.core', coreVersion: '0.0.1', sdkPackageVersion: '0.0.1',
     apiVersion: API_VERSION, generation, state: 'ready',
-    capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'core.ui.notification.v0', 'secrets.read', 'secrets.write'],
+    capabilities: ['tavern.generation.read', 'tavern.generation.execute', 'tavern.chat.events', 'tavern.plugin.request', 'core.ui.notification.v0', 'secrets.read', 'secrets.write'],
     artifact: { buildId: `fixture-${generation}`, contentDigest: 'a'.repeat(64) },
     ...overrides,
   };
 }
 
-function fixtureCore(generation, active, popupRegistrations = [], menuRegistrations = [], includeMenu = true) {
+function fixtureCore(generation, active, popupRegistrations = [], menuRegistrations = []) {
   let close;
   const closed = new Promise((resolve) => { close = resolve; });
   const openedPopups = [];
@@ -39,14 +39,12 @@ function fixtureCore(generation, active, popupRegistrations = [], menuRegistrati
     generation,
     closed,
     host: { generation: {} },
-    services: { expose: add },
-    events: { publish() {}, subscribe: add },
+    bus: { handle: add, request() {}, publish() {}, subscribe: add },
     ui: { showToast() {}, openPopup(token, input) { openedPopups.push({ token, input }); } },
     registerSettings: add,
+    registerChatIndicator: add,
     registerPopup(registration) { popupRegistrations.push(registration); return add(); },
-    ...(includeMenu ? {
-      registerExtensionMenuItem(registration) { menuRegistrations.push(registration); return add(); },
-    } : {}),
+    registerExtensionMenuItem(registration) { menuRegistrations.push(registration); return add(); },
     dispose() { close({ reason: 'consumer_dispose', generation }); },
   };
   return { session, close, openedPopups };
@@ -88,10 +86,10 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
-  assert.equal(active.size, 25, 'settings, menu item, status listener, popup, and typed services register once');
+  assert.equal(active.size, 22, 'settings, chat indicator, menu item, status listener, popup, and typed bus handlers register once');
   const registeredPopupTokens = firstPopupRegistrations.map(({ token }) => token);
   const schemaPopupTokens = collectPopupTokens(LLM_SETTINGS_SCHEMA.fields);
-  assert.equal(registeredPopupTokens.length, 14);
+  assert.equal(registeredPopupTokens.length, 12);
   assert.deepEqual(
     registeredPopupTokens.map(popupKey).sort(),
     schemaPopupTokens.map(popupKey).sort(),
@@ -113,21 +111,8 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   installSnapshot(target, coreDescriptor(2), second);
   first.close({ reason: 'core_replaced', generation: 1 });
   target.dispatchEvent(new Event(CORE_LIFECYCLE_EVENT));
-  await waitFor(() => bootstrap.current.generation === 2 && active.size === 25);
+  await waitFor(() => bootstrap.current.generation === 2 && active.size === 22);
 
-  bootstrap.dispose();
-  await bootstrap.closed;
-  await waitFor(() => active.size === 0);
-});
-
-test('older Core sessions without extension menu registration remain usable', async () => {
-  const target = new EventTarget();
-  const active = new Set();
-  const fixture = fixtureCore(1, active, [], [], false);
-  installSnapshot(target, coreDescriptor(1), fixture);
-  const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
-  const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
-  assert.equal(active.size, 24);
   bootstrap.dispose();
   await bootstrap.closed;
   await waitFor(() => active.size === 0);
@@ -141,7 +126,7 @@ test('incompatible Core fails before any settings, popup, or service registratio
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   await assert.rejects(
     startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services }),
-    (error) => error?.code === 'API_INCOMPATIBLE',
+    (error) => error?.code === 'INVALID_PAYLOAD',
   );
   assert.equal(active.size, 0);
 });

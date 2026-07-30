@@ -25,7 +25,3 @@ test('LLM registers a dependency-only indicator controlled by the global enabled
   cleanup();
   assert.equal(unsubscribed, 1);
 });
-
-test('LLM skips the contribution against an older Core', () => {
-  assert.doesNotThrow(() => registerLlmChatIndicator({}, { loadSettings: async () => ({ enabled: true }), subscribeSettings: () => () => {} })());
-});

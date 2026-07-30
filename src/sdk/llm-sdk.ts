@@ -4,16 +4,27 @@ import { BudgetManager } from '../budget/budget-manager';
 import {
     parseJsonOutput,
 } from '../schema/validator';
-import { normalizeStructuredCategoryBuckets } from '../schema/structured-output-classifier';
-import { normalizeJsonSchemaEnumFallbacks, validateJsonSchema } from '../schema/json-schema-validator';
+import {
+    preflightJsonSchema,
+    validateJsonSchema,
+    validateJsonSchemaItemized,
+    type JsonSchemaItemRejection,
+} from '../schema/json-schema-validator';
 import { ProfileManager } from '../profile/profile-manager';
-import { inferReasonCode } from '../schema/error-codes';
+import {
+    createSSHelperError,
+    describeSSHelperFailure,
+    isSSHelperReasonCode,
+    readSSHelperFailure,
+    SS_HELPER_DIAGNOSTICS,
+    type SSHelperFailureContext,
+    type SSHelperReasonCode,
+} from '@ss-helper/sdk';
 import { detectStructuredOutputIdentity, createStructuredOutputPlan, withStructuredOutputInstruction, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { resolveMaxTokens } from './max-tokens';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
-import { DisplayController } from '../display/display-controller';
 import { ConsumerRegistry } from '../registry/consumer-registry';
-import { logger } from '../runtime/logger';
+import { logger, safeFailureLogDetail } from '../runtime/logger';
 import { RequestLogService } from '../log/requestLogService';
 import type {
     LLMRunResult,
@@ -21,16 +32,52 @@ import type {
     CapabilityKind,
     ConsumerRegistration,
     LLMInspectApi,
-    OverlayPatch,
     RunTaskArgs,
     EmbedArgs,
     RerankArgs,
     RequestRecord,
-    RequestEnqueueOptions,
     LLMRequestLogRequestSnapshot,
     LLMTaskLifecycleEvent,
     LLMHubSettings,
 } from '../schema/types';
+
+function canonicalSchemaValue(value: unknown, seen = new WeakSet<object>()): unknown {
+    if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : String(value);
+    if (typeof value !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    const canonical = Array.isArray(value)
+        ? value.map((item) => canonicalSchemaValue(item, seen))
+        : Object.fromEntries(Object.entries(value as Record<string, unknown>)
+            .filter(([, nested]) => nested !== undefined)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, nested]) => [key, canonicalSchemaValue(nested, seen)]));
+    seen.delete(value);
+    return canonical;
+}
+
+function hashSchema(schema: unknown): string | undefined {
+    if (schema === undefined) return undefined;
+    const bytes = new TextEncoder().encode(JSON.stringify(canonicalSchemaValue(schema)));
+    let hash = 0x811c9dc5;
+    for (const byte of bytes) {
+        hash ^= byte;
+        hash = Math.imul(hash, 0x01000193) >>> 0;
+    }
+    return `fnv1a32:${hash.toString(16).padStart(8, '0')}`;
+}
+
+type StructuredOutputTransport = NonNullable<LLMRequest['structuredOutput']>['transport'];
+
+function nextStructuredOutputTransport(
+    current: StructuredOutputTransport,
+    supported: readonly StructuredOutputTransport[],
+): StructuredOutputTransport | undefined {
+    if (current === 'json_schema' && supported.includes('json_object')) return 'json_object';
+    if (current !== 'prompt_only' && supported.includes('prompt_only')) return 'prompt_only';
+    return undefined;
+}
 
 /**
  * 功能：判断输入是否为普通对象，便于拼装 generation 用户消息。
@@ -74,12 +121,8 @@ function buildGenerationUserContent(input: unknown): string {
     return JSON.stringify(rest);
 }
 
-type StructuredRetryRepair = NonNullable<RequestRecord['structuredRetryRepair']>;
-
 function structuredOutputLogFields(
     plan: NonNullable<LLMRequest['structuredOutput']>,
-    retryRepair?: StructuredRetryRepair,
-    retryRepairState: 'queued' | 'applied' = 'applied',
 ): NonNullable<LLMRequestLogRequestSnapshot['structuredOutput']> {
     return {
         vendor: plan.identity.vendor,
@@ -90,12 +133,6 @@ function structuredOutputLogFields(
         contextMode: plan.transport === 'prompt_only' ? 'isolated' : 'chat',
         nativeJsonMode: plan.transport !== 'prompt_only',
         nativeSchemaSent: plan.transport === 'json_schema' || plan.transport === 'tavern_json_schema',
-        ...(retryRepair === undefined ? {} : {
-            manualRetryRepair: {
-                reasonCode: retryRepair.reasonCode,
-                state: retryRepairState,
-            },
-        }),
     };
 }
 
@@ -104,27 +141,25 @@ function structuredOutputLogFields(
  * LLMSDK 门面层
  * 整合四层架构：注册中心、路由、编排、展示。
  *
- * 异步接口：runTask, embed, rerank, waitForOverlayClose
- * 同步接口：registerConsumer, unregisterConsumer, updateOverlay, closeOverlay
+ * 异步接口：runTask、embed、rerank。
+ * 同步接口：registerConsumer、unregisterConsumer。
  */
 export class LLMSDKImpl {
     private router: TaskRouter;
     private budgetManager: BudgetManager;
     private profileManager: ProfileManager;
     private orchestrator: RequestOrchestrator;
-    private displayController: DisplayController;
     private registry: ConsumerRegistry;
     private requestLogService: RequestLogService;
     private globalProfileId: string;
     private settingsResolver: (() => LLMHubSettings) | null = null;
-    private readonly unsupportedStrictSchemaResources = new Set<string>();
+    private readonly unsupportedStructuredTransports = new Set<string>();
     public inspect?: LLMInspectApi;
 
     constructor(
         router: TaskRouter,
         budgetManager: BudgetManager,
         orchestrator: RequestOrchestrator,
-        displayController: DisplayController,
         registry: ConsumerRegistry,
         requestLogService: RequestLogService,
     ) {
@@ -132,26 +167,20 @@ export class LLMSDKImpl {
         this.budgetManager = budgetManager;
         this.profileManager = new ProfileManager();
         this.orchestrator = orchestrator;
-        this.displayController = displayController;
         this.registry = registry;
         this.requestLogService = requestLogService;
         this.globalProfileId = 'balanced';
 
         // 连接编排器与展示控制器
-        this.orchestrator.setPendingDisplayCallback((record) => {
-            this.displayController.openPendingOverlay(record);
-        });
         this.orchestrator.setExecuteCallback((record) => this.executeRequest(record));
-        this.orchestrator.setDisplayCallback((record, result) => {
-            this.displayController.createOverlay(record, result);
-        });
         this.orchestrator.setArchiveCallback((record) => {
             void this.requestLogService.archiveRecord(record).catch((error) => {
-                logger.warn(`请求日志归档失败: ${record.requestId}`, error);
+                logger.warn(`请求日志归档失败: ${record.requestId}`, safeFailureLogDetail(error, {
+                    reasonCode: 'LOG_UNAVAILABLE',
+                    stage: 'llm.log.archive',
+                    requestId: record.requestId,
+                }));
             });
-        });
-        this.displayController.setNotifyOrchestratorClosed((requestId) => {
-            this.orchestrator.notifyOverlayClosed(requestId);
         });
     }
 
@@ -167,22 +196,14 @@ export class LLMSDKImpl {
         this.registry.unregisterConsumer(pluginId, opts);
     }
 
-    /** 更新覆层。同步返回。 */
-    updateOverlay(requestId: string, patch: OverlayPatch): void {
-        this.displayController.updateOverlay(requestId, patch);
-    }
-
-    /** 关闭覆层。同步返回。 */
-    closeOverlay(requestId: string, reason?: string): void {
-        this.displayController.closeOverlay(requestId, reason);
-    }
-
     // ─── 异步接口 ───
 
     setGlobalProfile(profileId: string): void {
         const profile = this.profileManager.get(profileId);
         if (!profile) {
-            throw new Error(`Profile 不存在: ${profileId}`);
+            throw createSSHelperError('LLM_PROFILE_NOT_FOUND', {
+                stage: 'llm.profile.select',
+            });
         }
         this.globalProfileId = profileId;
     }
@@ -193,6 +214,11 @@ export class LLMSDKImpl {
 
     setSettingsResolver(resolver: () => LLMHubSettings): void {
         this.settingsResolver = resolver;
+    }
+
+    dispose(): void {
+        this.settingsResolver = null;
+        this.orchestrator.dispose();
     }
 
     private readSettings(): LLMHubSettings {
@@ -223,123 +249,41 @@ export class LLMSDKImpl {
                 ...event,
             });
         } catch (error) {
-            logger.warn(`生命周期回调执行失败: ${record.requestId}`, error);
+            logger.warn(`生命周期回调执行失败: ${record.requestId}`, safeFailureLogDetail(error, {
+                reasonCode: 'INTERNAL_ERROR',
+                stage: 'llm.lifecycle.callback',
+                requestId: record.requestId,
+            }));
         }
     }
 
-    private formatRetryReason(result: LLMRunResult<unknown>): string {
-        if (result.ok) {
-            return '';
-        }
-        const errorText = String(result.error || '').trim();
-        const reasonCode = String(result.reasonCode || '').trim();
-        if (errorText && reasonCode) {
-            return `${errorText}\n原因码：${reasonCode}`;
-        }
-        if (errorText) {
-            return errorText;
-        }
-        if (reasonCode) {
-            return `原因码：${reasonCode}`;
-        }
-        return '未提供更详细的失败原因。';
+    private isReasonCodeRetryable(reasonCode?: SSHelperReasonCode): boolean {
+        return isSSHelperReasonCode(reasonCode)
+            ? SS_HELPER_DIAGNOSTICS[reasonCode].retryable
+            : false;
     }
 
-    private isReasonCodeRetryable(reasonCode?: string): boolean {
-        const normalizedReasonCode = String(reasonCode || '').trim();
-        return normalizedReasonCode === 'timeout'
-            || normalizedReasonCode === 'rate_limited'
-            || normalizedReasonCode === 'network_error'
-            || normalizedReasonCode === 'circuit_open'
-            || normalizedReasonCode === 'provider_unavailable';
+    private failure(
+        error: unknown,
+        stage: string,
+        context: Partial<Omit<SSHelperFailureContext, 'reasonCode' | 'stage'>> = {},
+    ): SSHelperFailureContext {
+        return readSSHelperFailure(error, {
+            reasonCode: 'INTERNAL_ERROR',
+            stage,
+            ...context,
+        })!;
     }
 
-    private shouldOfferRetry(result: LLMRunResult<unknown>): boolean {
-        if (result.ok) {
-            return false;
-        }
-        if (result.retryable === true) {
-            return true;
-        }
-        const inferredReasonCode = String(result.reasonCode || '').trim() || inferReasonCode(String(result.error || ''));
-        return this.isReasonCodeRetryable(inferredReasonCode);
-    }
-
-    /**
-     * Memory Capture/Dream are background jobs.  An interactive confirm() here
-     * blocks the host page and leaves the Memory capture-job in `running` until
-     * somebody dismisses a native dialog.  Those consumers already persist
-     * their own paused/failed state and apply backoff, so retry must be decided
-     * by the caller rather than by a browser modal.
-     */
-    private allowsInteractiveRetry(record: RequestRecord): boolean {
-        return record.consumer !== 'ss-helper.memory' && !String(record.taskKey || '').startsWith('memory_');
-    }
-
-    private buildStructuredRetryRepair(record: RequestRecord, result: LLMRunResult<unknown>): StructuredRetryRepair | undefined {
-        if (result.ok) {
-            return undefined;
-        }
-        const reasonCode = String(result.reasonCode || '').trim();
-        if (record.taskKind !== 'generation'
-            || record.requestLogSnapshot?.structuredOutput === undefined
-            || !['structured_output_empty', 'structured_output_truncated', 'invalid_json', 'schema_validation_failed'].includes(reasonCode)) {
-            return undefined;
-        }
-
-        const validationHints = Array.isArray(record.debug?.validationErrors)
-            ? record.debug.validationErrors.slice(0, 6).map((item) => String(item).trim()).filter(Boolean)
-            : [];
-        const reasonInstruction: Record<string, string> = {
-            structured_output_empty: '上一轮没有返回 JSON 内容。现在必须返回一个完整的 JSON 对象。',
-            structured_output_truncated: '上一轮 JSON 被截断。请优先输出满足 Schema 的最小完整 JSON，不要附加解释。',
-            invalid_json: '上一轮输出不是合法 JSON。不要续写剧情、解释或 Markdown 代码块，只返回一个可直接 JSON.parse 的对象。',
-            schema_validation_failed: '上一轮 JSON 未通过 Schema 校验。请只保留 Schema 声明的字段，并补全所有必填字段和正确类型。',
-        };
+    private failureResult<T>(failure: SSHelperFailureContext): LLMRunResult<T> {
+        const diagnostic = describeSSHelperFailure(failure);
         return {
-            reasonCode,
-            instruction: [
-                '这是一次用户确认后的结构化输出修正请求。',
-                reasonInstruction[reasonCode],
-                validationHints.length > 0 ? `需修正的校验项：${validationHints.join('；')}` : '',
-                '忽略此前任何非 JSON 写作倾向，最终只能输出一个符合当前 Schema 的 JSON 对象。',
-            ].filter(Boolean).join('\n'),
+            ok: false,
+            error: diagnostic.title,
+            reasonCode: failure.reasonCode,
+            retryable: diagnostic.retryable,
+            failure,
         };
-    }
-
-    private queueStructuredRetryRepair(record: RequestRecord, result: LLMRunResult<unknown>): void {
-        const repair = this.buildStructuredRetryRepair(record, result);
-        if (repair === undefined) {
-            return;
-        }
-        record.structuredRetryRepair = repair;
-        const structuredOutput = record.requestLogSnapshot?.structuredOutput;
-        if (structuredOutput !== undefined && record.requestLogSnapshot !== undefined) {
-            record.requestLogSnapshot = {
-                ...record.requestLogSnapshot,
-                structuredOutput: {
-                    ...structuredOutput,
-                    manualRetryRepair: {
-                        reasonCode: repair.reasonCode,
-                        state: 'queued',
-                    },
-                },
-            };
-        }
-    }
-
-    private confirmRetryableFailure(record: RequestRecord, result: LLMRunResult<unknown>, retryCount: number): boolean {
-        if (typeof window === 'undefined' || typeof window.confirm !== 'function' || result.ok || !this.shouldOfferRetry(result)) {
-            return false;
-        }
-        const taskLabel = String(record.taskDescription || record.taskKey || 'LLM 任务').trim() || 'LLM 任务';
-        const reasonText = this.formatRetryReason(result);
-        const retryPrompt = retryCount <= 0
-            ? '是否立即重试？'
-            : `当前已重试 ${retryCount} 次，是否继续重试？`;
-        return window.confirm(
-            `LLMHub 请求失败：${taskLabel}\n\n失败原因：\n${reasonText}\n\n${retryPrompt}`,
-        );
     }
 
     private async executeWithRetryLoop<T>(
@@ -347,23 +291,57 @@ export class LLMSDKImpl {
         args: RunTaskArgs | EmbedArgs | RerankArgs,
         executor: () => Promise<LLMRunResult<T>>,
     ): Promise<LLMRunResult<T>> {
+        if ('input' in args) {
+            return executor();
+        }
         let retryCount = 0;
 
         while (true) {
-            const attemptRequestId = this.generateAttemptRequestId(record);
-            const currentResult = await executor();
-            if (record.validity.isCancelled || record.validity.isSuperseded || record.validity.isObsolete) {
-                return { ok: false, error: '请求结果已作废', reasonCode: 'cancelled' };
+            const attemptId = this.generateAttemptRequestId(record);
+            record.activeAttemptPhase = retryCount > 0 ? 'transient_retry' : 'initial';
+            try {
+                await this.requestLogService.beginAttempt({ record, attemptId, attemptPhase: record.activeAttemptPhase });
+                await this.requestLogService.markAttemptRunning({ record, attemptId, attemptPhase: record.activeAttemptPhase });
+            } catch (error) {
+                // A log implementation bug or an exhausted fallback must not
+                // turn a business request into a failed Provider call.
+                logger.warn('请求日志初始化失败，LLM 请求将继续执行。', safeFailureLogDetail(error, {
+                    reasonCode: 'LOG_UNAVAILABLE',
+                    stage: 'llm.log.begin',
+                    requestId: record.requestId,
+                    attemptId,
+                }));
             }
-            const reasonCode = currentResult.ok
-                ? ''
-                : String(currentResult.reasonCode || '').trim() || inferReasonCode(String(currentResult.error || ''));
+            let currentResult: LLMRunResult<T>;
+            try {
+                currentResult = await executor();
+            } catch (error) {
+                currentResult = this.failureResult(this.failure(error, 'llm.request.execute', {
+                    requestId: record.requestId,
+                    attemptId,
+                }));
+            }
+            if (record.validity.isCancelled || record.validity.isSuperseded) {
+                const cancelled = this.failureResult<T>({
+                    reasonCode: 'CANCELLED',
+                    stage: 'llm.request.cancelled',
+                    requestId: record.requestId,
+                    attemptId,
+                });
+                await this.recordAttemptLog(record, attemptId, cancelled, true);
+                return cancelled;
+            }
+            const reasonCode: SSHelperReasonCode | undefined = currentResult.ok
+                ? undefined
+                : isSSHelperReasonCode(currentResult.reasonCode)
+                    ? currentResult.reasonCode
+                    : 'INTERNAL_ERROR';
             const shouldRetry = !currentResult.ok
                 && retryCount < 1
                 && currentResult.retryable !== false
                 && this.isReasonCodeRetryable(reasonCode);
 
-            await this.recordAttemptLog(record, attemptRequestId, currentResult, !shouldRetry);
+            await this.recordAttemptLog(record, attemptId, currentResult, !shouldRetry);
 
             if (!shouldRetry) {
                 return currentResult;
@@ -451,6 +429,7 @@ export class LLMSDKImpl {
             budget: runArgs.budget,
             enqueue: runArgs.enqueue,
             schemaSummary: this.summarizeSchema(runArgs.schema),
+            schemaHash: hashSchema(runArgs.schema),
             schema: runArgs.schema,
             generationInput: runArgs.input,
             metrics: { messageCount },
@@ -469,7 +448,7 @@ export class LLMSDKImpl {
      * 执行 AI 任务。
      * 只等待 AI 结果返回，不等待展示关闭。
      */
-    async runTask<T>(args: RunTaskArgs<T>): Promise<LLMRunResult<T>> {
+    async runTask<T>(args: RunTaskArgs): Promise<LLMRunResult<T>> {
         const taskKind: CapabilityKind = args.taskKind;
         const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, args.taskDescription);
 
@@ -477,11 +456,7 @@ export class LLMSDKImpl {
             args.consumer,
             args.taskKey,
             taskKind,
-            {
-                ...args.enqueue,
-                displayMode: args.enqueue?.displayMode || (taskKind === 'generation' ? 'fullscreen' : 'silent'),
-                scope: args.enqueue?.scope || { pluginId: args.consumer },
-            },
+            { ...args.enqueue, scope: args.enqueue?.scope || { pluginId: args.consumer } },
             args,
             taskDescription,
         );
@@ -507,11 +482,7 @@ export class LLMSDKImpl {
             args.consumer,
             args.taskKey,
             'embedding',
-            {
-                ...args.enqueue,
-                displayMode: args.enqueue?.displayMode || 'silent',
-                scope: args.enqueue?.scope || { pluginId: args.consumer },
-            },
+            { ...args.enqueue, scope: args.enqueue?.scope || { pluginId: args.consumer } },
             args,
             taskDescription,
         );
@@ -536,11 +507,7 @@ export class LLMSDKImpl {
             args.consumer,
             args.taskKey,
             'rerank',
-            {
-                ...args.enqueue,
-                displayMode: args.enqueue?.displayMode || 'silent',
-                scope: args.enqueue?.scope || { pluginId: args.consumer },
-            },
+            { ...args.enqueue, scope: args.enqueue?.scope || { pluginId: args.consumer } },
             args,
             taskDescription,
         );
@@ -563,34 +530,27 @@ export class LLMSDKImpl {
         return record.resultPromise.finally(() => signal.removeEventListener('abort', onAbort));
     }
 
-    /**
-     * 等待展示关闭。
-     */
-    async waitForOverlayClose(requestId: string): Promise<void> {
-        return this.orchestrator.waitForOverlayClose(requestId);
-    }
-
     // ─── 编排器执行回调（内部） ───
 
     private async executeRequest(record: RequestRecord): Promise<LLMRunResult<any>> {
         const args = record.requestArgs;
         if (!args) {
-            return { ok: false, error: '请求参数缺失', reasonCode: 'unknown' };
+            return this.failureResult({ reasonCode: 'LLM_REQUEST_INVALID', stage: 'llm.request.validate', requestId: record.requestId });
         }
 
         switch (record.taskKind) {
             case 'generation':
                 if (!this.isGenerationArgs(args)) {
-                    return { ok: false, error: 'generation 请求参数不合法', reasonCode: 'unknown' };
+                    return this.failureResult({ reasonCode: 'LLM_REQUEST_INVALID', stage: 'llm.request.validate', requestId: record.requestId });
                 }
                 if (this.readSettings().enabled === false) {
                     this.emitLifecycle(args, record, {
                         stage: 'failed',
                         message: 'LLMHub 未启用，请先在设置中启用 LLMHub。',
                         error: 'LLMHub 未启用',
-                        reasonCode: 'llmhub_disabled',
+                        reasonCode: 'LLM_DISABLED',
                     });
-                    return { ok: false, error: 'LLMHub 未启用', retryable: false, reasonCode: 'llmhub_disabled' };
+                    return this.failureResult({ reasonCode: 'LLM_DISABLED', stage: 'llm.request.enabled', requestId: record.requestId });
                 }
                 this.emitLifecycle(args, record, {
                     stage: 'running',
@@ -600,16 +560,16 @@ export class LLMSDKImpl {
                 return this.executeWithRetryLoop(record, args, () => this.executeGeneration(args, record));
             case 'embedding':
                 if (!this.isEmbedArgs(args)) {
-                    return { ok: false, error: 'embedding 请求参数不合法', reasonCode: 'unknown' };
+                    return this.failureResult({ reasonCode: 'LLM_REQUEST_INVALID', stage: 'llm.request.validate', requestId: record.requestId });
                 }
                 if (this.readSettings().enabled === false) {
                     this.emitLifecycle(args, record, {
                         stage: 'failed',
                         message: 'LLMHub 未启用，请先在设置中启用 LLMHub。',
                         error: 'LLMHub 未启用',
-                        reasonCode: 'llmhub_disabled',
+                        reasonCode: 'LLM_DISABLED',
                     });
-                    return { ok: false, error: 'LLMHub 未启用', retryable: false, reasonCode: 'llmhub_disabled' };
+                    return this.failureResult({ reasonCode: 'LLM_DISABLED', stage: 'llm.request.enabled', requestId: record.requestId });
                 }
                 this.emitLifecycle(args, record, {
                     stage: 'running',
@@ -619,16 +579,16 @@ export class LLMSDKImpl {
                 return this.executeWithRetryLoop(record, args, () => this.executeEmbed(args, record));
             case 'rerank':
                 if (!this.isRerankArgs(args)) {
-                    return { ok: false, error: 'rerank 请求参数不合法', reasonCode: 'unknown' };
+                    return this.failureResult({ reasonCode: 'LLM_REQUEST_INVALID', stage: 'llm.request.validate', requestId: record.requestId });
                 }
                 if (this.readSettings().enabled === false) {
                     this.emitLifecycle(args, record, {
                         stage: 'failed',
                         message: 'LLMHub 未启用，请先在设置中启用 LLMHub。',
                         error: 'LLMHub 未启用',
-                        reasonCode: 'llmhub_disabled',
+                        reasonCode: 'LLM_DISABLED',
                     });
-                    return { ok: false, error: 'LLMHub 未启用', retryable: false, reasonCode: 'llmhub_disabled' };
+                    return this.failureResult({ reasonCode: 'LLM_DISABLED', stage: 'llm.request.enabled', requestId: record.requestId });
                 }
                 this.emitLifecycle(args, record, {
                     stage: 'running',
@@ -637,7 +597,7 @@ export class LLMSDKImpl {
                 });
                 return this.executeWithRetryLoop(record, args, () => this.executeRerank(args, record));
             default:
-                return { ok: false, error: `未知任务类型: ${record.taskKind}`, reasonCode: 'unknown' };
+                return this.failureResult({ reasonCode: 'LLM_REQUEST_INVALID', stage: 'llm.request.task_kind', requestId: record.requestId });
         }
     }
 
@@ -721,8 +681,6 @@ export class LLMSDKImpl {
     }
 
     private async executeGeneration(args: RunTaskArgs, record: RequestRecord): Promise<LLMRunResult<any>> {
-        const retryRepair = record.structuredRetryRepair;
-        record.structuredRetryRepair = undefined;
         // 预算检查
         const budgetCheck = this.budgetManager.canRequest(args.consumer);
         if (!budgetCheck.allowed) {
@@ -730,13 +688,13 @@ export class LLMSDKImpl {
                 stage: 'failed',
                 message: budgetCheck.reason || '请求被限流/熔断',
                 error: budgetCheck.reason || '请求被限流/熔断',
-                reasonCode: 'circuit_open',
+                reasonCode: 'CIRCUIT_OPEN',
             });
             return {
                 ok: false,
                 error: budgetCheck.reason || '请求被限流/熔断',
                 retryable: true,
-                reasonCode: 'circuit_open',
+                reasonCode: 'CIRCUIT_OPEN',
             };
         }
 
@@ -761,18 +719,17 @@ export class LLMSDKImpl {
                 progress: 0.4,
             });
         } catch (error) {
+            const failure = this.failure(error, 'llm.route.resolve', {
+                requestId: record.requestId,
+            });
+            const diagnostic = describeSSHelperFailure(failure);
             this.emitLifecycle(args, record, {
                 stage: 'failed',
-                message: (error as Error).message,
-                error: (error as Error).message,
-                reasonCode: 'provider_unavailable',
+                message: diagnostic.reason,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
-            return {
-                ok: false,
-                error: (error as Error).message,
-                retryable: false,
-                reasonCode: 'provider_unavailable',
-            };
+            return this.failureResult(failure);
         }
 
         const profileId = resolved.profileId || this.globalProfileId;
@@ -783,11 +740,28 @@ export class LLMSDKImpl {
         const taskAssignment = this.router.getTaskAssignment(args.consumer, args.taskKey);
         const resolvedProvider = this.router.getProvider(resolved.resourceId);
         if (!resolvedProvider) {
-            const error = `资源 "${resolved.resourceId}" 未找到`;
-            this.emitLifecycle(args, record, { stage: 'failed', message: error, error, reasonCode: 'provider_unavailable' });
-            return { ok: false, error, retryable: false, reasonCode: 'provider_unavailable' };
+            const failure: SSHelperFailureContext = {
+                reasonCode: 'PROVIDER_UNAVAILABLE',
+                stage: 'llm.route.provider',
+                requestId: record.requestId,
+                resourceId: resolved.resourceId,
+            };
+            const diagnostic = describeSSHelperFailure(failure);
+            this.emitLifecycle(args, record, { stage: 'failed', message: diagnostic.reason, error: diagnostic.title, reasonCode: failure.reasonCode });
+            return this.failureResult(failure);
         }
         const schema = args.schema && typeof args.schema === 'object' && !Array.isArray(args.schema) ? args.schema : undefined;
+        if (schema !== undefined) {
+            const schemaCheck = preflightJsonSchema(schema);
+            if (!schemaCheck.valid) {
+                return {
+                    ok: false,
+                    error: `结构化任务 Schema 不受支持: ${schemaCheck.errors.join('; ')}`,
+                    retryable: false,
+                    reasonCode: 'LLM_REQUEST_INVALID',
+                };
+            }
+        }
         const providerKind = resolvedProvider.kind;
         const identity: StructuredOutputIdentity | undefined = schema === undefined ? undefined : (resolvedProvider.getStructuredOutputIdentity
             ? await resolvedProvider.getStructuredOutputIdentity(resolved.model)
@@ -796,14 +770,33 @@ export class LLMSDKImpl {
                 provider: providerKind,
                 model: resolved.model,
             }));
+        const structuredCapability = identity === undefined
+            ? resolvedProvider.capabilities.structuredOutput
+            : await (resolvedProvider.getStructuredOutputCapability?.(identity)
+                ?? resolvedProvider.capabilities.structuredOutput);
         const structuredName = schema === undefined ? undefined : this.sanitizeSchemaName(args.taskKey);
-        const strictCacheKey = `${resolved.resourceId}:${resolved.model || identity?.model || ''}`;
-        const structuredOutput = schema === undefined || identity === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
-            providerKind,
+        const strictCacheKeyParts = [
+            resolved.resourceId,
+            identity?.provider || '',
+            resolved.model || identity?.model || '',
+        ] as const;
+        const structuredTransportCacheKey = (transport: StructuredOutputTransport): string =>
+            JSON.stringify([...strictCacheKeyParts, transport]);
+        let structuredOutput = schema === undefined || identity === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
             identity,
             spec: { schema, name: structuredName },
-            strictSchemaUnavailable: this.unsupportedStrictSchemaResources.has(strictCacheKey),
+            capability: structuredCapability,
+            strictSchemaUnavailable: this.unsupportedStructuredTransports.has(structuredTransportCacheKey('json_schema')),
         });
+        while (structuredOutput !== undefined
+            && this.unsupportedStructuredTransports.has(structuredTransportCacheKey(structuredOutput.transport))) {
+            const fallbackTransport = nextStructuredOutputTransport(
+                structuredOutput.transport,
+                structuredCapability.transports,
+            );
+            if (fallbackTransport === undefined) break;
+            structuredOutput = { ...structuredOutput, transport: fallbackTransport };
+        }
 
         const resolvedMaxTokens = resolveMaxTokens(args, {
             globalControl: settings.maxTokensControl,
@@ -824,12 +817,8 @@ export class LLMSDKImpl {
                         content: buildGenerationUserContent(args.input),
                     },
                 ];
-        const buildStructuredMessages = (plan: NonNullable<LLMRequest['structuredOutput']>) => {
-            const messages = withStructuredOutputInstruction(baseMessages, plan);
-            return retryRepair === undefined
-                ? messages
-                : [...messages, { role: 'system' as const, content: retryRepair.instruction }];
-        };
+        const buildStructuredMessages = (plan: NonNullable<LLMRequest['structuredOutput']>) =>
+            withStructuredOutputInstruction(baseMessages, plan);
         const llmReq: LLMRequest = {
             messages: structuredOutput === undefined ? baseMessages : buildStructuredMessages(structuredOutput),
             model: resolved.model,
@@ -849,7 +838,7 @@ export class LLMSDKImpl {
             }),
             schemaSummary,
             schema: schemaForLog,
-            ...(structuredOutput === undefined ? {} : { structuredOutput: structuredOutputLogFields(structuredOutput, retryRepair) }),
+            ...(structuredOutput === undefined ? {} : { structuredOutput: structuredOutputLogFields(structuredOutput) }),
             resolvedMaxTokens: {
                 value: resolvedMaxTokens.value,
                 source: resolvedMaxTokens.source,
@@ -878,23 +867,141 @@ export class LLMSDKImpl {
             progress: 0.6,
         });
 
-        // 主 Provider 尝试
-        const primaryResult = await this.tryProvider(
-            resolved.resourceId,
-            llmReq,
-            schema,
-            args.consumer,
-            maxLatencyMs,
-            args.signal,
-        );
+        type AttemptPhase = NonNullable<RequestRecord['activeAttemptPhase']>;
+        type AttemptResult = Awaited<ReturnType<LLMSDKImpl['tryProvider']>>;
+        let attemptCount = 0;
+        let repairCount = 0;
+        let totalUsage = { promptTokens: 0, completionTokens: 0, totalTokens: 0 };
 
-        this.attachProviderRequestSnapshot(record, primaryResult.providerRequest);
-        this.attachRecordDebug(record, primaryResult);
-        this.rememberStructuredOutputFallback(resolved.resourceId, resolved.model, primaryResult);
+        const addUsage = (usage?: { promptTokens: number; completionTokens: number; totalTokens: number }): void => {
+            if (!usage) return;
+            totalUsage = {
+                promptTokens: totalUsage.promptTokens + Number(usage.promptTokens || 0),
+                completionTokens: totalUsage.completionTokens + Number(usage.completionTokens || 0),
+                totalTokens: totalUsage.totalTokens + Number(usage.totalTokens || 0),
+            };
+        };
+        const runProviderAttempt = async (
+            resourceId: string,
+            request: LLMRequest,
+            phase: AttemptPhase,
+        ): Promise<{ result: AttemptResult; attemptId: string } | { blocked: LLMRunResult<never> }> => {
+            attemptCount += 1;
+            record.attemptIndex = attemptCount;
+            record.activeAttemptPhase = phase;
+            const attemptId = this.generateAttemptRequestId(record);
+            const plannedTransport = request.structuredOutput?.transport;
+            try {
+                await this.requestLogService.beginAttempt({ record, attemptId, attemptPhase: phase, plannedTransport });
+                await this.requestLogService.markAttemptRunning({ record, attemptId, attemptPhase: phase, plannedTransport });
+            } catch (error) {
+                logger.warn('请求日志初始化失败，Provider 请求将继续执行。', safeFailureLogDetail(error, {
+                    reasonCode: 'LOG_UNAVAILABLE',
+                    stage: 'llm.log.begin',
+                    requestId: record.requestId,
+                    attemptId,
+                }));
+            }
+            const rawResult = await this.tryProvider(
+                resourceId,
+                request,
+                schema,
+                args.consumer,
+                taskDescriptor?.structuredPolicy,
+                maxLatencyMs,
+                args.signal,
+                record.requestId,
+                attemptId,
+            );
+            const result = !rawResult.ok && rawResult.failure === undefined && isSSHelperReasonCode(rawResult.reasonCode)
+                ? {
+                    ...rawResult,
+                    failure: {
+                        reasonCode: rawResult.reasonCode,
+                        stage: 'llm.provider.response',
+                        requestId: record.requestId,
+                        attemptId,
+                        resourceId,
+                    },
+                }
+                : rawResult;
+            addUsage(result.usage);
+            this.attachProviderRequestSnapshot(record, result.providerRequest);
+            this.attachRecordDebug(record, result);
+            return { result, attemptId };
+        };
+        const finishAttempt = async (
+            attempt: { result: AttemptResult; attemptId: string },
+            final: boolean,
+        ): Promise<void> => {
+            const attemptReasonCode = isSSHelperReasonCode(attempt.result.reasonCode)
+                ? attempt.result.reasonCode
+                : 'INTERNAL_ERROR';
+            const result: LLMRunResult<unknown> = attempt.result.ok
+                ? { ok: true, data: attempt.result.data, meta: {
+                    requestId: record.requestId,
+                    resourceId: String(attempt.result.resourceId || resolved.resourceId),
+                    capabilityKind: 'generation',
+                    queuedAt: record.queuedAt,
+                } }
+                : {
+                    ok: false,
+                    error: attempt.result.error || 'LLM provider request failed',
+                    reasonCode: attemptReasonCode,
+                    retryable: attempt.result.retryable,
+                    ...(attempt.result.failure ? { failure: attempt.result.failure } : {}),
+                };
+            await this.recordAttemptLog(
+                record,
+                attempt.attemptId,
+                result,
+                final,
+                record.activeAttemptPhase,
+                attempt.result.structuredOutput?.plannedTransport as NonNullable<LLMRequest['structuredOutput']>['transport'] | undefined,
+                attempt.result.structuredOutput?.actualTransport as NonNullable<LLMRequest['structuredOutput']>['transport'] | undefined,
+            );
+        };
 
-        if (primaryResult.ok) {
+        const first = await runProviderAttempt(resolved.resourceId, llmReq, 'initial');
+        if ('blocked' in first) return first.blocked;
+        const repairReasons = new Set(taskDescriptor?.structuredPolicy?.repairOn ?? ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED']);
+        const reasonCode: SSHelperReasonCode = isSSHelperReasonCode(first.result.reasonCode)
+            ? first.result.reasonCode
+            : 'INTERNAL_ERROR';
+        const maxProviderAttempts = taskDescriptor?.structuredPolicy?.maxProviderAttempts ?? 2;
+        const envelopeRepairAllowed = taskDescriptor?.structuredPolicy?.envelopeFailure !== 'fail';
+        const wantsRepair = schema !== undefined
+            && envelopeRepairAllowed
+            && repairReasons.has(reasonCode as 'INVALID_JSON' | 'SCHEMA_VALIDATION_FAILED');
+        const fallbackTransport = schema !== undefined
+            && reasonCode === 'RESPONSE_FORMAT_UNSUPPORTED'
+            && llmReq.structuredOutput !== undefined
+            ? nextStructuredOutputTransport(
+                llmReq.structuredOutput.transport,
+                structuredCapability.transports,
+            )
+            : undefined;
+        const wantsTransportFallback = fallbackTransport !== undefined;
+        const wantsRouteFallback = reasonCode === 'PROVIDER_UNAVAILABLE' && Boolean(resolved.fallbackResourceId);
+        const transientReasons = new Set<SSHelperReasonCode>([
+            'HTTP_DNS_FAILED',
+            'HTTP_CONNECT_FAILED',
+            'HTTP_REQUEST_TIMEOUT',
+            'HTTP_TRANSPORT_ERROR',
+            'RATE_LIMITED',
+            'PROVIDER_UNAVAILABLE',
+        ]);
+        const wantsTransientRetry = !wantsRouteFallback
+            && isSSHelperReasonCode(reasonCode)
+            && transientReasons.has(reasonCode);
+        const needsSecondAttempt = !first.result.ok
+            && attemptCount < maxProviderAttempts
+            && (wantsRepair || wantsTransportFallback || wantsRouteFallback || wantsTransientRetry);
+        await finishAttempt(first, !needsSecondAttempt);
+
+        if (first.result.ok) {
             const meta: LLMRunMeta = {
-                requestId: this.getActiveAttemptRequestId(record),
+                requestId: record.requestId,
                 resourceId: resolved.resourceId,
                 model: resolved.model,
                 capabilityKind: 'generation',
@@ -902,118 +1009,114 @@ export class LLMSDKImpl {
                 startedAt: record.startedAt,
                 finishedAt: Date.now(),
                 latencyMs: Date.now() - (record.startedAt || record.queuedAt),
+                attemptCount,
+                repairCount,
+                transport: (first.result.structuredOutput?.actualTransport ?? llmReq.structuredOutput?.transport) as LLMRunMeta['transport'],
+                validationOutcome: first.result.itemRejections?.length ? 'partial' : 'complete',
+                itemRejections: first.result.itemRejections ?? [],
+                usage: totalUsage,
             };
-            this.emitLifecycle(args, record, {
-                stage: 'completed',
-                message: '任务执行完成',
-                resourceId: resolved.resourceId,
-                model: resolved.model,
-                progress: 1,
-            });
-            return { ok: true, data: primaryResult.data, meta };
+            this.emitLifecycle(args, record, { stage: 'completed', message: '任务执行完成', resourceId: resolved.resourceId, model: resolved.model, progress: 1 });
+            return { ok: true, data: first.result.data, meta };
         }
-
-        // Fallback: 资源不可用
-        if (resolved.fallbackResourceId) {
-            this.emitLifecycle(args, record, {
-                stage: 'fallback_started',
-                message: `主资源失败，切换到备用资源 ${resolved.fallbackResourceId}`,
-                resourceId: resolved.fallbackResourceId,
-                model: resolved.model,
-                fallbackUsed: true,
-                progress: 0.75,
-            });
-            this.emitLifecycle(args, record, {
-                stage: 'provider_requesting',
-                message: '正在请求备用资源',
-                resourceId: resolved.fallbackResourceId,
-                model: resolved.model,
-                fallbackUsed: true,
-                progress: 0.85,
-            });
-            const fallbackProvider = this.router.getProvider(resolved.fallbackResourceId);
-            const fallbackIdentity = schema === undefined ? undefined : (fallbackProvider?.getStructuredOutputIdentity
-                ? await fallbackProvider.getStructuredOutputIdentity(resolved.model)
-                : detectStructuredOutputIdentity({ manualVendor: fallbackProvider?.kind === 'openai' ? 'openai' : 'auto', provider: fallbackProvider?.kind, model: resolved.model }));
-            const fallbackPlan = schema === undefined || fallbackIdentity === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
-                providerKind: fallbackProvider?.kind || 'unknown',
-                identity: fallbackIdentity,
-                spec: { schema, name: structuredName },
-                strictSchemaUnavailable: this.unsupportedStrictSchemaResources.has(`${resolved.fallbackResourceId}:${resolved.model || fallbackIdentity.model || ''}`),
-            });
-            const fallbackReq: LLMRequest = fallbackPlan === undefined
-                ? llmReq
-                : { ...llmReq, messages: buildStructuredMessages(fallbackPlan), structuredOutput: fallbackPlan };
-            const fallbackResult = await this.tryProvider(
-                resolved.fallbackResourceId,
-                fallbackReq,
-                schema,
-                args.consumer,
-                maxLatencyMs,
-                args.signal,
-            );
-            this.attachProviderRequestSnapshot(record, fallbackResult.providerRequest);
-            this.attachRecordDebug(record, fallbackResult);
-            this.rememberStructuredOutputFallback(resolved.fallbackResourceId, resolved.model, fallbackResult);
-            if (fallbackResult.ok) {
-                const meta: LLMRunMeta = {
-                    requestId: this.getActiveAttemptRequestId(record),
-                    resourceId: resolved.fallbackResourceId,
-                    model: resolved.model,
-                    capabilityKind: 'generation',
-                    queuedAt: record.queuedAt,
-                    startedAt: record.startedAt,
-                    finishedAt: Date.now(),
-                    latencyMs: Date.now() - (record.startedAt || record.queuedAt),
-                    fallbackUsed: true,
-                };
-                this.emitLifecycle(args, record, {
-                    stage: 'completed',
-                    message: '备用资源执行完成',
-                    resourceId: resolved.fallbackResourceId,
-                    model: resolved.model,
-                    fallbackUsed: true,
-                    progress: 1,
-                });
-                return { ok: true, data: fallbackResult.data, meta };
-            }
-            this.emitLifecycle(args, record, {
-                stage: 'failed',
-                message: `主备资源均失败: ${primaryResult.error} / ${fallbackResult.error}`,
-                error: `主备资源均失败: ${primaryResult.error} / ${fallbackResult.error}`,
-                reasonCode: fallbackResult.reasonCode || primaryResult.reasonCode || 'unknown',
-                fallbackUsed: true,
-            });
+        if (!needsSecondAttempt) {
+            this.emitLifecycle(args, record, { stage: 'failed', message: first.result.error || '未知错误', error: first.result.error || '未知错误', reasonCode });
             return {
                 ok: false,
-                error: `主备资源均失败: ${primaryResult.error} / ${fallbackResult.error}`,
-                retryable: true,
-                fallbackUsed: true,
-                reasonCode: fallbackResult.reasonCode || primaryResult.reasonCode || 'unknown',
+                error: first.result.error || '未知错误',
+                retryable: false,
+                reasonCode,
+                ...(first.result.failure ? { failure: first.result.failure } : {}),
             };
         }
 
-        this.emitLifecycle(args, record, {
-            stage: 'failed',
-            message: primaryResult.error || '未知错误',
-            error: primaryResult.error || '未知错误',
-            reasonCode: primaryResult.reasonCode,
-        });
+        let secondResourceId = resolved.resourceId;
+        let secondRequest = llmReq;
+        let secondPhase: AttemptPhase = 'transient_retry';
+        let fallbackUsed = false;
 
-        return {
-            ok: false,
-            error: primaryResult.error || '未知错误',
-            retryable: primaryResult.retryable,
-            reasonCode: primaryResult.reasonCode,
-        };
-    }
-
-    private rememberStructuredOutputFallback(resourceId: string, model: string | undefined, result: { structuredOutput?: { plannedTransport: string; actualTransport: string; fallbackReason?: string } }): void {
-        if (result.structuredOutput?.plannedTransport === 'json_schema'
-            && result.structuredOutput.actualTransport === 'json_object'
-            && result.structuredOutput.fallbackReason === 'response_format_unsupported') {
-            this.unsupportedStrictSchemaResources.add(`${resourceId}:${model || ''}`);
+        if (wantsRepair && schema !== undefined && structuredOutput !== undefined) {
+            repairCount = 1;
+            secondPhase = 'schema_repair';
+            const safeIssues = (first.result.validationIssues ?? []).slice(0, 16);
+            const repairInstruction = [
+                '上一轮输出未通过结构校验。重新生成一个完整 JSON 根对象；不要解释、不要 Markdown、不要复用上一轮文本。',
+                `安全校验问题：${JSON.stringify(safeIssues)}`,
+            ].join('\n');
+            const repairBaseMessages = [
+                ...baseMessages,
+                { role: 'user' as const, content: repairInstruction },
+            ];
+            secondRequest = {
+                ...llmReq,
+                messages: withStructuredOutputInstruction(repairBaseMessages, structuredOutput),
+                structuredOutput,
+            };
+        } else if (wantsTransportFallback && structuredOutput !== undefined) {
+            secondPhase = 'transport_fallback';
+            const transportPlan = { ...structuredOutput, transport: fallbackTransport! };
+            secondRequest = {
+                ...llmReq,
+                messages: withStructuredOutputInstruction(baseMessages, transportPlan),
+                structuredOutput: transportPlan,
+            };
+            this.unsupportedStructuredTransports.add(structuredTransportCacheKey(structuredOutput.transport));
+        } else if (wantsRouteFallback && resolved.fallbackResourceId) {
+            secondPhase = 'route_fallback';
+            fallbackUsed = true;
+            secondResourceId = resolved.fallbackResourceId;
+            const fallbackProvider = this.router.getProvider(secondResourceId);
+            if (!fallbackProvider) return { ok: false, error: `备用资源 "${secondResourceId}" 未找到`, reasonCode: 'PROVIDER_UNAVAILABLE', retryable: false };
+            const fallbackIdentity = fallbackProvider.getStructuredOutputIdentity
+                ? await fallbackProvider.getStructuredOutputIdentity(resolved.model)
+                : detectStructuredOutputIdentity({ provider: fallbackProvider.kind, model: resolved.model });
+            const fallbackCapability = await (fallbackProvider.getStructuredOutputCapability?.(fallbackIdentity)
+                ?? fallbackProvider.capabilities.structuredOutput);
+            const fallbackPlan = schema === undefined || structuredName === undefined ? undefined : createStructuredOutputPlan({
+                identity: fallbackIdentity,
+                spec: { schema, name: structuredName },
+                capability: fallbackCapability,
+            });
+            secondRequest = fallbackPlan === undefined ? llmReq : { ...llmReq, messages: buildStructuredMessages(fallbackPlan), structuredOutput: fallbackPlan };
         }
+
+        this.orchestrator.advanceAttempt(record);
+        const second = await runProviderAttempt(secondResourceId, secondRequest, secondPhase);
+        if ('blocked' in second) return second.blocked;
+        await finishAttempt(second, true);
+        if (!second.result.ok) {
+            const secondReasonCode = isSSHelperReasonCode(second.result.reasonCode)
+                ? second.result.reasonCode
+                : 'INTERNAL_ERROR';
+            this.emitLifecycle(args, record, { stage: 'failed', message: second.result.error || 'LLM provider request failed', error: second.result.error, reasonCode: secondReasonCode, fallbackUsed });
+            return {
+                ok: false,
+                error: second.result.error || 'LLM provider request failed',
+                retryable: false,
+                reasonCode: secondReasonCode,
+                fallbackUsed,
+                ...(second.result.failure ? { failure: second.result.failure } : {}),
+            };
+        }
+        const meta: LLMRunMeta = {
+            requestId: record.requestId,
+            resourceId: secondResourceId,
+            model: resolved.model,
+            capabilityKind: 'generation',
+            queuedAt: record.queuedAt,
+            startedAt: record.startedAt,
+            finishedAt: Date.now(),
+            latencyMs: Date.now() - (record.startedAt || record.queuedAt),
+            fallbackUsed,
+            attemptCount,
+            repairCount,
+            transport: (second.result.structuredOutput?.actualTransport ?? secondRequest.structuredOutput?.transport) as LLMRunMeta['transport'],
+            validationOutcome: second.result.itemRejections?.length ? 'partial' : 'complete',
+            itemRejections: second.result.itemRejections ?? [],
+            usage: totalUsage,
+        };
+        this.emitLifecycle(args, record, { stage: 'completed', message: secondPhase === 'schema_repair' ? '结构化修复完成' : '第二次尝试完成', resourceId: secondResourceId, model: resolved.model, fallbackUsed, progress: 1 });
+        return { ok: true, data: second.result.data, meta };
     }
 
     private attachRecordDebug(record: RequestRecord, result: {
@@ -1022,15 +1125,21 @@ export class LLMSDKImpl {
         parsedResponse?: unknown;
         normalizedResponse?: unknown;
         validationErrors?: string[];
+        validationIssues?: Array<{ path: string; keyword: string; expected: string }>;
+        itemRejections?: import('@ss-helper/sdk').LlmStructuredItemRejection[];
         error?: string;
-        reasonCode?: string;
+        reasonCode?: SSHelperReasonCode;
+        failure?: SSHelperFailureContext;
     }): void {
         const hasDebug = result.rawResponseText != null
             || result.providerResponse !== undefined
             || result.parsedResponse !== undefined
             || result.normalizedResponse !== undefined
             || (Array.isArray(result.validationErrors) && result.validationErrors.length > 0)
-            || result.error;
+            || (Array.isArray(result.validationIssues) && result.validationIssues.length > 0)
+            || (Array.isArray(result.itemRejections) && result.itemRejections.length > 0)
+            || result.error
+            || result.failure !== undefined;
         if (!hasDebug) return;
 
         record.debug = {
@@ -1039,8 +1148,18 @@ export class LLMSDKImpl {
             parsedResponse: result.parsedResponse,
             normalizedResponse: result.normalizedResponse,
             validationErrors: result.validationErrors,
-            finalError: result.error,
-            reasonCode: result.reasonCode,
+            validationIssues: result.validationIssues,
+            itemRejections: result.itemRejections,
+            ...(result.failure ? {
+                failure: result.failure,
+            } : isSSHelperReasonCode(result.reasonCode) ? {
+                failure: {
+                    reasonCode: result.reasonCode,
+                    stage: 'llm.provider.response',
+                    requestId: record.requestId,
+                    ...(record.activeAttemptRequestId ? { attemptId: record.activeAttemptRequestId } : {}),
+                },
+            } : {}),
         };
 
         if (record.requestLogSnapshot?.metrics && result.rawResponseText != null) {
@@ -1112,19 +1231,22 @@ export class LLMSDKImpl {
                 progress: 0.4,
             });
         } catch (error) {
+            const failure = this.failure(error, 'llm.embedding.route', { requestId: record.requestId });
+            const diagnostic = describeSSHelperFailure(failure);
             this.emitLifecycle(args, record, {
                 stage: 'failed',
-                message: (error as Error).message,
-                error: (error as Error).message,
+                message: diagnostic.reason,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
-            return { ok: false, error: (error as Error).message };
+            return this.failureResult(failure);
         }
 
         const provider = this.router.getProvider(resolved.resourceId);
         if (!provider?.embed) {
             this.attachRecordDebug(record, {
                 error: '当前资源不支持 embedding',
-                reasonCode: 'provider_unavailable',
+                reasonCode: 'PROVIDER_UNAVAILABLE',
             });
             this.emitLifecycle(args, record, {
                 stage: 'failed',
@@ -1169,23 +1291,23 @@ export class LLMSDKImpl {
             });
             return { ok: true, vectors: response.embeddings, model: resolved.model, meta, providerResponse: response };
         } catch (error) {
-            const errorMessage = (error as Error).message;
-            const reasonCode = inferReasonCode(errorMessage);
+            const failure = this.failure(error, 'llm.embedding.provider', {
+                requestId: record.requestId,
+                resourceId: resolved.resourceId,
+                model: resolved.model,
+            });
+            const diagnostic = describeSSHelperFailure(failure);
             this.attachRecordDebug(record, {
-                error: errorMessage,
-                reasonCode,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
             this.emitLifecycle(args, record, {
                 stage: 'failed',
-                message: errorMessage,
-                error: errorMessage,
+                message: diagnostic.reason,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
-            return {
-                ok: false,
-                error: errorMessage,
-                retryable: this.isReasonCodeRetryable(reasonCode),
-                reasonCode,
-            };
+            return this.failureResult(failure);
         }
     }
 
@@ -1222,6 +1344,9 @@ export class LLMSDKImpl {
         requestId: string,
         result: LLMRunResult<unknown>,
         isFinalAttempt: boolean,
+        attemptPhase = record.activeAttemptPhase,
+        plannedTransport?: NonNullable<LLMRequest['structuredOutput']>['transport'],
+        actualTransport?: NonNullable<LLMRequest['structuredOutput']>['transport'],
     ): Promise<void> {
         await this.requestLogService.recordAttempt({
             record,
@@ -1230,6 +1355,9 @@ export class LLMSDKImpl {
             attemptTag: record.attemptIndex > 1 ? '重试' : '初次请求',
             attemptOutcome: result.ok ? '成功' : '失败',
             isFinalAttempt,
+            attemptPhase,
+            plannedTransport,
+            actualTransport,
         });
     }
 
@@ -1251,12 +1379,15 @@ export class LLMSDKImpl {
                 progress: 0.4,
             });
         } catch (error) {
+            const failure = this.failure(error, 'llm.rerank.route', { requestId: record.requestId });
+            const diagnostic = describeSSHelperFailure(failure);
             this.emitLifecycle(args, record, {
                 stage: 'failed',
-                message: (error as Error).message,
-                error: (error as Error).message,
+                message: diagnostic.reason,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
-            return { ok: false, error: (error as Error).message };
+            return this.failureResult(failure);
         }
 
         const provider = this.router.getProvider(resolved.resourceId);
@@ -1303,25 +1434,25 @@ export class LLMSDKImpl {
                     progress: 1,
                 });
                 return { ok: true, results: response.results, resource: resolved.resourceId, meta, providerResponse: response };
-        } catch (error) {
-            const errorMessage = (error as Error).message;
-            const reasonCode = inferReasonCode(errorMessage);
-            this.attachRecordDebug(record, {
-                error: errorMessage,
-                reasonCode,
-            });
-            this.emitLifecycle(args, record, {
-                stage: 'failed',
-                message: errorMessage,
-                error: errorMessage,
-            });
-            return {
-                ok: false,
-                error: errorMessage,
-                retryable: this.isReasonCodeRetryable(reasonCode),
-                reasonCode,
-            };
-        }
+            } catch (error) {
+                const failure = this.failure(error, 'llm.rerank.provider', {
+                    requestId: record.requestId,
+                    resourceId: resolved.resourceId,
+                    model: resolved.model,
+                });
+                const diagnostic = describeSSHelperFailure(failure);
+                this.attachRecordDebug(record, {
+                    error: diagnostic.title,
+                    reasonCode: failure.reasonCode,
+                });
+                this.emitLifecycle(args, record, {
+                    stage: 'failed',
+                    message: diagnostic.reason,
+                    error: diagnostic.title,
+                    reasonCode: failure.reasonCode,
+                });
+                return this.failureResult(failure);
+            }
         }
 
         // Provider 不支持 rerank：关键词覆盖率兜底
@@ -1367,34 +1498,45 @@ export class LLMSDKImpl {
         req: LLMRequest,
         schema: object | undefined,
         consumer: string,
+        structuredPolicy?: import('@ss-helper/sdk').LlmStructuredRepairPolicy,
         maxLatencyMs?: number,
         signal?: AbortSignal,
+        requestId?: string,
+        attemptId?: string,
     ): Promise<{
         ok: boolean;
         data?: any;
         error?: string;
         retryable?: boolean;
         cost?: number;
-        reasonCode?: string;
+        reasonCode?: SSHelperReasonCode;
         rawResponseText?: string;
         providerResponse?: unknown;
         parsedResponse?: unknown;
         normalizedResponse?: unknown;
         validationErrors?: string[];
+        validationIssues?: Array<{ path: string; keyword: string; expected: string }>;
+        itemRejections?: import('@ss-helper/sdk').LlmStructuredItemRejection[];
         providerRequest?: Record<string, unknown>;
         structuredOutput?: { plannedTransport: string; actualTransport: string; fallbackReason?: string };
+        resourceId?: string;
+        usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+        failure?: SSHelperFailureContext;
     }> {
         try {
             const provider = this.router.getProvider(resourceId);
             if (!provider) {
-                return { ok: false, error: `资源 "${resourceId}" 未找到`, retryable: false, reasonCode: 'provider_unavailable' };
+                return { ok: false, error: `资源 "${resourceId}" 未找到`, retryable: false, reasonCode: 'PROVIDER_UNAVAILABLE' };
             }
 
             const timeoutMs = Number(maxLatencyMs);
             const response = Number.isFinite(timeoutMs) && timeoutMs > 0
                 ? await Promise.race([
                     provider.request({ ...req, signal }),
-                    new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`请求 Provider 超时 (>${timeoutMs}ms)`)), timeoutMs)),
+                    new Promise<never>((_, reject) => setTimeout(() => reject(createSSHelperError('HTTP_REQUEST_TIMEOUT', {
+                        stage: 'llm.provider.request',
+                        resourceId,
+                    })), timeoutMs)),
                 ])
                 : await provider.request({ ...req, signal });
 
@@ -1406,10 +1548,12 @@ export class LLMSDKImpl {
                     ok: false,
                     error: `模型输出被截断：已触发 max_tokens=${Number(req.maxTokens ?? 0) || 0} 上限，返回的 JSON 未完整结束`,
                     retryable: true,
-                    reasonCode: schema === undefined ? 'token_limit_exceeded' : 'structured_output_truncated',
+                    reasonCode: schema === undefined ? 'TOKEN_LIMIT_EXCEEDED' : 'STRUCTURED_OUTPUT_TRUNCATED',
                     rawResponseText: response.content,
                     providerResponse: response,
                     providerRequest: response.debugRequest,
+                    resourceId,
+                    usage: response.usage,
                 };
             }
 
@@ -1422,6 +1566,8 @@ export class LLMSDKImpl {
                     providerResponse: response,
                     providerRequest: response.debugRequest,
                     structuredOutput: response.structuredOutput,
+                    resourceId,
+                    usage: response.usage,
                 };
             }
 
@@ -1431,10 +1577,12 @@ export class LLMSDKImpl {
                     ok: false,
                     error: '模型返回空内容，未生成结构化 JSON。',
                     retryable: true,
-                    reasonCode: 'structured_output_empty',
+                    reasonCode: 'STRUCTURED_OUTPUT_EMPTY',
                     providerResponse: response,
                     providerRequest: response.debugRequest,
                     structuredOutput: response.structuredOutput,
+                    resourceId,
+                    usage: response.usage,
                 };
             }
 
@@ -1445,7 +1593,7 @@ export class LLMSDKImpl {
                     ok: false,
                     error: `JSON 解析失败: ${parsed.error}`,
                     retryable: true,
-                    reasonCode: 'invalid_json',
+                    reasonCode: 'INVALID_JSON',
                     rawResponseText: response.content,
                     providerResponse: response,
                     providerRequest: response.debugRequest,
@@ -1453,57 +1601,69 @@ export class LLMSDKImpl {
                 };
             }
 
-            const categoryNormalizedInput = normalizeStructuredCategoryBuckets(parsed.data);
-            const enumNormalization = normalizeJsonSchemaEnumFallbacks(categoryNormalizedInput, schema);
-            const postProcessedInput = enumNormalization.data;
-            const validation = validateJsonSchema(postProcessedInput, schema);
+            const validation = structuredPolicy?.itemFailure === 'return_partial'
+                && Array.isArray(structuredPolicy.itemCollections)
+                ? validateJsonSchemaItemized(parsed.data, schema, structuredPolicy.itemCollections)
+                : validateJsonSchema(parsed.data, schema);
             if (!validation.valid) {
                 this.budgetManager.recordFailure(consumer);
                 return {
                     ok: false,
                     error: `Schema 校验失败: ${validation.errors.join('; ')}`,
                     retryable: true,
-                    reasonCode: 'schema_validation_failed',
+                    reasonCode: 'SCHEMA_VALIDATION_FAILED',
                     rawResponseText: response.content,
                     providerResponse: response,
                     parsedResponse: parsed.data,
-                    normalizedResponse: postProcessedInput,
+                    normalizedResponse: parsed.data,
                     validationErrors: validation.errors,
+                    validationIssues: validation.issues,
                     providerRequest: response.debugRequest,
                     structuredOutput: response.structuredOutput,
+                    resourceId,
+                    usage: response.usage,
                 };
             }
 
             this.budgetManager.recordSuccess(consumer);
+            const itemRejections: JsonSchemaItemRejection[] = 'rejections' in validation
+                && Array.isArray(validation.rejections)
+                ? validation.rejections
+                : [];
+            const validatedData = 'value' in validation ? validation.value : parsed.data;
             return {
                 ok: true,
-                data: postProcessedInput,
+                data: validatedData,
                 rawResponseText: response.content,
                 providerResponse: response,
                 parsedResponse: parsed.data,
-                normalizedResponse: postProcessedInput,
+                normalizedResponse: validatedData,
+                itemRejections,
                 providerRequest: response.debugRequest,
                 structuredOutput: response.structuredOutput,
+                resourceId,
+                usage: response.usage,
             };
         } catch (error) {
             this.budgetManager.recordFailure(consumer);
             const providerError = error as Error & {
-                reasonCode?: string;
-                detail?: string;
                 providerRequest?: Record<string, unknown>;
                 providerResponse?: unknown;
             };
-            const message = providerError.message;
-            const reasonCode = providerError.reasonCode || inferReasonCode(message);
-            const retryable = reasonCode === 'timeout' || reasonCode === 'rate_limited' || reasonCode === 'network_error';
+            const failure = this.failure(error, 'llm.provider.request', {
+                resourceId,
+                ...(requestId ? { requestId } : {}),
+                ...(attemptId ? { attemptId } : {}),
+            });
+            const diagnostic = describeSSHelperFailure(failure);
             return {
                 ok: false,
-                error: message,
-                retryable,
-                reasonCode,
-                rawResponseText: providerError.detail,
+                error: diagnostic.title,
+                retryable: diagnostic.retryable,
+                reasonCode: failure.reasonCode,
                 providerRequest: providerError.providerRequest,
                 providerResponse: providerError.providerResponse,
+                failure,
             };
         }
     }

@@ -37,7 +37,7 @@ function releaseVersion(version: string | undefined): string {
   return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(normalized) ? `v${normalized}` : '未知';
 }
 
-function serviceSnapshot(response: LlmCapabilityStatusResponse | undefined): SettingsStatusSnapshot {
+function generationSnapshot(response: LlmCapabilityStatusResponse | undefined): SettingsStatusSnapshot {
   if (!response) return warning('状态不可用', 'LLM 实时状态暂不可用，请稍后重试。');
   const entries = new Map(response.checks.map((entry) => [entry.id, entry]));
   const generation = entries.get('generation');
@@ -54,13 +54,24 @@ function serviceSnapshot(response: LlmCapabilityStatusResponse | undefined): Set
     const source = generation?.source === 'tavern' ? '酒馆' : generation?.source === 'custom' ? '自定义 API' : undefined;
     return error(['生成不可用', source].filter(Boolean).join(' · '), descriptions[generation?.reason as keyof typeof descriptions] ?? '当前来源内没有可用的生成模型。');
   }
-  const source = generation.source === 'tavern' ? '酒馆' : generation.source === 'custom' ? '自定义 API' : undefined;
-  const generationDetails = [source, generation.resourceId, generation.model].filter((item, index, values) => Boolean(item) && values.indexOf(item) === index);
-  const optional = [
-    entries.get('embedding')?.available ? '向量化可用' : '向量化未配置',
-    entries.get('rerank')?.available ? '重排序可用' : '重排序未配置',
-  ];
-  return success(['生成可用', ...generationDetails].join(' · '), optional.join(' · '));
+  return success('可用', '当前生成路由可用。');
+}
+
+function optionalCapabilitySnapshot(
+  response: LlmCapabilityStatusResponse | undefined,
+  id: 'embedding' | 'rerank',
+  label: '向量' | '重排',
+): SettingsStatusSnapshot {
+  if (!response) return warning('状态不可用', `暂时无法读取${label}服务状态。`);
+  const capability = response.checks.find((entry) => entry.id === id);
+  if (capability?.available) return success('可用', `${label}服务可用。`);
+  switch (capability?.reason) {
+    case 'no_resource': return neutral('未配置', `尚未配置${label}资源。`);
+    case 'resource_disabled': return neutral('已停用', `${label}资源已停用。`);
+    case 'credential_missing': return error('缺少密钥', `${label}资源缺少密钥。`);
+    case 'status_unavailable': return warning('状态未知', `暂时无法读取${label}服务状态。`);
+    default: return error('不可用', `当前没有可用的${label}路由。`);
+  }
 }
 
 /** Event-driven settings status bridge. It never exposes credentials or provider response bodies. */
@@ -76,14 +87,16 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
   private unsubscribeCapability: (() => void) | undefined;
 
   constructor(
-    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
+    private readonly session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'tavern.plugin.request' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
     private readonly repository: LlmWorkspaceRepository,
     private readonly handlers: LlmServiceHandlers,
     private readonly target: DiscoveryTarget = globalThis as unknown as DiscoveryTarget,
   ) {
     this.status = Object.freeze({
       tavernStatus: neutral('正在连接', '正在读取酒馆当前使用的来源和模型。'),
-      serviceStatus: neutral('正在同步', '正在同步 LLM 路由与资源状态。'),
+      generationStatus: neutral('正在同步', '正在同步生成路由状态。'),
+      embeddingStatus: neutral('正在同步', '正在同步向量服务状态。'),
+      rerankStatus: neutral('正在同步', '正在同步重排服务状态。'),
       about: this.versionSnapshot(),
     });
   }
@@ -96,7 +109,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       this.unsubscribeHost = undefined;
     }
     try {
-      this.unsubscribeCapability = this.session.events.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, () => this.scheduleRefresh());
+      this.unsubscribeCapability = this.session.bus.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, () => this.scheduleRefresh());
     } catch {
       this.unsubscribeCapability = undefined;
     }
@@ -126,7 +139,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       const model = current.model?.trim();
       const provider = current.provider?.trim();
       if (!model && !provider) return warning('未选择模型', '酒馆连接可用，但尚未报告来源或模型。');
-      return success([provider, model].filter(Boolean).join(' · '), '用于文本整理。');
+      return success(['酒馆', model ?? provider].join(' · '), '用于文本整理。');
     }).catch(() => warning('状态不可用', '无法读取酒馆当前连接状态。'));
 
     const capabilityPromise = this.handlers.capabilityStatus
@@ -141,7 +154,9 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
     if (this.disposed || controller.signal.aborted || generation !== this.refreshGeneration) return;
     this.status = Object.freeze({
       tavernStatus,
-      serviceStatus: serviceSnapshot(capabilities),
+      generationStatus: generationSnapshot(capabilities),
+      embeddingStatus: optionalCapabilitySnapshot(capabilities, 'embedding', '向量'),
+      rerankStatus: optionalCapabilitySnapshot(capabilities, 'rerank', '重排'),
       about: this.versionSnapshot(),
     });
     for (const listener of this.listeners) {

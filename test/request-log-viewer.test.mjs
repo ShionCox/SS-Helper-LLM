@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
-import { clampLogListWidth, presentDiagnostic, presentLogRow } from '../dist/src/ui/request-log-viewer.js';
+import { clampLogListWidth, presentDiagnostic, presentLogRow } from '../dist/src/ui/request-log-presentation.js';
 
 const viewerSource = readFileSync(new URL('../src/ui/request-log-viewer.ts', import.meta.url), 'utf8');
 const viewerStyles = readFileSync(new URL('../src/ui/request-log-viewer.css', import.meta.url), 'utf8');
@@ -44,24 +44,17 @@ test('request log viewer splitter keeps both panes usable', () => {
   assert.equal(clampLogListWidth(650, 500), 240);
 });
 
-test('request log viewer explains a legacy reason code when the error body is missing', () => {
-  assert.deepEqual(presentDiagnostic('invalid_json', undefined), {
-    code: 'invalid_json',
-    message: '模型返回内容不是合法 JSON，无法解析。',
+test('request log viewer only renders the central structured failure', () => {
+  assert.deepEqual(presentDiagnostic({ reasonCode: 'INVALID_JSON', stage: 'llm.parse' }), {
+    code: 'INVALID_JSON',
+    message: '模型返回内容不是有效 JSON：模型输出无法解析为单一完整 JSON。 允许一次结构修复；持续失败时更换模型。',
   });
-  assert.deepEqual(presentDiagnostic('structured_output_truncated', undefined), {
-    code: 'structured_output_truncated',
-    message: '模型返回的结构化 JSON 在结束前被截断。',
+  assert.deepEqual(presentDiagnostic({ reasonCode: 'STRUCTURED_OUTPUT_TRUNCATED', stage: 'llm.parse' }), {
+    code: 'STRUCTURED_OUTPUT_TRUNCATED',
+    message: '模型结构化输出被截断：模型达到输出上限，JSON 没有完整结束。 减少批次内容或提高输出上限后重试。',
   });
-  assert.deepEqual(presentDiagnostic('future_error_code', undefined), {
-    code: 'future_error_code',
-    message: '日志只保存了错误码，未保存具体错误正文。',
-  });
-  assert.deepEqual(presentDiagnostic(undefined, undefined), {});
-  assert.deepEqual(presentDiagnostic('invalid_json', '模型返回了截断内容'), {
-    code: 'invalid_json',
-    message: '模型返回了截断内容',
-  });
+  assert.deepEqual(presentDiagnostic({ reasonCode: 'future_error_code', stage: 'llm.parse' }), {});
+  assert.deepEqual(presentDiagnostic(undefined), {});
 });
 
 test('request log viewer uses a toast for load status instead of an in-workspace status row', () => {
@@ -69,4 +62,15 @@ test('request log viewer uses a toast for load status instead of an in-workspace
   assert.equal(viewerStyles.includes('ss-helper-llm-log-status'), false);
   assert.match(viewerSource, /notify\('success', '日志已加载'/u);
   assert.match(viewerSource, /notify\('error', '日志加载失败'/u);
+});
+
+test('request log viewer uses JSONEditor and keeps status beside the title', () => {
+  assert.match(viewerSource, /mount\(JSONEditor/u);
+  assert.equal(viewerSource.includes("action === 'format'"), false);
+  assert.equal(viewerSource.includes('显示原文'), false);
+  assert.match(viewerSource, /titleGroup\.append\(statusIcon, title\)/u);
+  assert.match(viewerSource, /top\.append\(titleGroup, time\)/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-log-item-status\[data-state="failed"\]/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-log-detail-pane > \.ss-helper-llm-json-editor[^}]+width: auto;[^}]+max-width: calc\(100% - 24px\)/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-json-editor \.jse-main[^}]+min-width: 0;[^}]+overflow: hidden/u);
 });

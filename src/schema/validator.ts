@@ -28,10 +28,7 @@ export function validateZodSchema<T>(data: any, schema: ZodType<T>): ValidationR
     }
 }
 
-/**
- * 尝试从 LLM 混沌输出中提取最纯净的 JSON
- * 对于部分附带反思过程 `<think>` 或者包裹在 \`\`\`json 里面的格式，进行强力清洗
- */
+/** Strictly parses one JSON root object without cleaning, stitching, or fence extraction. */
 export function parseJsonOutput(raw: string | object): { ok: boolean; data: any; error?: string } {
     if (raw && typeof raw === 'object') {
         return Array.isArray(raw)
@@ -42,49 +39,14 @@ export function parseJsonOutput(raw: string | object): { ok: boolean; data: any;
         return { ok: false, data: null, error: '返回内容为空或格式非字符串' };
     }
 
-    let cleanStr = raw.trim();
-    let lastError = '';
-
-    // 1. 尝试去除 DeepSeek / Claude 等喜欢附带的 <think> 标签内容
-    cleanStr = cleanStr.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-
-    const parseRootObject = (value: string): { ok: boolean; data: any; error?: string } => {
-        try {
-            const parsed = JSON.parse(value);
-            return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-                ? { ok: true, data: parsed }
-                : { ok: false, data: null, error: '结构化输出必须是唯一根对象' };
-        } catch (error) {
-            return { ok: false, data: null, error: (error as Error).message };
-        }
-    };
-
-    // 2. 直接解析唯一根对象
     try {
-        const parsed = parseRootObject(cleanStr);
-        if (parsed.ok) return parsed;
-        lastError = parsed.error ?? '';
+        const parsed = JSON.parse(raw.trim());
+        return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+            ? { ok: true, data: parsed }
+            : { ok: false, data: null, error: '结构化输出必须是唯一根对象' };
     } catch (error) {
-        lastError = (error as Error).message;
+        return { ok: false, data: null, error: (error as Error).message };
     }
-
-    // 3. 只允许整个输出由一个 ```json ... ``` 或 ``` ... ``` 块组成
-    const jsonBlockMatch = cleanStr.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?\s*```$/);
-    if (jsonBlockMatch) {
-        const parsed = parseRootObject(jsonBlockMatch[1].trim());
-        if (parsed.ok) return parsed;
-        lastError = `代码块中的 JSON 解析失败: ${parsed.error ?? '未知错误'}`;
-    }
-
-    if (/[\[{]/.test(cleanStr)) {
-        return {
-            ok: false,
-            data: null,
-            error: lastError || '只接受一个完整 JSON 根对象；输出可能截断、未闭合或包含多个根对象',
-        };
-    }
-
-    return { ok: false, data: null, error: lastError || '无法从 LLM 输出中识别到有效的 JSON' };
 }
 
 function isRecord(value: unknown): value is Record<string, any> {

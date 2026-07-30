@@ -28,12 +28,19 @@ export interface LLMRunMeta {
     finishedAt?: number;
     latencyMs?: number;
     fallbackUsed?: boolean;
+    attemptCount?: number;
+    repairCount?: number;
+    transport?: LlmStructuredTransport;
+    validationOutcome?: 'complete' | 'partial';
+    itemRejections?: LlmStructuredItemRejection[];
+    parentRequestId?: string;
+    usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
 }
 
 /** 统一结果形态 */
 export type LLMRunResult<T> =
     | { ok: true; data: T; meta: LLMRunMeta }
-    | { ok: false; error: string; retryable?: boolean; fallbackUsed?: boolean; reasonCode?: string; meta?: LLMRunMeta };
+    | { ok: false; error: string; retryable?: boolean; fallbackUsed?: boolean; reasonCode?: SSHelperReasonCode; meta?: LLMRunMeta; failure?: SSHelperFailureContext };
 
 export type LLMTaskLifecycleStage =
     | 'queued'
@@ -58,7 +65,7 @@ export interface LLMTaskLifecycleEvent {
     fallbackUsed?: boolean;
     progress?: number;
     error?: string;
-    reasonCode?: string;
+    reasonCode?: SSHelperReasonCode;
 }
 
 export type LLMTaskLifecycleHandler = (event: LLMTaskLifecycleEvent) => void;
@@ -67,7 +74,6 @@ export type LLMTaskLifecycleHandler = (event: LLMTaskLifecycleEvent) => void;
 //  展示模式
 // ═══════════════════════════════════════════
 
-export type DisplayMode = 'fullscreen' | 'compact' | 'silent';
 
 // ═══════════════════════════════════════════
 //  消费方注册描述
@@ -80,9 +86,9 @@ export interface TaskDescriptor {
     requiredCapabilities: LLMCapability[];
     maxTokens?: number;
     recommendedRoute?: { resourceId?: string; profileId?: string };
-    recommendedDisplay?: DisplayMode;
     description?: string;
     backgroundEligible?: boolean;
+    structuredPolicy?: LlmStructuredRepairPolicy;
 }
 
 /** 路由绑定 —— 一个插件对某个任务的覆盖 */
@@ -136,14 +142,6 @@ export interface ConsumerPersistentSnapshot {
 export interface ConsumerSessionSnapshot {
     online: boolean;
     seenAt: number;
-    currentQueueState: {
-        pendingCount: number;
-        runningTaskKey?: string;
-    };
-    currentOverlayState: {
-        activeRequestId?: string;
-        displayMode?: DisplayMode;
-    };
 }
 
 /** 完整注册快照 */
@@ -181,19 +179,17 @@ export interface RequestScope {
 export interface RequestEnqueueOptions {
     dedupeKey?: string;
     replacePendingByKey?: string;
-    cancelOnScopeChange?: boolean;
-    displayMode?: DisplayMode;
-    autoCloseMs?: number;
     scope?: RequestScope;
-    blockNextUntilOverlayClose?: boolean;
+    /** Core Bus correlation id. Public contract handlers pass this through unchanged. */
+    requestId?: string;
+    /** Optional root request used to group deferred repair calls with capture. */
+    parentRequestId?: string;
 }
 
 /** 请求状态机 */
 export type RequestState =
     | 'queued'
     | 'running'
-    | 'result_ready'
-    | 'overlay_waiting'
     | 'completed'
     | 'failed'
     | 'cancelled';
@@ -202,7 +198,6 @@ export type RequestState =
 export interface RequestValidity {
     isCancelled: boolean;
     isSuperseded: boolean;
-    isObsolete: boolean;
 }
 
 export interface RequestDebugInfo {
@@ -211,8 +206,9 @@ export interface RequestDebugInfo {
     normalizedResponse?: unknown;
     providerResponse?: unknown;
     validationErrors?: string[];
-    finalError?: string;
-    reasonCode?: string;
+    validationIssues?: Array<{ path: string; keyword: string; expected: string }>;
+    itemRejections?: LlmStructuredItemRejection[];
+    failure?: SSHelperFailureContext;
 }
 
 export interface LLMRequestLogRequestSnapshot {
@@ -222,6 +218,7 @@ export interface LLMRequestLogRequestSnapshot {
     budget?: unknown;
     enqueue?: unknown;
     schemaSummary?: string;
+    schemaHash?: string;
     schema?: unknown;
     structuredOutput?: {
         vendor: string;
@@ -233,7 +230,7 @@ export interface LLMRequestLogRequestSnapshot {
         nativeJsonMode?: boolean;
         nativeSchemaSent?: boolean;
         manualRetryRepair?: {
-            reasonCode: string;
+            reasonCode: SSHelperReasonCode;
             state: 'queued' | 'applied';
         };
     };
@@ -261,9 +258,10 @@ export interface LLMRequestLogRequestSnapshot {
 
 export interface LLMRequestLogResponseSnapshot {
     meta?: Partial<LLMRunMeta>;
-    finalError?: string;
-    reasonCode?: string;
+    failure?: SSHelperFailureContext;
     validationErrors?: string[];
+    validationIssues?: Array<{ path: string; keyword: string; expected: string }>;
+    itemRejections?: LlmStructuredItemRejection[];
     rawResponseText?: string;
     providerResponse?: unknown;
     parsedResponse?: unknown;
@@ -274,6 +272,8 @@ export interface LLMRequestLogEntry {
     logId: string;
     llmTaskId: string;
     requestId: string;
+    parentRequestId?: string;
+    attemptId: string;
     sourcePluginId: string;
     consumer: string;
     taskKey: string;
@@ -281,8 +281,11 @@ export interface LLMRequestLogEntry {
     taskKind: CapabilityKind;
     state: RequestState;
     attemptIndex: number;
+    attemptPhase: LlmStructuredAttemptPhase;
+    plannedTransport?: LlmStructuredTransport;
+    actualTransport?: LlmStructuredTransport;
     attemptTag: '初次请求' | '重试';
-    attemptOutcome: '成功' | '失败' | '取消';
+    attemptOutcome?: '成功' | '失败' | '取消';
     isFinalAttempt: boolean;
     chatKey?: string;
     sessionId?: string;
@@ -332,62 +335,16 @@ export interface RequestRecord<T = unknown> {
     requestId: string;
     activeAttemptRequestId?: string;
     attemptIndex: number;
+    activeAttemptPhase?: LlmStructuredAttemptPhase;
     queuedAt: number;
     startedAt?: number;
     finishedAt?: number;
     resultPromise: Promise<LLMRunResult<T>>;
-    overlayClosedPromise: Promise<void>;
     resolveResult?: (value: LLMRunResult<T>) => void;
-    resolveOverlay?: () => void;
     meta?: LLMRunMeta;
     debug?: RequestDebugInfo;
     requestLogSnapshot?: LLMRequestLogRequestSnapshot;
-    /** 用户确认结构化失败后，仅用于下一次手动重试的修正指令。 */
-    structuredRetryRepair?: {
-        reasonCode: string;
-        instruction: string;
-    };
 }
-
-// ═══════════════════════════════════════════
-//  展示协议
-// ═══════════════════════════════════════════
-
-/** Level 1: 结构化覆层描述 */
-export interface LLMOverlaySpec {
-    requestId: string;
-    title?: string;
-    status?: 'loading' | 'streaming' | 'done' | 'error';
-    progress?: number;
-    content?: LLMSafeRichContent;
-    actions?: OverlayAction[];
-    displayMode: DisplayMode;
-    autoClose?: boolean;
-    autoCloseMs?: number;
-    autoCloseAt?: number;
-}
-
-/** Level 2: 受限富内容 */
-export interface LLMSafeRichContent {
-    type: 'text' | 'markdown' | 'html';
-    body: string;
-}
-
-export interface OverlayAction {
-    id: string;
-    label: string;
-    style?: 'primary' | 'secondary' | 'danger';
-    closeOnClick?: boolean;
-}
-
-/** Overlay 补丁 */
-export type OverlayPatch = Partial<Omit<LLMOverlaySpec, 'requestId'>>;
-
-// ═══════════════════════════════════════════
-//  路由解析
-// ═══════════════════════════════════════════
-
-/** 路由解析入口参数 */
 export interface RouteResolveArgs {
     consumer: string;
     taskKind: CapabilityKind;
@@ -499,13 +456,6 @@ export interface TaskAssignment {
     staleReason?: string;
 }
 
-/** silent 权限授权 */
-export interface SilentPermissionGrant {
-    pluginId: string;
-    taskKey: string;
-    grantedAt: number;
-}
-
 /** LLMHub 完整设置 */
 export interface LLMHubSettings {
     enabled?: boolean;
@@ -514,8 +464,6 @@ export interface LLMHubSettings {
     timeoutMs?: number;
     maxTokensMode?: MaxTokensMode;
     maxTokens?: number;
-    resultDisplay?: 'auto' | 'silent' | 'compact' | 'fullscreen';
-    detailedLogs?: boolean;
     requestLogging?: LLMRequestLoggingSettings;
     globalProfile?: string;
     /** 全局 max_tokens 控制 */
@@ -531,7 +479,6 @@ export interface LLMHubSettings {
     /** 预算配置 */
     budgets?: Record<string, import('../budget/budget-manager').BudgetConfig>;
     /** silent 权限授权 */
-    silentPermissions?: SilentPermissionGrant[];
 }
 
 // ═══════════════════════════════════════════
@@ -587,7 +534,7 @@ export interface LLMInspectApi {
 //  runTask / embed / rerank 入参
 // ═══════════════════════════════════════════
 
-export interface RunTaskArgs<T = unknown> {
+export interface RunTaskArgs {
     consumer: string;
     taskKey: string;
     taskDescription?: string;
@@ -624,3 +571,11 @@ export interface RerankArgs {
     onLifecycle?: LLMTaskLifecycleHandler;
     signal?: AbortSignal;
 }
+import type {
+    LlmStructuredAttemptPhase,
+    LlmStructuredItemRejection,
+    LlmStructuredRepairPolicy,
+    LlmStructuredTransport,
+    SSHelperFailureContext,
+    SSHelperReasonCode,
+} from '@ss-helper/sdk';

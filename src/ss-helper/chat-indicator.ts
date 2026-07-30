@@ -5,7 +5,6 @@ export function registerLlmChatIndicator(
   session: Pick<PluginSession, 'registerChatIndicator'>,
   repository: Pick<LlmWorkspaceRepository, 'loadSettings' | 'subscribeSettings'>,
 ): () => void {
-  if (session.registerChatIndicator === undefined) return () => undefined;
   return session.registerChatIndicator({
     label: 'LLM',
     icon: 'microchip',

@@ -67,20 +67,26 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   const snapshots = [];
   const unsubscribe = monitor.subscribeStatus((snapshot) => snapshots.push(snapshot));
   await monitor.start();
-  assert.equal(monitor.loadStatus().tavernStatus.value, 'openai · gpt-test');
-  assert.equal(monitor.loadStatus().serviceStatus.value, '生成可用 · 酒馆 · gpt-test');
+  assert.equal(monitor.loadStatus().tavernStatus.value, '酒馆 · gpt-test');
+  assert.equal(monitor.loadStatus().generationStatus.value, '可用');
+  assert.equal(monitor.loadStatus().embeddingStatus.value, '未配置');
+  assert.equal(monitor.loadStatus().rerankStatus.value, '未配置');
   assert.equal(monitor.loadStatus().about.value, `LLM v${LLM_PLUGIN_VERSION} · Core v${CORE_VERSION} · SDK v${SDK_PACKAGE_VERSION} · API ${API_VERSION}`);
 
   value.changeModel({ provider: 'claude', model: 'claude-test' });
   await wait();
-  assert.equal(snapshots.at(-1).tavernStatus.value, 'claude · claude-test');
+  assert.equal(snapshots.at(-1).tavernStatus.value, '酒馆 · claude-test');
 
   value.changeRepository();
   await wait();
-  assert.equal(snapshots.at(-1).serviceStatus.value, '生成可用 · 酒馆 · claude-test');
+  assert.equal(snapshots.at(-1).generationStatus.value, '可用');
+  assert.equal(snapshots.at(-1).embeddingStatus.value, '未配置');
+  assert.equal(snapshots.at(-1).rerankStatus.value, '未配置');
   value.changeCapabilities();
   await wait();
-  assert.equal(snapshots.at(-1).serviceStatus.value, '生成可用 · 酒馆 · claude-test');
+  assert.equal(snapshots.at(-1).generationStatus.value, '可用');
+  assert.equal(snapshots.at(-1).embeddingStatus.value, '未配置');
+  assert.equal(snapshots.at(-1).rerankStatus.value, '未配置');
   unsubscribe();
   monitor.dispose();
 });
@@ -131,7 +137,9 @@ test('adapter exposes live status and disposed monitors ignore later host events
   const monitor = new LlmSettingsStatusMonitor(value.session, value.repository, {}, value.target);
   await monitor.start();
   const adapter = createWorkspaceLlmSettingsAdapter(value.repository, monitor);
-  assert.equal((await adapter.loadStatus()).serviceStatus.value, '状态不可用');
+  assert.equal((await adapter.loadStatus()).generationStatus.value, '状态不可用');
+  assert.equal((await adapter.loadStatus()).embeddingStatus.value, '状态不可用');
+  assert.equal((await adapter.loadStatus()).rerankStatus.value, '状态不可用');
   const before = monitor.loadStatus().tavernStatus.value;
   monitor.dispose();
   value.changeModel({ provider: 'gemini', model: 'gemini-test' });
@@ -156,7 +164,7 @@ test('background status refresh isolates broken observers and never leaks an unh
     value.changeModel({ provider: 'openai', model: 'after-observer-error' });
     await wait(160);
     assert.equal(unhandled.length, 0);
-    assert.equal(monitor.loadStatus().tavernStatus.value, 'openai · after-observer-error');
+    assert.equal(monitor.loadStatus().tavernStatus.value, '酒馆 · after-observer-error');
   } finally {
     process.off('unhandledRejection', onUnhandled);
     unsubscribe();

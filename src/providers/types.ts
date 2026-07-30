@@ -3,7 +3,13 @@
  * 将 Provider 抽象与具体实现解耦
  */
 
-import type { StructuredOutputIdentity, StructuredOutputPlan } from '../schema/structured-output-plan';
+import type { SSHelperFailureContext } from '@ss-helper/sdk';
+import type { StructuredOutputIdentity, StructuredOutputPlan, StructuredOutputTransport } from '../schema/structured-output-plan';
+
+export interface StructuredOutputCapability {
+    readonly transports: readonly StructuredOutputTransport[];
+    readonly preferred: StructuredOutputTransport;
+}
 
 export interface LLMProviderCapabilities {
     chat: boolean;
@@ -11,6 +17,7 @@ export interface LLMProviderCapabilities {
     tools: boolean;
     embeddings: boolean;
     rerank?: boolean;
+    structuredOutput: StructuredOutputCapability;
 }
 
 export interface LLMRequest {
@@ -61,8 +68,7 @@ export interface RerankResponse {
 export interface ProviderConnectionResult {
     ok: boolean;
     message: string;
-    errorCode?: string;
-    detail?: string;
+    failure?: SSHelperFailureContext;
     model?: string;
     latencyMs?: number;
 }
@@ -76,8 +82,7 @@ export interface ProviderModelListResult {
     ok: boolean;
     models: ProviderModelInfo[];
     message: string;
-    errorCode?: string;
-    detail?: string;
+    failure?: SSHelperFailureContext;
 }
 
 /**
@@ -90,8 +95,9 @@ export interface LLMProvider {
     request(req: LLMRequest): Promise<LLMResponse>;
     embed?(req: EmbedRequest): Promise<EmbedResponse>;
     rerank?(req: RerankRequest): Promise<RerankResponse>;
-    testConnection?(): Promise<ProviderConnectionResult>;
-    listModels?(): Promise<ProviderModelListResult>;
+    testConnection?(signal?: AbortSignal): Promise<ProviderConnectionResult>;
+    listModels?(signal?: AbortSignal): Promise<ProviderModelListResult>;
     dispose?(): void;
     getStructuredOutputIdentity?(model?: string): Promise<StructuredOutputIdentity> | StructuredOutputIdentity;
+    getStructuredOutputCapability?(identity: StructuredOutputIdentity): Promise<StructuredOutputCapability> | StructuredOutputCapability;
 }

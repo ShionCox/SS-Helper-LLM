@@ -1,7 +1,20 @@
-import type { GenerationRequest, GenerationResult } from '@ss-helper/sdk';
-import { inferReasonCode } from '../schema/error-codes';
+import {
+    createSSHelperError,
+    describeSSHelperFailure,
+    readSSHelperFailure,
+    type GenerationRequest,
+    type GenerationResult,
+} from '@ss-helper/sdk';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
-import type { LLMProvider, LLMRequest, LLMResponse, ProviderConnectionResult, ProviderModelListResult } from './types';
+import type {
+    LLMProvider,
+    LLMRequest,
+    LLMResponse,
+    ProviderConnectionResult,
+    ProviderModelListResult,
+    StructuredOutputCapability,
+} from './types';
+import { providerModelListFailure } from './provider-errors';
 
 export interface TavernGenerationAdapter {
     available(): Promise<boolean>;
@@ -14,7 +27,13 @@ export interface TavernGenerationAdapter {
 export class TavernProvider implements LLMProvider {
     id: string;
     kind: 'tavern' = 'tavern';
-    capabilities = { chat: true, json: true, tools: false, embeddings: false };
+    capabilities = {
+        chat: true,
+        json: true,
+        tools: false,
+        embeddings: false,
+        structuredOutput: { transports: ['tavern_json_schema', 'prompt_only'] as const, preferred: 'tavern_json_schema' as const },
+    };
 
     constructor(config: { id: string; generation?: TavernGenerationAdapter }) {
         this.id = config.id;
@@ -25,9 +44,11 @@ export class TavernProvider implements LLMProvider {
 
     async request(req: LLMRequest): Promise<LLMResponse> {
         if (!this.generation) {
-            const error = new Error('Core HostPort generation capability is not configured') as Error & { reasonCode?: string };
-            error.reasonCode = inferReasonCode(error.message);
-            throw error;
+            throw createSSHelperError('PROVIDER_UNAVAILABLE', {
+                stage: 'llm.provider.tavern',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
         }
         const prompt = req.messages.map((message) => `${message.role}: ${message.content}`).join('\n');
         const model = typeof req.model === 'string' ? req.model.trim() : '';
@@ -51,13 +72,13 @@ export class TavernProvider implements LLMProvider {
         try {
             result = await this.generation.generate(request);
         } catch (error) {
-            const hostError = error as Error & { code?: string };
-            if (hostError.code === 'BRIDGE_CORRUPTED' || hostError.message === 'The Tavern host adapter failed') {
-                const diagnostic = new Error('酒馆生成调用失败：当前连接或模型后端拒绝了请求') as Error & { reasonCode?: string };
-                diagnostic.reasonCode = 'provider_unavailable';
-                throw diagnostic;
-            }
-            throw error;
+            const failure = readSSHelperFailure(error, {
+                reasonCode: 'INTERNAL_ERROR',
+                stage: 'llm.provider.tavern',
+                providerKind: this.kind,
+                resourceId: this.id,
+            })!;
+            throw createSSHelperError(failure.reasonCode, failure);
         }
         return {
             content: result.text,
@@ -74,25 +95,69 @@ export class TavernProvider implements LLMProvider {
         };
     }
 
-    async testConnection(): Promise<ProviderConnectionResult> {
-        if (!this.generation) return { ok: false, message: 'Core HostPort generation capability is not configured' };
+    async testConnection(signal?: AbortSignal): Promise<ProviderConnectionResult> {
+        signal?.throwIfAborted();
+        if (!this.generation) {
+            const diagnostic = describeSSHelperFailure(createSSHelperError('PROVIDER_UNAVAILABLE', {
+                stage: 'llm.provider.tavern.test',
+                providerKind: this.kind,
+                resourceId: this.id,
+            }));
+            return { ok: false, message: diagnostic.reason, failure: diagnostic };
+        }
         const startedAt = Date.now();
         try {
             const result = await this.generation.test({ prompt: 'Reply with OK.', quiet: true });
+            signal?.throwIfAborted();
             return { ok: true, message: '连接成功', model: result.model, latencyMs: Date.now() - startedAt };
         } catch (error) {
-            return { ok: false, message: error instanceof Error ? error.message : String(error), latencyMs: Date.now() - startedAt };
+            const diagnostic = describeSSHelperFailure(readSSHelperFailure(error, {
+                reasonCode: 'INTERNAL_ERROR',
+                stage: 'llm.provider.tavern.test',
+                providerKind: this.kind,
+                resourceId: this.id,
+            }));
+            return { ok: false, message: diagnostic.reason, failure: diagnostic, latencyMs: Date.now() - startedAt };
         }
     }
 
-    async listModels(): Promise<ProviderModelListResult> {
-        if (!this.generation || !(await this.generation.available())) return { ok: false, models: [], message: '酒馆生成服务不可用' };
-        const models = await this.generation.models();
-        return { ok: true, models: models.map((id) => ({ id, label: id })), message: '读取成功' };
+    async listModels(signal?: AbortSignal): Promise<ProviderModelListResult> {
+        const context = {
+            stage: 'llm.provider.models',
+            providerKind: this.kind,
+            resourceId: this.id,
+        } as const;
+        try {
+            signal?.throwIfAborted();
+            if (!this.generation || !(await this.generation.available())) {
+                return providerModelListFailure(createSSHelperError('PROVIDER_UNAVAILABLE', context), context);
+            }
+            signal?.throwIfAborted();
+            const models = await this.generation.models();
+            signal?.throwIfAborted();
+            return { ok: true, models: models.map((id) => ({ id, label: id })), message: '读取成功' };
+        } catch (error) {
+            const failure = signal?.aborted
+                ? createSSHelperError('REQUEST_ABORTED', context)
+                : error;
+            return providerModelListFailure(failure, context);
+        }
     }
 
     async getStructuredOutputIdentity(model?: string): Promise<StructuredOutputIdentity> {
         const current = this.generation ? await this.generation.current() : {};
         return detectStructuredOutputIdentity({ manualVendor: 'auto', provider: current.provider, model: model || current.model });
+    }
+
+    getStructuredOutputCapability(identity: StructuredOutputIdentity): StructuredOutputCapability {
+        const source = String(identity.provider || '').trim().toLowerCase();
+        // The host only exposes `jsonSchema` through its public generation
+        // helpers. Native provider branches translate that hint for their own
+        // protocol (DeepSeek becomes json_object), but Custom forwards it as
+        // OpenAI json_schema. A model name cannot make that host transport safe.
+        if (source === 'custom' || identity.vendor === 'unknown') {
+            return { transports: ['prompt_only'], preferred: 'prompt_only' };
+        }
+        return this.capabilities.structuredOutput;
     }
 }

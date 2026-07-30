@@ -1,11 +1,34 @@
+import { createSSHelperError } from '@ss-helper/sdk';
 import type {
     LLMProvider, LLMProviderCapabilities, LLMRequest, LLMResponse, EmbedRequest, EmbedResponse,
     RerankRequest, RerankResponse,
     ProviderConnectionResult, ProviderModelListResult,
 } from './types';
-import { isResponseFormatUnsupported, providerHttpError } from './provider-errors';
+import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import type { ApiType } from '../schema/types';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import { validateJsonSchema, type JsonSchemaIssue } from '../schema/json-schema-validator';
+
+const RERANK_RESPONSE_SCHEMA = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['results'],
+    properties: {
+        results: {
+            type: 'array',
+            minItems: 1,
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                required: ['index', 'score'],
+                properties: {
+                    index: { type: 'integer', minimum: 0 },
+                    score: { type: 'number', minimum: 0, maximum: 1 },
+                },
+            },
+        },
+    },
+} as const;
 
 /**
  * OpenAI 兼容 Provider 实现
@@ -54,12 +77,19 @@ export class OpenAIProvider implements LLMProvider {
             tools: true,
             embeddings: true,
             rerank: config.enableRerank === true,
+            structuredOutput: this.apiType === 'deepseek'
+                ? { transports: ['json_object', 'prompt_only'], preferred: 'json_object' }
+                : this.apiType === 'generic'
+                    ? { transports: ['prompt_only'], preferred: 'prompt_only' }
+                    : { transports: ['json_schema', 'json_object', 'prompt_only'], preferred: 'json_schema' },
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
         const manualVendor = this.apiType === 'openai' || this.apiType === 'deepseek' || this.apiType === 'gemini' || this.apiType === 'claude'
             ? this.apiType
-            : 'auto';
-        this.structuredOutputIdentity = config.structuredOutputIdentity ?? detectStructuredOutputIdentity({ manualVendor, baseUrl: this.baseUrl, model: this.model });
+            : undefined;
+        this.structuredOutputIdentity = config.structuredOutputIdentity ?? (manualVendor
+            ? detectStructuredOutputIdentity({ manualVendor, model: this.model })
+            : { vendor: 'unknown', evidence: 'manual', confidence: 'high', model: this.model });
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -94,57 +124,54 @@ export class OpenAIProvider implements LLMProvider {
         return '';
     }
 
-    private extractJsonObject(raw: string): any {
-        const text = String(raw || '').trim();
-        if (!text) return null;
-
-        const candidates = [text];
-        const fencedMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
-        if (fencedMatch?.[1]) candidates.push(fencedMatch[1].trim());
-
-        const firstBrace = text.indexOf('{');
-        const lastBrace = text.lastIndexOf('}');
-        if (firstBrace >= 0 && lastBrace > firstBrace) {
-            candidates.push(text.slice(firstBrace, lastBrace + 1));
-        }
-
-        for (const candidate of candidates) {
-            try {
-                return JSON.parse(candidate);
-            } catch {
-                // continue
-            }
-        }
-
-        return null;
+    private rerankValidationError(issue: JsonSchemaIssue): Error {
+        return createSSHelperError('SCHEMA_VALIDATION_FAILED', {
+            stage: 'llm.provider.rerank.validate',
+            providerKind: this.kind,
+            resourceId: this.id,
+            path: issue.path,
+            keyword: issue.keyword,
+            expected: issue.expected,
+        });
     }
 
-    private normalizeRerankResponse(data: any, req: RerankRequest): RerankResponse {
-        const rawResults = Array.isArray(data?.results)
-            ? data.results
-            : Array.isArray(data?.ranked)
-                ? data.ranked
-                : Array.isArray(data)
-                    ? data
-                    : [];
-
-        const normalized = rawResults.map((item: any, fallbackIndex: number) => {
-            const rawIndex = Number(item?.index ?? item?.document_index ?? fallbackIndex);
-            const index = Number.isFinite(rawIndex) && rawIndex >= 0 ? rawIndex : fallbackIndex;
-            const rawScore = Number(item?.score ?? item?.relevance_score ?? item?.similarity ?? 0);
-            return {
-                index,
-                score: Number.isFinite(rawScore) ? rawScore : 0,
-                doc: req.docs[index] ?? req.docs[fallbackIndex] ?? '',
-            };
-        });
-
-        const sorted = normalized.sort(
-            (a: { index: number; score: number; doc: string }, b: { index: number; score: number; doc: string }) => b.score - a.score,
-        );
-        return {
-            results: typeof req.topK === 'number' && req.topK > 0 ? sorted.slice(0, req.topK) : sorted,
-        };
+    private parseRerankResponse(raw: string, req: RerankRequest): RerankResponse {
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(String(raw || '').trim());
+        } catch {
+            throw createSSHelperError('INVALID_JSON', {
+                stage: 'llm.provider.rerank.parse',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
+        }
+        const validation = validateJsonSchema(parsed, RERANK_RESPONSE_SCHEMA);
+        if (!validation.valid) throw this.rerankValidationError(validation.issues[0]!);
+        const results = (parsed as { results: Array<{ index: number; score: number }> }).results;
+        const seen = new Set<number>();
+        for (let itemIndex = 0; itemIndex < results.length; itemIndex += 1) {
+            const result = results[itemIndex]!;
+            if (result.index >= req.docs.length) {
+                throw this.rerankValidationError({
+                    path: `$.results[${itemIndex}].index`,
+                    keyword: 'maximum',
+                    expected: `an integer below ${req.docs.length}`,
+                });
+            }
+            if (seen.has(result.index)) {
+                throw this.rerankValidationError({
+                    path: `$.results[${itemIndex}].index`,
+                    keyword: 'uniqueItems',
+                    expected: 'a unique document index',
+                });
+            }
+            seen.add(result.index);
+        }
+        const normalized = results
+            .map(({ index, score }) => ({ index, score, doc: req.docs[index]! }))
+            .sort((left, right) => right.score - left.score);
+        return { results: typeof req.topK === 'number' && req.topK > 0 ? normalized.slice(0, req.topK) : normalized };
     }
 
     private buildResponseFormat(req: LLMRequest, transport = req.structuredOutput?.transport): Record<string, unknown> | undefined {
@@ -175,7 +202,7 @@ export class OpenAIProvider implements LLMProvider {
             signal,
         });
 
-        if (!response.ok) throw providerHttpError('OpenAI', response.status, await response.text().catch(() => undefined));
+        if (!response.ok) throw await providerHttpErrorFromResponse('OpenAI', response);
 
         return response.json();
     }
@@ -186,30 +213,18 @@ export class OpenAIProvider implements LLMProvider {
             messages: req.messages,
             temperature: req.temperature ?? 0.7,
             max_tokens: req.maxTokens ?? 2048,
+            // Some OpenAI-compatible gateways default to SSE unless callers
+            // explicitly opt out. The provider consumes one complete JSON
+            // response, so make that wire contract deterministic.
+            stream: false,
         };
-        const plannedTransport = req.structuredOutput?.transport;
         const responseFormat = this.buildResponseFormat(req);
         const body: Record<string, any> = this.withCustomParams({
             ...baseBody,
             ...(responseFormat ? { response_format: responseFormat } : {}),
         });
 
-        let data: any;
-        let finalBody: Record<string, any> = body;
-        try {
-            data = await this.sendChatCompletion(body, req.signal);
-        } catch (error) {
-            if (plannedTransport === 'json_schema' && isResponseFormatUnsupported(error)) {
-                const fallbackBody = this.withCustomParams({
-                    ...baseBody,
-                    response_format: { type: 'json_object' },
-                });
-                finalBody = fallbackBody;
-                data = await this.sendChatCompletion(fallbackBody, req.signal);
-            } else {
-                throw error;
-            }
-        }
+        const data: any = await this.sendChatCompletion(body, req.signal);
         const choice = data.choices?.[0];
 
         return {
@@ -223,8 +238,7 @@ export class OpenAIProvider implements LLMProvider {
             ...(req.structuredOutput === undefined ? {} : {
                 structuredOutput: {
                     plannedTransport: req.structuredOutput.transport,
-                    actualTransport: finalBody.response_format?.type === 'json_object' ? 'json_object' : req.structuredOutput.transport,
-                    ...(finalBody.response_format?.type === 'json_object' && req.structuredOutput.transport === 'json_schema' ? { fallbackReason: 'response_format_unsupported' } : {}),
+                    actualTransport: req.structuredOutput.transport,
                 },
             }),
             debugRequest: {
@@ -232,7 +246,7 @@ export class OpenAIProvider implements LLMProvider {
                 apiType: this.apiType,
                 resourceId: this.id,
                 requestFormat: 'openai_chat_completions',
-                payload: finalBody,
+                payload: body,
             },
         };
     }
@@ -249,8 +263,7 @@ export class OpenAIProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            await response.text().catch(() => undefined);
-            throw providerHttpError('Embedding', response.status);
+            throw await providerHttpErrorFromResponse('Embedding', response);
         }
 
         const data = await response.json();
@@ -261,7 +274,11 @@ export class OpenAIProvider implements LLMProvider {
 
     async rerank(req: RerankRequest): Promise<RerankResponse> {
         if (this.capabilities.rerank !== true) {
-            throw new Error('当前资源未启用 rerank 能力');
+            throw createSSHelperError('PROVIDER_UNAVAILABLE', {
+                stage: 'llm.provider.rerank.capability',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
         }
 
         const userPayload = JSON.stringify({
@@ -293,22 +310,16 @@ export class OpenAIProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            await response.text().catch(() => undefined);
-            throw providerHttpError('Rerank', response.status);
+            throw await providerHttpErrorFromResponse('Rerank', response);
         }
 
         const data = await response.json();
         const choice = data.choices?.[0];
         const content = this.extractMessageContent(choice);
-        const parsed = this.extractJsonObject(content);
-        const normalized = this.normalizeRerankResponse(parsed, req);
-        if (!Array.isArray(normalized.results) || normalized.results.length === 0) {
-            throw new Error('LLM 重排返回为空或格式异常');
-        }
-        return normalized;
+        return this.parseRerankResponse(content, req);
     }
 
-    async testConnection(): Promise<ProviderConnectionResult> {
+    async testConnection(signal?: AbortSignal): Promise<ProviderConnectionResult> {
         const start = Date.now();
         try {
             const res = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
@@ -319,42 +330,44 @@ export class OpenAIProvider implements LLMProvider {
                     messages: [{ role: 'user', content: 'Hi' }],
                     max_tokens: 1,
                 })),
+                signal,
             });
             const latencyMs = Date.now() - start;
 
             if (!res.ok) {
-                const text = await res.text().catch(() => '');
-                const code = res.status === 401 || res.status === 403
-                    ? 'AUTH_ERROR'
-                    : res.status === 404
-                        ? 'ENDPOINT_NOT_FOUND'
-                        : `HTTP_${res.status}`;
-                return { ok: false, message: `连接失败 (${res.status})`, errorCode: code, detail: text, latencyMs };
+                return providerConnectionFailure(await providerHttpErrorFromResponse(this.kind, res), {
+                    stage: 'llm.provider.test',
+                    providerKind: this.kind,
+                    resourceId: this.id,
+                    model: this.model,
+                }, latencyMs);
             }
 
             return { ok: true, message: '连接成功', model: this.model, latencyMs };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            return {
-                ok: false,
-                message: `网络错误: ${msg}`,
-                errorCode: 'NETWORK_ERROR',
-                detail: msg,
-                latencyMs: Date.now() - start,
-            };
+            return providerConnectionFailure(error, {
+                stage: 'llm.provider.test',
+                providerKind: this.kind,
+                resourceId: this.id,
+                model: this.model,
+            }, Date.now() - start);
         }
     }
 
-    async listModels(): Promise<ProviderModelListResult> {
+    async listModels(signal?: AbortSignal): Promise<ProviderModelListResult> {
         try {
             const res = await this.fetchImpl(`${this.baseUrl}/models`, {
                 method: 'GET',
                 headers: { 'Authorization': `Bearer ${this.apiKey}` },
+                signal,
             });
 
             if (!res.ok) {
-                const text = await res.text().catch(() => '');
-                return { ok: false, models: [], message: `获取模型列表失败 (${res.status})`, detail: text };
+                return providerModelListFailure(await providerHttpErrorFromResponse(this.kind, res), {
+                    stage: 'llm.provider.models',
+                    providerKind: this.kind,
+                    resourceId: this.id,
+                });
             }
 
             const json = await res.json();
@@ -367,8 +380,11 @@ export class OpenAIProvider implements LLMProvider {
 
             return { ok: true, models, message: `共 ${models.length} 个模型` };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            return { ok: false, models: [], message: `网络错误: ${msg}`, errorCode: 'NETWORK_ERROR', detail: msg };
+            return providerModelListFailure(error, {
+                stage: 'llm.provider.models',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
         }
     }
 }

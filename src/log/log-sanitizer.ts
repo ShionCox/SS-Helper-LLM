@@ -1,7 +1,7 @@
 import type { PlainData } from '@ss-helper/sdk';
 import type { LLMLogDetailMode } from '../schema/types';
 
-export const LOG_FORMAT_VERSION = 2 as const;
+export const LOG_FORMAT_VERSION = 3 as const;
 export const MAX_SINGLE_LOG_BYTES = 4 * 1024 * 1024;
 
 const SENSITIVE_KEY = /^(?:authorization|proxy-authorization|cookie|set-cookie|api[-_]?key|access[-_]?token|refresh[-_]?token|id[-_]?token|client[-_]?secret|private[-_]?key|password|passwd|secret|credential|credentials|headers|requestheaders)$/iu;
@@ -60,18 +60,20 @@ function metadata(entry: Record<string, unknown>, response: Record<string, unkno
         logId: entry.logId,
         llmTaskId: entry.llmTaskId,
         requestId: entry.requestId,
+        parentRequestId: entry.parentRequestId,
+        attemptId: entry.attemptId,
         sourcePluginId: entry.sourcePluginId,
         consumer: entry.consumer,
         taskKey: entry.taskKey,
-        taskDescription: entry.taskDescription,
         taskKind: entry.taskKind,
         state: entry.state,
         attemptIndex: entry.attemptIndex,
+        attemptPhase: entry.attemptPhase,
+        plannedTransport: entry.plannedTransport,
+        actualTransport: entry.actualTransport,
         attemptTag: entry.attemptTag,
         attemptOutcome: entry.attemptOutcome,
         isFinalAttempt: entry.isFinalAttempt,
-        chatKey: entry.chatKey,
-        sessionId: entry.sessionId,
         queuedAt: entry.queuedAt,
         startedAt: entry.startedAt,
         finishedAt: entry.finishedAt,
@@ -81,31 +83,44 @@ function metadata(entry: Record<string, unknown>, response: Record<string, unkno
         model: meta?.model,
         provider: meta?.provider,
         capabilityKind: meta?.capabilityKind,
-        reasonCode: response?.reasonCode,
+        reasonCode: response?.failure && typeof response.failure === 'object' && !Array.isArray(response.failure)
+            ? (response.failure as Record<string, unknown>).reasonCode
+            : undefined,
     };
 }
 
 function summaryValue(entry: Record<string, unknown>, response: Record<string, unknown> | undefined): Record<string, unknown> {
     const request = entry.request && typeof entry.request === 'object' && !Array.isArray(entry.request) ? entry.request as Record<string, unknown> : undefined;
-    const metrics = request?.metrics && typeof request.metrics === 'object' && !Array.isArray(request.metrics) ? request.metrics : undefined;
+    const responseMeta = response?.meta && typeof response.meta === 'object' && !Array.isArray(response.meta)
+        ? response.meta as Record<string, unknown>
+        : undefined;
+    const schemaHash = typeof request?.schemaHash === 'string' ? request.schemaHash : undefined;
+    const failure = response?.failure && typeof response.failure === 'object' && !Array.isArray(response.failure)
+        ? response.failure as Record<string, unknown>
+        : undefined;
     return {
         ...metadata(entry, response),
         request: request ? {
             taskKind: request.taskKind,
-            taskDescription: request.taskDescription,
-            routeHint: request.routeHint,
-            budget: request.budget,
-            schemaSummary: request.schemaSummary,
-            responseFormatResolved: request.responseFormatResolved,
-            resolvedMaxTokens: request.resolvedMaxTokens,
-            normalizeMode: request.normalizeMode,
-            metrics,
+            schemaHash,
         } : undefined,
         response: response ? {
-            meta: response.meta,
-            reasonCode: response.reasonCode,
-            finalError: response.finalError,
-            validationErrors: response.validationErrors,
+            usage: responseMeta?.usage,
+            failure: failure ? {
+                reasonCode: failure.reasonCode,
+                stage: failure.stage,
+                requestId: failure.requestId,
+                attemptId: failure.attemptId,
+                batchIndex: failure.batchIndex,
+                collection: failure.collection,
+                path: failure.path,
+                keyword: failure.keyword,
+                expected: failure.expected,
+                httpStatus: failure.httpStatus,
+                providerKind: failure.providerKind,
+                resourceId: failure.resourceId,
+                model: failure.model,
+            } : undefined,
         } : undefined,
     };
 }
@@ -113,37 +128,33 @@ function summaryValue(entry: Record<string, unknown>, response: Record<string, u
 export function buildStoredLog(entry: Record<string, unknown>, mode: LLMLogDetailMode): StoredLogResult | null {
     if (mode === 'off') return null;
     const response = entry.response && typeof entry.response === 'object' && !Array.isArray(entry.response) ? entry.response as Record<string, unknown> : undefined;
-    const full = mode === 'full' || (mode === 'failed-full' && entry.state === 'failed');
     const redactions: string[] = [];
-    const raw = full ? {
-        ...metadata(entry, response),
-        request: entry.request,
-        response,
-    } : summaryValue(entry, response);
+    const raw = summaryValue(entry, response);
     const value = toPlain({
         ...raw,
         logFormatVersion: LOG_FORMAT_VERSION,
-        contentMode: full ? 'full' : 'summary',
+        contentMode: 'summary',
     }, '', redactions, new WeakSet<object>()) as Record<string, PlainData>;
     let size = jsonBytes(value);
-    if (full && size > MAX_SINGLE_LOG_BYTES) {
+    if (size > MAX_SINGLE_LOG_BYTES) {
+        const originalBytes = size;
         const fallback = toPlain({
             ...summaryValue(entry, response),
             logFormatVersion: LOG_FORMAT_VERSION,
             contentMode: 'summary',
             truncated: {
                 reason: 'single_record_limit',
-                originalBytes: size,
+                originalBytes,
                 maxBytes: MAX_SINGLE_LOG_BYTES,
                 omitted: ['request.generationInput', 'request.embeddingTexts', 'request.rerankDocs', 'request.providerRequest', 'response.rawResponseText', 'response.providerResponse', 'response.parsedResponse', 'response.normalizedResponse'],
             },
         }, '', redactions, new WeakSet<object>()) as Record<string, PlainData>;
         size = jsonBytes(fallback);
-        return { value: fallback, storageBytes: size, contentMode: 'summary', redactions, truncated: { reason: 'single_record_limit', originalBytes: value.storageBytes ?? size, maxBytes: MAX_SINGLE_LOG_BYTES } };
+        return { value: fallback, storageBytes: size, contentMode: 'summary', redactions, truncated: { reason: 'single_record_limit', originalBytes, maxBytes: MAX_SINGLE_LOG_BYTES } };
     }
     value.redactions = redactions.length ? redactions : [];
     value.storageBytes = size;
     size = jsonBytes(value);
     value.storageBytes = size;
-    return { value, storageBytes: size, contentMode: full ? 'full' : 'summary', redactions };
+    return { value, storageBytes: size, contentMode: 'summary', redactions };
 }

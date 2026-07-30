@@ -70,27 +70,22 @@ export function detectStructuredOutputIdentity(input: {
 }
 
 export function createStructuredOutputPlan(input: {
-    readonly providerKind: string;
     readonly identity: StructuredOutputIdentity;
     readonly spec: StructuredOutputSpec;
+    readonly capability: {
+        readonly transports: readonly StructuredOutputTransport[];
+        readonly preferred: StructuredOutputTransport;
+    };
     readonly strictSchemaUnavailable?: boolean;
 }): StructuredOutputPlan {
     const strictSchemaCompatible = isStrictJsonSchemaCompatible(input.spec.schema);
-    const tavernSource = String(input.identity.provider || '').trim().toLowerCase();
-    // 酒馆的 Custom 来源只是一个代理配置，并不能证明底层供应商支持
-    // 酒馆的 jsonSchema 参数。模型名同样不足以证明这一点，因此 Custom 一律走
-    // 无聊天上下文的 Schema Prompt 链路，避免角色卡或后端协议干扰结构化结果。
-    const tavernRequiresPromptOnly = input.providerKind === 'tavern'
-        && (tavernSource === 'custom' || input.identity.vendor === 'unknown');
-    const transport: StructuredOutputTransport = input.providerKind === 'tavern'
-        ? (tavernRequiresPromptOnly ? 'prompt_only' : 'tavern_json_schema')
-        : input.identity.vendor === 'deepseek'
-            ? 'json_object'
-            : input.identity.vendor === 'openai'
-                ? (strictSchemaCompatible && !input.strictSchemaUnavailable ? 'json_schema' : 'json_object')
-                : input.identity.vendor === 'gemini' || input.identity.vendor === 'claude'
-                    ? 'json_schema'
-                    : 'prompt_only';
+    const declared = new Set(input.capability.transports);
+    let transport = input.capability.preferred;
+    if (!declared.has(transport)) transport = 'prompt_only';
+    if (transport === 'json_schema' && (!strictSchemaCompatible || input.strictSchemaUnavailable)) {
+        transport = declared.has('json_object') ? 'json_object' : 'prompt_only';
+    }
+    if (!declared.has(transport)) transport = 'prompt_only';
     return {
         identity: input.identity,
         transport,

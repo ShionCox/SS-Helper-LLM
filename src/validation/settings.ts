@@ -1,16 +1,18 @@
+import { createSSHelperError } from '@ss-helper/sdk';
 import type { BudgetConfig } from '../budget/budget-manager';
-import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, PluginAssignment, ResourceConfig, SilentPermissionGrant, TaskAssignment } from '../schema/types';
+import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, PluginAssignment, ResourceConfig, TaskAssignment } from '../schema/types';
 
-const TOP_LEVEL = new Set(['enabled', 'generationSource', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'resultDisplay', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'silentPermissions', 'requestLogging']);
+const TOP_LEVEL = new Set(['enabled', 'generationSource', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'requestLogging']);
 const RESOURCE_KEYS = new Set(['id', 'type', 'source', 'apiType', 'label', 'baseUrl', 'model', 'enabled', 'rerankPath', 'capabilities', 'customParams']);
 const BUDGET_KEYS = new Set(['maxRPM', 'maxTokens', 'maxLatencyMs']);
 const MAX_JSON_BYTES = 256 * 1024;
 const LOG_DETAIL_MODES = ['full', 'failed-full', 'summary', 'off'] as const;
 
-function invalid(message: string, code = 'PAYLOAD_INVALID'): never {
-  const error = new Error(message) as Error & { code?: string };
-  error.code = code;
-  throw error;
+function invalid(message: string): never {
+  throw createSSHelperError('INVALID_PAYLOAD', {
+    stage: 'llm.settings.validate',
+    expected: message.slice(0, 256),
+  });
 }
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -44,7 +46,7 @@ function rejectDeprecated(value: unknown, depth = 0): void {
   if (Array.isArray(value)) { if (value.length > 1_000) invalid('设置数组过长'); value.forEach((item) => rejectDeprecated(item, depth + 1)); return; }
   if (!value || typeof value !== 'object') return;
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    if (key === 'maxCost') invalid('maxCost 已废弃，请使用 Token、延迟和 RPM 限制。', 'LLM_DEPRECATED_MAX_COST');
+    if (key === 'maxCost') invalid('maxCost 已废弃，请使用 Token、延迟和 RPM 限制。');
     rejectDeprecated(nested, depth + 1);
   }
 }
@@ -60,7 +62,12 @@ function validateResource(value: unknown): ResourceConfig {
   let baseUrl: string | undefined;
   if (record.baseUrl !== undefined) {
     baseUrl = string(record.baseUrl, 'resource.baseUrl', 2_048);
-    try { const parsed = new URL(baseUrl); if (parsed.protocol !== 'https:' || parsed.username || parsed.password) invalid('resource.baseUrl 必须使用 HTTPS'); }
+    try {
+      const parsed = new URL(baseUrl);
+      if (!['https:', 'http:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+        invalid('resource.baseUrl 必须是无凭据、查询参数和片段的 HTTP(S) 地址');
+      }
+    }
     catch { invalid('resource.baseUrl 无效'); }
   }
   const capabilities = record.capabilities === undefined ? undefined : (() => {
@@ -160,21 +167,6 @@ function validateMaxTokensControl(value: unknown): GlobalMaxTokensControl {
   };
 }
 
-function validateSilentPermissions(value: unknown): SilentPermissionGrant[] {
-  if (!Array.isArray(value) || value.length > 1_000) invalid('silentPermissions 无效');
-  const ids = new Set<string>();
-  return value.map((item, index) => {
-    const input = object(item, `silentPermissions[${index}]`);
-    for (const key of Object.keys(input)) if (!['pluginId', 'taskKey', 'grantedAt'].includes(key)) invalid(`silentPermissions[${index}].${key} 不受支持`);
-    const pluginId = string(input.pluginId, `silentPermissions[${index}].pluginId`, 128);
-    const taskKey = string(input.taskKey, `silentPermissions[${index}].taskKey`, 256);
-    const id = `${pluginId}::${taskKey}`;
-    if (ids.has(id)) invalid('silentPermissions 组合键必须唯一');
-    ids.add(id);
-    return { pluginId, taskKey, grantedAt: positiveInteger(input.grantedAt, `silentPermissions[${index}].grantedAt`, Number.MAX_SAFE_INTEGER) };
-  });
-}
-
 function validateRequestLogging(value: unknown): LLMRequestLoggingSettings {
   const input = object(value, 'requestLogging');
   for (const key of Object.keys(input)) if (!['enabled', 'detailMode', 'maxEntries', 'retentionDays', 'maxBytes'].includes(key)) invalid(`requestLogging.${key} 不受支持`);
@@ -218,7 +210,6 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
   if (input.timeoutMs !== undefined) result.timeoutMs = positiveInteger(input.timeoutMs, 'timeoutMs', 600_000);
   if (input.maxTokens !== undefined) result.maxTokens = positiveInteger(input.maxTokens, 'maxTokens', 1_000_000);
   if (input.maxTokensMode !== undefined) result.maxTokensMode = enumString(input.maxTokensMode, 'maxTokensMode', ['inherit', 'manual', 'adaptive'] as const);
-  if (input.resultDisplay !== undefined) result.resultDisplay = enumString(input.resultDisplay, 'resultDisplay', ['auto', 'silent', 'compact', 'fullscreen'] as const);
   if (input.globalProfile !== undefined) result.globalProfile = enumString(input.globalProfile, 'globalProfile', ['precise', 'creative', 'balanced', 'economy'] as const);
   if (input.requestLogging !== undefined) result.requestLogging = validateRequestLogging(input.requestLogging);
   if (input.maxTokensControl !== undefined) result.maxTokensControl = validateMaxTokensControl(input.maxTokensControl);
@@ -231,21 +222,5 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
   if (input.pluginAssignments !== undefined) result.pluginAssignments = validatePluginAssignments(input.pluginAssignments);
   if (input.taskAssignments !== undefined) result.taskAssignments = validateTaskAssignments(input.taskAssignments);
   result.budgets = validateBudgetConfigs(input.budgets);
-  if (input.silentPermissions !== undefined) result.silentPermissions = validateSilentPermissions(input.silentPermissions);
   return result;
-}
-
-export function migrateStoredLlmSettings(value: unknown): { settings: LLMHubSettings; migrated: boolean } {
-  const clone = structuredClone(object(value ?? {}, 'settings'));
-  let migrated = false;
-  const clean = (item: unknown): void => {
-    if (Array.isArray(item)) { item.forEach(clean); return; }
-    if (!item || typeof item !== 'object') return;
-    for (const key of Object.keys(item as Record<string, unknown>)) {
-      if (key === 'maxCost' || key === 'detailedLogs') { delete (item as Record<string, unknown>)[key]; migrated = true; }
-      else clean((item as Record<string, unknown>)[key]);
-    }
-  };
-  clean(clone);
-  return { settings: validateLlmSettings(clone), migrated };
 }

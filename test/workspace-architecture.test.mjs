@@ -6,33 +6,128 @@ import {
   LLM_WORKSPACE_ID,
   createProductionLlmServices,
   createProviderFromResource,
+  createWorkspaceLlmSettingsAdapter,
 } from '../dist/index.js';
 
-class MemoryWorkspace {
-  constructor() { this.records = new Map(); this.collections = []; this.version = 1; this.transactionKeys = []; this.failNextTransaction = false; this.failCredentialRead = false; }
-  key(collection, recordId) { return `${collection}:${recordId}`; }
-  async health() { return { ready: true, database: 'ss-helper.sqlite3', schemaVersion: 0 }; }
-  async integrity() { return { ok: true, messages: ['ok'] }; }
-  async open({ workspaceId }) { assert.equal(workspaceId, LLM_WORKSPACE_ID); return { ownerPluginId: 'ss-helper.llm', workspaceId, created: true, version: this.version }; }
-  async defineCollection({ name }) { this.collections.push(name); }
-  async get({ collection = 'default', recordId }) { if (this.failCredentialRead && collection === 'credentials') { const error = new Error('credential read failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = this.records.get(this.key(collection, recordId)); return record ? structuredClone(record) : null; }
-  async upsert({ collection = 'default', recordId, value, expectedVersion, expectedRevision }) {
-    const key = this.key(collection, recordId); const previous = this.records.get(key);
-    const currentRevision = previous?.revision ?? previous?.version ?? 0;
-    if ((expectedRevision ?? expectedVersion) !== undefined && currentRevision !== (expectedRevision ?? expectedVersion)) { const error = new Error('conflict'); error.code = 'WORKSPACE_CONFLICT'; throw error; }
-    const record = { recordId, value: structuredClone(value), version: (previous?.version ?? 0) + 1, revision: currentRevision + 1, updatedAt: Date.now() }; this.records.set(key, record); return structuredClone(record);
-  }
-  async delete({ collection = 'default', recordId, expectedVersion, expectedRevision }) { const key = this.key(collection, recordId); const previous = this.records.get(key); const currentRevision = previous?.revision ?? previous?.version ?? 0; if ((expectedRevision ?? expectedVersion) !== undefined && currentRevision !== (expectedRevision ?? expectedVersion)) { const error = new Error('conflict'); error.code = 'WORKSPACE_CONFLICT'; throw error; } return this.records.delete(key); }
-  async query({ collection = 'default', filter = {}, limit = 1000, cursor }) { const values = [...this.records.entries()].filter(([key, record]) => key.startsWith(`${collection}:`) && Object.entries(filter).every(([field, value]) => record.value?.[field] === value)).map(([, record]) => structuredClone(record)); const offset = cursor ? Number(cursor) : 0; const page = values.slice(offset, offset + limit); return { records: page, nextCursor: offset + page.length < values.length ? String(offset + page.length) : null }; }
-  async transaction({ operations, idempotencyKey }) { this.transactionKeys.push(idempotencyKey); if (this.failNextTransaction) { this.failNextTransaction = false; const error = new Error('injected transaction failure'); error.code = 'WORKSPACE_FAILURE'; throw error; } const snapshot = new Map(this.records); const results = []; try { for (const operation of operations) { if (operation.action === 'upsert') { const record = await this.upsert(operation); results.push({ collection: operation.collection ?? 'default', recordId: record.recordId, action: 'upsert', version: record.version, revision: record.revision }); } else { const removed = await this.delete(operation); results.push({ collection: operation.collection ?? 'default', recordId: operation.recordId, action: 'delete', removed }); } } return { operationCount: results.length, replayed: false, results }; } catch (error) { this.records = snapshot; throw error; } }
-  async clearOwned() { const count = this.records.size; this.records.clear(); return count; }
+function flattenSettingsFields(fields) {
+  return fields.flatMap((field) => field.kind === 'section' ? flattenSettingsFields(field.children) : [field]);
 }
 
+function assertSettingsValuesMatchSchema(values) {
+  const fields = flattenSettingsFields(LLM_SETTINGS_SCHEMA.fields)
+    .filter((field) => field.kind !== 'action' && field.kind !== 'status');
+  assert.deepEqual(Object.keys(values).sort(), fields.map((field) => field.id).sort());
+  for (const field of fields) {
+    const value = values[field.id];
+    if (field.kind === 'toggle' || field.kind === 'checkbox') assert.equal(typeof value, 'boolean', field.id);
+    else if (field.kind === 'select' || field.kind === 'radio') assert.equal(field.options.some((option) => option.value === value), true, field.id);
+    else if (field.kind === 'number' || field.kind === 'range') {
+      assert.equal(typeof value, 'number', field.id);
+      const min = field.kind === 'range' ? field.min : field.validation?.min;
+      const max = field.kind === 'range' ? field.max : field.validation?.max;
+      if (min !== undefined) assert.ok(value >= min, field.id);
+      if (max !== undefined) assert.ok(value <= max, field.id);
+    }
+  }
+}
+
+class MemoryWorkspace {
+  constructor() {
+    this.records = new Map(); this.collections = []; this.version = 1; this.transactionKeys = []; this.failNextTransaction = false;
+    this.admin = {
+      health: async () => ({ ready: true, status: 'ready', database: 'ss-helper.sqlite3', schemaVersion: 0 }),
+      integrity: async () => ({ ok: true, messages: ['ok'] }),
+      reset: async () => { const count = this.records.size; this.records.clear(); return count; },
+    };
+  }
+  key(collection, recordId) { return `${collection}:${recordId}`; }
+  async open({ id, schema }) {
+    assert.equal(id, LLM_WORKSPACE_ID);
+    this.collections.push(...schema.collections.map((item) => item.name));
+    return this;
+  }
+  async get(collection, id) { const record = this.records.get(this.key(collection, id)); return record ? structuredClone(record) : null; }
+  async put({ collection, id, value, expectedRevision }) {
+    const key = this.key(collection, id); const previous = this.records.get(key);
+    const currentRevision = previous?.revision ?? 0;
+    if (expectedRevision !== undefined && currentRevision !== expectedRevision) { const error = new Error('conflict'); error.code = 'WORKSPACE_CONFLICT'; throw error; }
+    const record = { id, value: structuredClone(value), revision: currentRevision + 1, updatedAt: Date.now() }; this.records.set(key, record); return structuredClone(record);
+  }
+  async remove({ collection, id, expectedRevision }) { const key = this.key(collection, id); const previous = this.records.get(key); const currentRevision = previous?.revision ?? 0; if (expectedRevision !== undefined && currentRevision !== expectedRevision) { const error = new Error('conflict'); error.code = 'WORKSPACE_CONFLICT'; throw error; } return this.records.delete(key); }
+  async query(collection, { filter = {}, limit = 1000, cursor } = {}) { const values = [...this.records.entries()].filter(([key, record]) => key.startsWith(`${collection}:`) && Object.entries(filter).every(([field, value]) => record.value?.[field] === value)).map(([, record]) => structuredClone(record)); const offset = cursor ? Number(cursor) : 0; const page = values.slice(offset, offset + limit); return { records: page, nextCursor: offset + page.length < values.length ? String(offset + page.length) : null }; }
+  async commit({ operations, idempotencyKey }) { this.transactionKeys.push(idempotencyKey); if (this.failNextTransaction) { this.failNextTransaction = false; const error = new Error('injected transaction failure'); error.code = 'WORKSPACE_FAILURE'; throw error; } const snapshot = new Map(this.records); const results = []; try { for (const operation of operations) { if (operation.action === 'put') { const record = await this.put(operation); results.push({ collection: operation.collection, id: record.id, action: 'put', revision: record.revision }); } else { const removed = await this.remove(operation); results.push({ collection: operation.collection, id: operation.id, action: 'delete', revision: (snapshot.get(this.key(operation.collection, operation.id))?.revision ?? 0) + (removed ? 1 : 0), removed }); } } return { requestId: idempotencyKey, replayed: false, results }; } catch (error) { this.records = snapshot; throw error; } }
+}
+
+test('repository retries a failed first initialization and broadcasts one authoritative snapshot after recovery', async () => {
+  class RetryWorkspace extends MemoryWorkspace {
+    constructor() { super(); this.openAttempts = 0; this.lifecycle = []; }
+    async open(input) {
+      this.openAttempts += 1;
+      this.lifecycle.push(`open:${this.openAttempts}`);
+      if (this.openAttempts === 1) { const error = new Error('bridge warming'); error.code = 'HOST_NOT_READY'; throw error; }
+      const result = await super.open(input);
+      input.schema.collections.forEach((item) => this.lifecycle.push(`define:${item.name}`));
+      return result;
+    }
+    async get(collection, id) { this.lifecycle.push(`get:${collection}:${id}`); return super.get(collection, id); }
+  }
+
+  const workspace = new RetryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await assert.rejects(repository.ready(), { code: 'HOST_NOT_READY' });
+  const snapshots = [];
+  const unsubscribe = repository.subscribeSettings((settings) => snapshots.push(settings));
+  await repository.ready();
+  await Promise.resolve();
+
+  assert.equal(workspace.openAttempts, 2);
+  assert.equal(snapshots.length, 1);
+  assert.equal(snapshots[0].globalProfile, 'balanced');
+  assert.ok(workspace.lifecycle.indexOf('define:settings') < workspace.lifecycle.indexOf('get:settings:global'), 'settings must not be read before its collection exists');
+  unsubscribe();
+});
+
+test('settings adapter exposes only schema fields and preserves popup-managed configuration on save', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.saveSettings({
+    ...(await repository.loadSettings()),
+    resources: [{ id: 'embed-main', type: 'embedding', source: 'custom', apiType: 'openai', label: 'Embedding', enabled: true }],
+    globalAssignments: { embedding: { resourceId: 'embed-main' } },
+  });
+  const statusSource = {
+    async loadStatus() { return {}; },
+    subscribeStatus() { return () => {}; },
+    async refreshNow() {},
+  };
+  const adapter = createWorkspaceLlmSettingsAdapter(repository, statusSource);
+  const loaded = await adapter.load();
+  assertSettingsValuesMatchSchema(loaded);
+  assert.equal(Object.hasOwn(loaded, 'resources'), false);
+  assert.equal(Object.hasOwn(loaded, 'requestLogging'), false);
+
+  const snapshots = [];
+  const unsubscribe = adapter.subscribe((values) => snapshots.push(values));
+  await Promise.resolve();
+  assertSettingsValuesMatchSchema(snapshots.at(-1));
+
+  await adapter.save({ ...loaded, globalProfile: 'precise', 'requestLogging.maxBytesMb': 64 });
+  const stored = await repository.loadSettings();
+  assert.equal(stored.globalProfile, 'precise');
+  assert.equal(stored.requestLogging.maxBytes, 64 * 1024 * 1024);
+  assert.equal(stored.resources[0].id, 'embed-main');
+  assert.equal(stored.globalAssignments.embedding.resourceId, 'embed-main');
+
+  const reset = await adapter.reset();
+  assertSettingsValuesMatchSchema(reset);
+  unsubscribe();
+});
+
 class MemorySecrets {
-  constructor() { this.records = new Map(); this.failRead = false; }
-  async set({ secretId, value, metadata }) { const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 0 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
+  constructor() { this.records = new Map(); this.failRead = false; this.failNextDelete = false; this.returnFalseNextDelete = false; this.failNextSet = false; }
+  async set({ secretId, value, metadata }) { if (this.failNextSet) { this.failNextSet = false; const error = new Error('secret write failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 0 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
   async get({ secretId }) { if (this.failRead) { const error = new Error('secret read failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = this.records.get(secretId); return record ? structuredClone(record) : null; }
-  async delete({ secretId }) { return this.records.delete(secretId); }
+  async delete({ secretId }) { if (this.failNextDelete) { this.failNextDelete = false; const error = new Error('secret delete failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } if (this.returnFalseNextDelete) { this.returnFalseNextDelete = false; return false; } return this.records.delete(secretId); }
   async list() { return [...this.records.values()].map(({ value, ...record }) => structuredClone(record)); }
 }
 
@@ -47,7 +142,7 @@ test('settings schema exposes five progressive pages and generic popup actions',
     start: ['服务状态', '生成偏好', '请求与展示'],
     resources: ['资源管理', '能力测试'],
     routing: ['路由配置', '高级配置'],
-    runtime: ['额度与任务', '权限与展示'],
+    runtime: ['额度与任务'],
     diagnostics: ['检查与日志', '日志记录策略', '数据管理', '关于'],
   });
   assert.ok(allFields.some((field) => field.id === 'globalProfile'));
@@ -73,25 +168,23 @@ test('settings schema exposes five progressive pages and generic popup actions',
     advanced: ['routing', 'open-advanced', 'advanced-routing', '编辑'],
     budgetManager: ['runtime', 'open-budget-manager', 'budget-manager', '配置'],
     queueManager: ['runtime', 'open-queue-manager', 'queue-manager', '查看'],
-    permissionManager: ['runtime', 'open-permission-manager', 'permission-manager', '配置'],
-    displayRules: ['runtime', 'open-display-rules', 'display-rules', '配置'],
     serviceDiagnostics: ['diagnostics', 'open-diagnostics', 'diagnostics', '运行检查'],
     requestLogs: ['diagnostics', 'open-request-logs', 'request-logs', '查看'],
     backup: ['diagnostics', 'open-backup', 'backup', '管理'],
     reset: ['diagnostics', 'reset-llm', 'reset-confirm', '重置'],
   };
-  assert.equal(actions.length, 14);
+  assert.equal(actions.length, 12);
   assert.deepEqual(Object.fromEntries(actions.map((field) => [field.id, [field.tabId, field.actionId, field.popup?.name, field.buttonLabel]])), expectedActions);
   assert.ok(actions.every((field) => field.placement === 'inline'));
   assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
 });
 
-test('LLM browser repository stores complete sanitized logs and excludes credentials', async () => {
+test('LLM browser repository stores strict allowlisted logs and excludes prompts, responses and credentials', async () => {
   const workspace = new MemoryWorkspace();
   const secrets = new MemorySecrets();
   const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.ready();
-  const expectedDefaults = { enabled: true, generationSource: 'tavern', globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000, resultDisplay: 'auto' };
+  const expectedDefaults = { enabled: true, generationSource: 'tavern', globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
   const initialSettings = await repository.loadSettings();
   assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
@@ -106,17 +199,25 @@ test('LLM browser repository stores complete sanitized logs and excludes credent
   assert.equal(secrets.records.get('resource:resource-test')?.value, 'secret-value');
   assert.equal(await repository.hasResourceSecret('resource-test'), true);
   assert.equal(await repository.getResourceSecret('resource-test'), 'secret-value');
-  await repository.saveLog({ request: { taskKind: 'generation', taskDescription: 'visible prompt', metrics: { total: 1 }, body: 'must persist', headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
+  await repository.saveLog({ logId: 'fixture-log', requestId: 'fixture-request', attemptId: 'fixture-attempt', request: { taskKind: 'generation', schemaHash: 'fnv1a32:1234abcd', taskDescription: 'visible prompt', metrics: { total: 1 }, body: 'must persist', headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
   const logs = await repository.queryLogs({ sourcePluginId: 'fixture' });
   assert.equal(logs.length, 1);
-  assert.equal(logs[0].contentMode, 'full');
-  assert.equal(logs[0].request.body, 'must persist');
-  assert.equal(logs[0].request.taskDescription, 'visible prompt');
-  assert.equal(logs[0].response.body, 'visible response');
-  assert.equal(logs[0].request.headers, '[已脱敏]');
-  assert.equal(JSON.stringify(logs[0]).includes('secret-value'), false);
-  await assert.rejects(repository.saveSettings({ budgets: { fixture: { maxCost: 1 } } }), { code: 'LLM_DEPRECATED_MAX_COST' });
-  await assert.rejects(repository.saveSettings({ resources: [{ id: 'http', type: 'generation', source: 'custom', apiType: 'openai', label: 'HTTP', baseUrl: 'http://provider.example', enabled: false }] }), { code: 'PAYLOAD_INVALID' });
+  assert.equal(logs[0].contentMode, 'summary');
+  assert.equal(logs[0].logFormatVersion, 3);
+  assert.equal(logs[0].request.schemaHash, 'fnv1a32:1234abcd');
+  const persistedLog = JSON.stringify(logs[0]);
+  assert.equal(persistedLog.includes('must persist'), false);
+  assert.equal(persistedLog.includes('visible prompt'), false);
+  assert.equal(persistedLog.includes('visible response'), false);
+  assert.equal(persistedLog.includes('secret-value'), false);
+  await assert.rejects(
+    repository.saveSettings({ budgets: { fixture: { maxCost: 1 } } }),
+    (error) => error?.code === 'INVALID_PAYLOAD'
+      && error?.details?.reasonCode === 'INVALID_PAYLOAD'
+      && error?.details?.stage === 'llm.settings.validate',
+  );
+  await repository.saveSettings({ resources: [{ id: 'http', type: 'generation', source: 'custom', apiType: 'openai', label: 'HTTP', baseUrl: 'http://provider.example', enabled: false }] });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'unsafe-url', type: 'generation', source: 'custom', apiType: 'openai', label: 'Unsafe', baseUrl: 'https://user:pass@provider.example/v1?token=secret', enabled: false }] }), { code: 'INVALID_PAYLOAD' });
   assert.equal((await repository.listSecrets()).length, 1);
   await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom' });
   const exported = await repository.exportConfig();
@@ -132,51 +233,34 @@ test('LLM browser repository stores complete sanitized logs and excludes credent
   assert.equal((await repository.loadSettings()).globalProfile, 'precise');
 });
 
-test('legacy plaintext credentials migrate only after encrypted verification and retry safely', async () => {
+test('resource health is strictly validated, persisted independently, and can commit atomically with settings', async () => {
   const workspace = new MemoryWorkspace();
-  const secrets = new MemorySecrets();
-  workspace.records.set('credentials:resource:legacy', {
-    recordId: 'resource:legacy',
-    value: { resourceId: 'legacy', apiKey: 'legacy-secret' },
-    version: 1,
-    revision: 1,
-    updatedAt: Date.now(),
-  });
-  const repository = new LlmWorkspaceRepository(workspace, secrets);
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.ready();
-  assert.equal(await repository.getResourceSecret('legacy'), 'legacy-secret');
-  assert.equal(workspace.records.has('credentials:resource:legacy'), false);
+  assert.ok(workspace.collections.includes('resource-health'));
+  const success = { resourceId: 'resource-health-a', state: 'success', checkedAt: 1_700_000_000_000, durationMs: 321 };
+  await repository.saveResourceHealth(success);
+  assert.deepEqual(await repository.listResourceHealth(), [success]);
+  await assert.rejects(repository.saveResourceHealth({ ...success, state: 'failed', reasonCode: 'private response' }), { code: 'INVALID_PAYLOAD' });
 
-  await secrets.set({ workspaceId: LLM_WORKSPACE_ID, secretId: 'resource:preferred', value: 'encrypted-key', metadata: {} });
-  workspace.records.set('credentials:resource:preferred', {
-    recordId: 'resource:preferred',
-    value: { resourceId: 'preferred', apiKey: 'old-plaintext-key' },
-    version: 1,
-    revision: 1,
-    updatedAt: Date.now(),
-  });
-  const preferEncrypted = new LlmWorkspaceRepository(workspace, secrets);
-  await preferEncrypted.ready();
-  assert.equal(await preferEncrypted.getResourceSecret('preferred'), 'encrypted-key');
-  assert.equal(workspace.records.has('credentials:resource:preferred'), false);
+  const settings = await repository.loadSettings();
+  const failed = {
+    resourceId: 'resource-health-b',
+    state: 'failed',
+    checkedAt: 1_700_000_000_100,
+    durationMs: 654,
+    failure: { reasonCode: 'AUTH_FAILED', stage: 'llm.resource.test', resourceId: 'resource-health-b' },
+  };
+  await repository.saveSettings({ ...settings, globalProfile: 'precise' }, { resourceHealth: failed });
+  assert.equal((await repository.loadSettings()).globalProfile, 'precise');
+  assert.deepEqual((await repository.listResourceHealth()).find((record) => record.resourceId === failed.resourceId), failed);
 
-  const retryWorkspace = new MemoryWorkspace();
-  retryWorkspace.records.set('credentials:resource:retry', {
-    recordId: 'resource:retry',
-    value: { resourceId: 'retry', apiKey: 'retry-secret' },
-    version: 1,
-    revision: 1,
-    updatedAt: Date.now(),
-  });
-  const retrySecrets = new MemorySecrets();
-  retrySecrets.failRead = true;
-  const retry = new LlmWorkspaceRepository(retryWorkspace, retrySecrets);
-  await retry.ready();
-  await assert.rejects(retry.getResourceSecret('retry'), { code: 'LLM_SECRET_MIGRATION_FAILED' });
-  assert.equal(retryWorkspace.records.has('credentials:resource:retry'), true, 'failed migration must retain the original record');
-  retrySecrets.failRead = false;
-  assert.equal(await retry.getResourceSecret('retry'), 'retry-secret');
-  assert.equal(retryWorkspace.records.has('credentials:resource:retry'), false);
+  workspace.failNextTransaction = true;
+  await assert.rejects(repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'economy' }, {
+    resourceHealth: { resourceId: failed.resourceId, state: 'success', checkedAt: failed.checkedAt + 1, durationMs: 1 },
+  }), { code: 'WORKSPACE_FAILURE' });
+  assert.equal((await repository.loadSettings()).globalProfile, 'precise');
+  assert.equal((await repository.listResourceHealth()).find((record) => record.resourceId === failed.resourceId).state, 'failed');
 });
 
 test('provider factory covers direct browser generation and rerank resources', () => {
@@ -204,6 +288,58 @@ test('request log policy supports summary mode and prunes by count', async () =>
   assert.equal(stats.policy.maxEntries, 2);
 });
 
+test('request log reason filtering is applied before limit and offset', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.ready();
+  for (let index = 0; index < 120; index += 1) {
+    const reasonCode = index >= 110 ? 'AUTH_FAILED' : 'RATE_LIMITED';
+    workspace.records.set(`request-logs:filter-${index}`, {
+      id: `filter-${index}`,
+      value: {
+        logId: `filter-${index}`,
+        createdAt: index,
+        response: { failure: { reasonCode } },
+      },
+      revision: 1,
+      updatedAt: index,
+    });
+  }
+  const logs = await repository.queryLogs({ reasonCode: 'AUTH_FAILED', limit: 3, offset: 2 });
+  assert.equal(logs.length, 3);
+  assert.ok(logs.every((row) => row.response.failure.reasonCode === 'AUTH_FAILED'));
+});
+
+test('legacy request logs are rewritten once to the strict v3 allowlist', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.ready();
+  await workspace.put({
+    collection: 'request-logs',
+    id: 'legacy-log',
+    value: {
+      logId: 'legacy-log',
+      requestId: 'legacy-request',
+      attemptId: 'legacy-attempt',
+      sourcePluginId: 'fixture',
+      state: 'completed',
+      taskKind: 'generation',
+      request: { taskKind: 'generation', generationInput: { messages: [{ content: 'PROMPT_SENTINEL' }] } },
+      response: { rawResponseText: 'MODEL_SENTINEL', providerResponse: { content: 'PROVIDER_SENTINEL' } },
+      logFormatVersion: 2,
+      createdAt: 1,
+    },
+  });
+  assert.equal(await repository.sanitizeStoredLogs(), 1);
+  assert.equal(await repository.sanitizeStoredLogs(), 0);
+  const [log] = await repository.queryLogs({ sourcePluginId: 'fixture' });
+  const serialized = JSON.stringify(log);
+  assert.equal(log.logFormatVersion, 3);
+  assert.equal(serialized.includes('PROMPT_SENTINEL'), false);
+  assert.equal(serialized.includes('MODEL_SENTINEL'), false);
+  assert.equal(serialized.includes('PROVIDER_SENTINEL'), false);
+});
+
 test('Workspace mutations use unique idempotency keys even when the clock is frozen', async () => {
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
@@ -221,11 +357,11 @@ test('Workspace mutations use unique idempotency keys even when the clock is fro
 
 test('settings validation rejects coercion and malformed nested routing values', async () => {
   const repository = new LlmWorkspaceRepository(new MemoryWorkspace(), new MemorySecrets());
-  await assert.rejects(repository.saveSettings({ enabled: 'false' }), { code: 'PAYLOAD_INVALID' });
-  await assert.rejects(repository.saveSettings({ globalProfile: 'unknown' }), { code: 'PAYLOAD_INVALID' });
-  await assert.rejects(repository.saveSettings({ generationSource: 'automatic' }), { code: 'PAYLOAD_INVALID' });
-  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad', type: 'generation', source: 'custom', label: 'Bad', enabled: 'false' }] }), { code: 'PAYLOAD_INVALID' });
-  await assert.rejects(repository.saveSettings({ globalAssignments: { generation: { resourceId: 42 } } }), { code: 'PAYLOAD_INVALID' });
+  await assert.rejects(repository.saveSettings({ enabled: 'false' }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ globalProfile: 'unknown' }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ generationSource: 'automatic' }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad', type: 'generation', source: 'custom', label: 'Bad', enabled: 'false' }] }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ globalAssignments: { generation: { resourceId: 42 } } }), { code: 'INVALID_PAYLOAD' });
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
 });
 
@@ -233,28 +369,104 @@ test('clearLogs paginates beyond one thousand records and can resume after a fai
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.ready();
-  for (let index = 0; index < 2_501; index += 1) workspace.records.set(`request-logs:seed-${index}`, { recordId: `seed-${index}`, value: { state: 'completed' }, version: 1, revision: 1, updatedAt: index });
+  for (let index = 0; index < 2_501; index += 1) workspace.records.set(`request-logs:seed-${index}`, { id: `seed-${index}`, value: { state: 'completed' }, revision: 1, updatedAt: index });
   assert.equal(await repository.clearLogs(), 2_501);
   assert.equal((await repository.queryLogs({ limit: 500 })).length, 0);
-  for (let index = 0; index < 3; index += 1) workspace.records.set(`request-logs:retry-${index}`, { recordId: `retry-${index}`, value: { state: 'failed' }, version: 1, revision: 1, updatedAt: index });
+  for (let index = 0; index < 3; index += 1) workspace.records.set(`request-logs:retry-${index}`, { id: `retry-${index}`, value: { state: 'failed' }, revision: 1, updatedAt: index });
   workspace.failNextTransaction = true;
-  await assert.rejects(repository.clearLogs(), { code: 'LLM_LOG_CLEAR_PARTIAL' });
+  await assert.rejects(
+    repository.clearLogs(),
+    (error) => error?.code === 'INTERNAL' && error?.details?.reasonCode === 'INTERNAL_ERROR',
+  );
   assert.equal(await repository.clearLogs(), 3);
 });
 
 test('config import is atomic and resource deletion removes its credential in one transaction', async () => {
   const workspace = new MemoryWorkspace();
-  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  const secrets = new MemorySecrets();
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', apiType: 'auto', label: 'A', enabled: false }] });
   await repository.setResourceSecret('resource-a', 'secret-value');
+  await repository.saveResourceHealth({
+    resourceId: 'resource-a',
+    state: 'failed',
+    checkedAt: 1_700_000_000_000,
+    durationMs: 50,
+    failure: { reasonCode: 'AUTH_FAILED', stage: 'llm.resource.test', resourceId: 'resource-a' },
+  });
   const exported = await repository.exportConfig();
   workspace.failNextTransaction = true;
   await assert.rejects(repository.importConfig(exported.archive, exported.sha256), { code: 'WORKSPACE_FAILURE' });
   assert.equal(await repository.getResourceSecret('resource-a'), 'secret-value');
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
+  workspace.failNextTransaction = true;
+  await assert.rejects(repository.deleteResource('resource-a'), { code: 'WORKSPACE_FAILURE' });
+  assert.equal(await repository.getResourceSecret('resource-a'), 'secret-value');
+  assert.equal((await repository.loadSettings()).resources?.some((resource) => resource.id === 'resource-a'), true);
+  assert.equal((await repository.listResourceHealth()).some((record) => record.resourceId === 'resource-a'), true);
+  secrets.failNextDelete = true;
+  await assert.rejects(repository.deleteResource('resource-a'), { code: 'WORKSPACE_FAILURE' });
+  assert.equal(await repository.getResourceSecret('resource-a'), 'secret-value');
+  assert.equal((await repository.loadSettings()).resources?.some((resource) => resource.id === 'resource-a'), true);
+  assert.equal((await repository.listResourceHealth()).some((record) => record.resourceId === 'resource-a'), true);
+  secrets.returnFalseNextDelete = true;
+  await assert.rejects(
+    repository.deleteResource('resource-a'),
+    (error) => error?.code === 'CORE_UNAVAILABLE'
+      && error?.details?.reasonCode === 'WORKSPACE_SECRET_UNAVAILABLE'
+      && error?.details?.stage === 'llm.resource.delete.secret',
+  );
+  assert.equal(await repository.getResourceSecret('resource-a'), 'secret-value');
+  assert.equal((await repository.loadSettings()).resources?.some((resource) => resource.id === 'resource-a'), true);
+  assert.equal((await repository.listResourceHealth()).some((record) => record.resourceId === 'resource-a'), true);
   await repository.deleteResource('resource-a');
   assert.equal(await repository.getResourceSecret('resource-a'), null);
   assert.equal((await repository.loadSettings()).resources?.some((resource) => resource.id === 'resource-a'), false);
+  assert.equal((await repository.listResourceHealth()).some((record) => record.resourceId === 'resource-a'), false);
+});
+
+test('resource deletion restores the credential when the Workspace commit fails after secret deletion', async () => {
+  const workspace = new MemoryWorkspace();
+  const secrets = new MemorySecrets();
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
+  await repository.saveSettings({
+    enabled: true,
+    resources: [{ id: 'resource-compensated', type: 'generation', source: 'custom', apiType: 'openai', label: 'Compensated', enabled: false }],
+  });
+  await repository.setResourceSecret('resource-compensated', 'secret-value', { label: 'Compensated' });
+  workspace.failNextTransaction = true;
+
+  await assert.rejects(repository.deleteResource('resource-compensated'), { code: 'WORKSPACE_FAILURE' });
+  assert.equal(await repository.getResourceSecret('resource-compensated'), 'secret-value');
+  assert.deepEqual(secrets.records.get('resource:resource-compensated')?.metadata, { label: 'Compensated' });
+  assert.equal((await repository.loadSettings()).resources?.some((resource) => resource.id === 'resource-compensated'), true);
+});
+
+test('bulk secret removal restores earlier keys and leaves Workspace settings unchanged when a later delete returns false', async () => {
+  const workspace = new MemoryWorkspace();
+  const secrets = new MemorySecrets();
+  const repository = new LlmWorkspaceRepository(workspace, secrets);
+  await repository.saveSettings({ enabled: true, globalProfile: 'precise' });
+  await repository.setResourceSecret('resource-a', 'secret-a', { label: 'A' });
+  await repository.setResourceSecret('resource-b', 'secret-b', { label: 'B' });
+  const originalDelete = secrets.delete.bind(secrets);
+  let deleteCount = 0;
+  secrets.delete = async (input) => {
+    deleteCount += 1;
+    if (deleteCount === 2) return false;
+    return originalDelete(input);
+  };
+
+  await assert.rejects(
+    repository.reset(),
+    (error) => error?.code === 'CORE_UNAVAILABLE'
+      && error?.details?.reasonCode === 'WORKSPACE_SECRET_UNAVAILABLE'
+      && error?.details?.stage === 'llm.settings.reset.secret',
+  );
+  assert.equal((await repository.loadSettings()).globalProfile, 'precise');
+  assert.equal(await repository.getResourceSecret('resource-a'), 'secret-a');
+  assert.equal(await repository.getResourceSecret('resource-b'), 'secret-b');
+  assert.deepEqual(secrets.records.get('resource:resource-a')?.metadata, { label: 'A' });
 });
 
 test('runtime preparation failure leaves persisted settings and the active runtime unchanged', async () => {
@@ -272,7 +484,10 @@ test('runtime preparation failure leaves persisted settings and the active runti
   await repository.saveSettings({ enabled: true, globalProfile: 'balanced', resources: [resource], globalAssignments: { generation: { resourceId: resource.id } } });
   await repository.setResourceSecret(resource.id, 'runtime-secret');
   secrets.failRead = true;
-  await assert.rejects(repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'economy' }), { code: 'LLM_RUNTIME_APPLY_FAILED' });
+  await assert.rejects(
+    repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'economy' }),
+    (error) => error?.code === 'INTERNAL' && error?.details?.reasonCode === 'INTERNAL_ERROR',
+  );
   secrets.failRead = false;
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
   handlers.dispose?.();
@@ -346,7 +561,7 @@ test('event listener failures cannot turn an applied generation source change in
       events: { subscribe() { return () => {}; } },
     },
     events: {
-      publish() { throw Object.assign(new Error('An event listener failed'), { code: 'PAYLOAD_INVALID' }); },
+      publish() { throw Object.assign(new Error('An event listener failed'), { code: 'INVALID_PAYLOAD' }); },
       subscribe() { return () => {}; },
     },
   };
@@ -417,7 +632,12 @@ test('Provider HTTP failures expose a safe code without returning response bodie
   globalThis.fetch = async () => new Response('provider-secret-error-body', { status: 500 });
   try {
     const provider = createProviderFromResource({ id: 'openai', type: 'generation', source: 'custom', apiType: 'openai', label: 'OpenAI', baseUrl: 'https://provider.example/v1', model: 'gpt' }, 'secret-value');
-    await assert.rejects(provider.request({ messages: [{ role: 'user', content: 'hello' }] }), (error) => error?.code === 'LLM_PROVIDER_HTTP_ERROR' && !String(error).includes('provider-secret-error-body'));
+    await assert.rejects(
+      provider.request({ messages: [{ role: 'user', content: 'hello' }] }),
+      (error) => error?.code === 'CORE_UNAVAILABLE'
+        && error?.details?.reasonCode === 'PROVIDER_UNAVAILABLE'
+        && !String(error).includes('provider-secret-error-body'),
+    );
     provider.dispose?.();
   } finally {
     globalThis.fetch = originalFetch;

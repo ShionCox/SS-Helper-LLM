@@ -9,7 +9,7 @@
  * 注册接口是同步命令式；内部持久化、广播、异步落盘由注册中心自己排程处理。
  */
 
-import { logger } from '../runtime/logger';
+import { logger, safeFailureLogDetail } from '../runtime/logger';
 import type {
     ConsumerRegistration,
     ConsumerPersistentSnapshot,
@@ -19,7 +19,6 @@ import type {
     TaskDescriptor,
     RouteBinding,
     LLMCapability,
-    CapabilityKind,
 } from '../schema/types';
 
 
@@ -116,8 +115,6 @@ export class ConsumerRegistry {
         this.sessions.set(pluginId, {
             online: true,
             seenAt: Date.now(),
-            currentQueueState: { pendingCount: 0 },
-            currentOverlayState: {},
         });
 
         // 更新失效绑定
@@ -207,22 +204,6 @@ export class ConsumerRegistry {
         }
     }
 
-    /** 更新队列状态 */
-    updateQueueState(pluginId: string, state: ConsumerSessionSnapshot['currentQueueState']): void {
-        const session = this.sessions.get(pluginId);
-        if (session) {
-            session.currentQueueState = state;
-        }
-    }
-
-    /** 更新展示状态 */
-    updateOverlayState(pluginId: string, state: ConsumerSessionSnapshot['currentOverlayState']): void {
-        const session = this.sessions.get(pluginId);
-        if (session) {
-            session.currentOverlayState = state;
-        }
-    }
-
     // ─── 失效检测 ───
 
     /** 全局失效扫描（可定期调用） */
@@ -275,8 +256,6 @@ export class ConsumerRegistry {
         return {
             online: false,
             seenAt: 0,
-            currentQueueState: { pendingCount: 0 },
-            currentOverlayState: {},
         };
     }
 
@@ -290,7 +269,10 @@ export class ConsumerRegistry {
             try {
                 listener();
             } catch (error) {
-                logger.warn('通知 consumer 注册表监听器失败。', error);
+                logger.warn('通知 consumer 注册表监听器失败。', safeFailureLogDetail(error, {
+                    reasonCode: 'INTERNAL_ERROR',
+                    stage: 'llm.registry.listener',
+                }));
             }
         });
     }

@@ -7,7 +7,7 @@ import type {
     ProviderConnectionResult,
     ProviderModelListResult,
 } from './types';
-import { providerHttpError, providerProtocolError } from './provider-errors';
+import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure, providerProtocolError } from './provider-errors';
 
 /**
  * 独立自定义重排 Provider
@@ -18,7 +18,14 @@ import { providerHttpError, providerProtocolError } from './provider-errors';
 export class CustomRerankProvider implements LLMProvider {
     id: string;
     kind: 'custom' = 'custom';
-    capabilities = { chat: false, json: false, tools: false, embeddings: false, rerank: true };
+    capabilities = {
+        chat: false,
+        json: false,
+        tools: false,
+        embeddings: false,
+        rerank: true,
+        structuredOutput: { transports: ['prompt_only'] as const, preferred: 'prompt_only' as const },
+    };
 
     private apiKey: string;
     private baseUrl: string;
@@ -203,10 +210,10 @@ export class CustomRerankProvider implements LLMProvider {
                 });
 
                 if (!response.ok) {
-                    await response.text().catch(() => undefined);
                     if (response.status === 401 || response.status === 403) {
-                        throw providerHttpError('Rerank', response.status);
+                        throw await providerHttpErrorFromResponse('Rerank', response);
                     }
+                    await response.text().catch(() => undefined);
                     continue;
                 }
 
@@ -229,7 +236,7 @@ export class CustomRerankProvider implements LLMProvider {
         return this.executeCompatibleRerank(req);
     }
 
-    async testConnection(): Promise<ProviderConnectionResult> {
+    async testConnection(signal?: AbortSignal): Promise<ProviderConnectionResult> {
         const start = Date.now();
         try {
             await this.executeCompatibleRerank({
@@ -237,33 +244,35 @@ export class CustomRerankProvider implements LLMProvider {
                 query: 'test',
                 docs: ['hello', 'world'],
                 topK: 1,
+                signal,
             });
             const latencyMs = Date.now() - start;
 
             return { ok: true, message: '重排服务连接成功', model: this.model, latencyMs };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            const authMatched = /401|403|AUTH/i.test(msg);
-            return {
-                ok: false,
-                message: authMatched ? '连接失败（鉴权异常）' : `连接失败: ${msg}`,
-                errorCode: authMatched ? 'AUTH_ERROR' : 'NETWORK_ERROR',
-                detail: msg,
-                latencyMs: Date.now() - start,
-            };
+            return providerConnectionFailure(error, {
+                stage: 'llm.provider.test',
+                providerKind: this.kind,
+                resourceId: this.id,
+                model: this.model,
+            }, Date.now() - start);
         }
     }
 
-    async listModels(): Promise<ProviderModelListResult> {
+    async listModels(signal?: AbortSignal): Promise<ProviderModelListResult> {
         try {
             const res = await this.fetchImpl(`${this.getModelListBaseUrl()}/models`, {
                 method: 'GET',
                 headers: { 'Authorization': `Bearer ${this.apiKey}` },
+                signal,
             });
 
             if (!res.ok) {
-                const text = await res.text().catch(() => '');
-                return { ok: false, models: [], message: `获取模型列表失败 (${res.status})`, detail: text };
+                return providerModelListFailure(await providerHttpErrorFromResponse(this.kind, res), {
+                    stage: 'llm.provider.models',
+                    providerKind: this.kind,
+                    resourceId: this.id,
+                });
             }
 
             const json = await res.json();
@@ -282,8 +291,11 @@ export class CustomRerankProvider implements LLMProvider {
 
             return { ok: true, models, message: `共 ${models.length} 个模型` };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            return { ok: false, models: [], message: `网络错误: ${msg}`, errorCode: 'NETWORK_ERROR', detail: msg };
+            return providerModelListFailure(error, {
+                stage: 'llm.provider.models',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
         }
     }
 }

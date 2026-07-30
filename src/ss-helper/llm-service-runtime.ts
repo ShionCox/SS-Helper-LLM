@@ -1,6 +1,5 @@
-import { LLM_CAPABILITY_STATUS_CHANGED_V0, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
+import { LLM_CAPABILITY_STATUS_CHANGED_V0, createSSHelperError, readSSHelperFailure, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
 import { BudgetManager } from '../budget/budget-manager';
-import { DisplayController } from '../display/display-controller';
 import { RequestLogService } from '../log/requestLogService';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
 import { ClaudeProvider } from '../providers/claude-provider';
@@ -18,6 +17,8 @@ import type { LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from
 import { createLlmSdkServiceHandlers, publishRouteChanged, type LlmServiceHandlers } from './services';
 import { LlmWorkspaceRepository, type PreparedSettingsRuntime, type SettingsRuntimePrepareOptions } from '../storage/llm-workspace-repository';
 import { validateLlmSettings } from '../validation/settings';
+import { logger, safeFailureLogDetail } from '../runtime/logger';
+import { createCoreBridgeFetch } from './core-bridge-fetch';
 
 export interface ProductionLlmProviderRegistration {
     readonly provider: LLMProvider;
@@ -32,12 +33,12 @@ export interface ProductionLlmServiceOptions {
     readonly repository?: LlmWorkspaceRepository;
 }
 
-export function createProviderFromResource(resource: ResourceConfig, apiKey: string): LLMProvider {
-    const identity = resource.apiType === 'generic'
+export function createProviderFromResource(resource: ResourceConfig, apiKey: string, fetchImpl: typeof fetch = fetch): LLMProvider {
+    const resolvedApiType = resource.apiType === 'auto' ? 'generic' : resource.apiType;
+    const identity = resolvedApiType === 'generic'
         ? { vendor: 'unknown' as const, evidence: 'manual' as const, confidence: 'high' as const, ...(resource.model ? { model: resource.model } : {}) }
-        : detectStructuredOutputIdentity({ manualVendor: resource.apiType, baseUrl: resource.baseUrl, model: resource.model });
-    const resolvedApiType = identity.vendor === 'unknown' ? 'generic' : identity.vendor;
-    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl: fetch };
+        : detectStructuredOutputIdentity({ manualVendor: resolvedApiType, model: resource.model });
+    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl };
     if (resource.type === 'rerank') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath });
     if (resolvedApiType === 'claude') return new ClaudeProvider(base);
     if (resolvedApiType === 'gemini') return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
@@ -45,14 +46,16 @@ export function createProviderFromResource(resource: ResourceConfig, apiKey: str
 }
 
 export function createProductionLlmServices(
-    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
+    session: PluginSession<'tavern.generation.read' | 'tavern.generation.execute' | 'tavern.chat.events' | 'tavern.plugin.request' | 'core.ui.notification.v0' | 'secrets.read' | 'secrets.write'>,
     options: ProductionLlmServiceOptions = {},
 ): LlmServiceHandlers {
     const router = new TaskRouter();
     const registry = new ConsumerRegistry();
     const budget = new BudgetManager();
-    const display = new DisplayController();
     const repository = options.repository;
+    const bridgeFetch = session.host.has('tavern.plugin.request')
+        ? createCoreBridgeFetch((request, requestOptions) => session.host.request.send(request, requestOptions))
+        : fetch;
     const initialSettings = options.settings?.() ?? {};
     const settingsState: { value: LLMHubSettings } = { value: { ...DEFAULT_LLM_SETTINGS, ...initialSettings, maxTokensControl: initialSettings.maxTokensControl ?? { mode: 'adaptive' } } };
     router.setRegistry(registry);
@@ -64,7 +67,7 @@ export function createProductionLlmServices(
     const notifyCapabilityChange = (kinds: readonly LlmCapabilityKind[]): void => {
         statusRevision += 1;
         try {
-            session.events.publish(LLM_CAPABILITY_STATUS_CHANGED_V0, { revision: statusRevision, kinds: [...new Set(kinds)] });
+            session.bus.publish(LLM_CAPABILITY_STATUS_CHANGED_V0, { revision: statusRevision, kinds: [...new Set(kinds)] });
         } catch {
             // Event delivery is best effort and must not turn an applied runtime update into a failed save.
         }
@@ -74,7 +77,13 @@ export function createProductionLlmServices(
         managed.add(registration.provider.id);
     }
 
-    const sdk = new LLMSDKImpl(router, budget, new RequestOrchestrator(), display, registry, new RequestLogService(repository));
+    const sdk = new LLMSDKImpl(router, budget, new RequestOrchestrator(), registry, new RequestLogService(repository));
+    if (repository) {
+        void repository.sanitizeStoredLogs().then(() => repository.reconcileInterruptedLogs()).catch((error) => logger.warn(
+            '遗留 LLM 请求日志收敛失败',
+            safeFailureLogDetail(error, { reasonCode: 'LOG_UNAVAILABLE', stage: 'llm.log.reconcile' }),
+        ));
+    }
     sdk.setSettingsResolver(() => { const value = settingsState.value as LLMHubSettings & Record<string, unknown>; return { ...settingsState.value, maxTokensControl: settingsState.value.maxTokensControl ?? ({ mode: value.maxTokensMode as 'inherit' | 'manual' | 'adaptive', manualValue: Number(value.maxTokens ?? 2048) }) }; });
     let disposed = false;
     let applyGeneration = 0;
@@ -93,17 +102,29 @@ export function createProductionLlmServices(
                 if (Object.prototype.hasOwnProperty.call(overrides, resource.id)) apiKey = overrides[resource.id] ?? null;
                 else if (!options.emptyCredentials && repository) apiKey = await repository.getResourceSecret(resource.id);
                 if (!apiKey) continue;
-                const provider = createProviderFromResource(resource, apiKey);
+                const provider = createProviderFromResource(
+                    resource,
+                    apiKey,
+                    /^https?:\/\//iu.test(resource.baseUrl ?? '') ? bridgeFetch : fetch,
+                );
                 built.push(provider);
                 registrations.push({ provider, resourceType: resource.type, capabilities: resource.capabilities, defaultModel: resource.model });
             }
             const occupied = new Set(router.getAllProviders().filter((provider) => !managed.has(provider.id)).map((provider) => provider.id));
-            if (registrations.some((registration) => occupied.has(registration.provider.id))) throw new Error('Provider ID 已被占用');
-            if (disposed || generation !== applyGeneration) throw new Error('运行时应用已过期');
+            if (registrations.some((registration) => occupied.has(registration.provider.id))) {
+                throw createSSHelperError('INTERNAL_ERROR', { stage: 'llm.runtime.provider_conflict' });
+            }
+            if (disposed || generation !== applyGeneration) {
+                throw createSSHelperError('SERVER_SESSION_CLOSED', { stage: 'llm.runtime.apply' });
+            }
         } catch (error) {
             for (const provider of built) provider.dispose?.();
-            if (error instanceof Error && error.message === '运行时应用已过期') throw Object.assign(new Error('运行时应用已过期'), { code: 'LLM_RUNTIME_APPLY_STALE' });
-            throw Object.assign(new Error('LLM runtime apply failed'), { code: 'LLM_RUNTIME_APPLY_FAILED' });
+            const failure = readSSHelperFailure(error, {
+                reasonCode: 'INTERNAL_ERROR',
+                stage: 'llm.runtime.apply',
+            })!;
+            const { reasonCode, ...context } = failure;
+            throw createSSHelperError(reasonCode, context);
         }
 
         let committed = false;
@@ -124,7 +145,6 @@ export function createProductionLlmServices(
                 router.applyPluginAssignments(settings.pluginAssignments ?? []);
                 router.applyTaskAssignments(settings.taskAssignments ?? []);
                 budget.replaceConfigs(settings.budgets ?? {});
-                display.restoreSilentPermissions(settings.silentPermissions ?? []);
                 router.replaceManagedProviders([...managed], registrations);
                 managed.clear();
                 for (const registration of registrations) managed.add(registration.provider.id);
@@ -201,17 +221,32 @@ export function createProductionLlmServices(
     const detachRuntimePreparer = repository?.attachRuntimePreparer(prepareRuntime);
     if (repository) {
         registry.setPersistCallback((snapshots) => { void repository.saveConsumers(snapshots as unknown as Record<string, import('@ss-helper/sdk').PlainData>); });
-        void repository.ready().then(async () => { const consumers = await repository.loadConsumers(); if (Object.keys(consumers).length) registry.restoreFromStorage(consumers as never); return repository.loadSettings(); }).then(async (settings) => { const prepared = await prepareRuntime(settings); prepared.commit(); }).catch(() => undefined);
+        void (async () => {
+            for (const delayMs of [0, 120, 400, 1_200, 3_000] as const) {
+                if (disposed) return;
+                if (delayMs > 0) await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+                try {
+                    await repository.ready();
+                    const consumers = await repository.loadConsumers();
+                    if (Object.keys(consumers).length) registry.restoreFromStorage(consumers as never);
+                    const settings = await repository.loadSettings();
+                    const prepared = await prepareRuntime(settings);
+                    prepared.commit();
+                    return;
+                } catch {
+                    // Server-plugin and workspace startup are independent of the
+                    // browser extension. A later bounded attempt must be able to
+                    // apply persisted routes even when the first Bridge call lost
+                    // the startup race.
+                }
+            }
+        })();
         repository.subscribeChanges((kinds) => notifyCapabilityChange(kinds));
     } else {
         void prepareRuntime(settingsState.value).then((prepared) => prepared.commit()).catch(() => undefined);
     }
     const host = session.host as unknown as HostPort;
     const unlistenGeneration = host.has?.('tavern.chat.events') && host.events ? host.events.subscribe('generation-config-changed', () => notifyCapabilityChange(['generation'])) : undefined;
-    const handlers = createLlmSdkServiceHandlers(sdk, (kind) => {
-        const display = settingsState.value.resultDisplay;
-        if (display === 'fullscreen' || display === 'compact' || display === 'silent') return display;
-        return kind === 'generation' ? 'compact' : 'silent';
-    });
-    return { ...handlers, capabilityStatus, dispose(): void { if (disposed) return; disposed = true; applyGeneration += 1; detachRuntimePreparer?.(); unlistenGeneration?.(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); } };
+    const handlers = createLlmSdkServiceHandlers(sdk);
+    return { ...handlers, capabilityStatus, dispose(): void { if (disposed) return; disposed = true; applyGeneration += 1; detachRuntimePreparer?.(); unlistenGeneration?.(); sdk.dispose(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); } };
 }

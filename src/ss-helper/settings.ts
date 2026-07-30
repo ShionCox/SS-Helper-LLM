@@ -5,15 +5,15 @@ import type { LLMHubSettings } from '../schema/types';
 import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type { LlmSettingsStatusSource } from './settings-status';
 
-export const LLM_SETTINGS_KEY = 'ss-helper.llm.settings.v0';
-
 export const LLM_POPUP_VERSION = 0 as const;
 
 const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', name, version: LLM_POPUP_VERSION } as const);
 
 export const LLM_REQUEST_LOGS_POPUP = popup('request-logs');
+export const LLM_RESOURCE_WIZARD_POPUP = popup('resource-wizard');
+export const LLM_RESOURCE_MANAGER_POPUP = popup('resource-manager');
 
-export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
+export const LLM_SETTINGS_SCHEMA = {
     id: 'ss-helper.llm',
     title: config.settingsTitle,
     fields: [
@@ -21,7 +21,9 @@ export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
             { kind: 'section', id: 'startStatus', label: '服务状态', children: [
                 { kind: 'toggle', id: 'enabled', label: '启用 LLM', description: '开启AI服务。', defaultValue: DEFAULT_LLM_SETTINGS.enabled },
                 { kind: 'status', id: 'tavernStatus', label: '大语言模型', description: '显示酒馆正在使用的来源和模型，不需要额外配置。', value: '正在连接', tone: 'neutral' },
-                { kind: 'status', id: 'serviceStatus', label: '服务状态', description: '实时显示生成、向量化和重排序能力。', value: '正在同步', tone: 'neutral' },
+                { kind: 'status', id: 'generationStatus', label: '生成服务', description: '当前生成路由状态。', value: '正在同步', tone: 'neutral' },
+                { kind: 'status', id: 'embeddingStatus', label: '向量服务', description: '当前向量资源状态。', value: '正在同步', tone: 'neutral' },
+                { kind: 'status', id: 'rerankStatus', label: '重排服务', description: '当前重排资源状态。', value: '正在同步', tone: 'neutral' },
             ] },
             { kind: 'section', id: 'generationPreferences', label: '生成偏好', children: [
                 { kind: 'select', id: 'generationSource', label: '模型来源', description: '仅影响大语言模型生成；向量化和重排序始终使用自定义 API。', options: [{ value: 'tavern', label: '酒馆当前模型' }, { value: 'custom', label: '自定义 API' }], defaultValue: DEFAULT_LLM_SETTINGS.generationSource },
@@ -31,13 +33,12 @@ export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
             ] },
             { kind: 'section', id: 'requestDisplay', label: '请求与展示', children: [
                 { kind: 'number', id: 'timeoutMs', label: '请求超时', description: '超过这个时间仍未完成时停止请求。', defaultValue: DEFAULT_LLM_SETTINGS.timeoutMs, validation: { min: 1000, max: 300000 }, step: 1000, unit: '毫秒', showStepper: true },
-                { kind: 'select', id: 'resultDisplay', label: '结果展示', description: '智能模式只显示必要结果，后台任务不会频繁打扰。', options: [{ value: 'auto', label: '智能' }, { value: 'compact', label: '紧凑' }, { value: 'fullscreen', label: '全屏' }, { value: 'silent', label: '静默（需授权）' }], defaultValue: DEFAULT_LLM_SETTINGS.resultDisplay },
             ] },
         ] },
         { kind: 'section', id: 'resources', label: '资源', children: [
             { kind: 'section', id: 'resourceManagement', label: '资源管理', children: [
-                { kind: 'action', id: 'resourceWizard', label: '添加资源', description: '按步骤添加生成、向量化或重排序服务。', actionId: 'open-resource-wizard', placement: 'inline', buttonLabel: '打开向导', popup: popup('resource-wizard') },
-                { kind: 'action', id: 'resourceManager', label: '管理资源', description: '查看、测试、启用、编辑或删除已有资源。', actionId: 'open-resource-manager', placement: 'inline', buttonLabel: '打开', popup: popup('resource-manager') },
+                { kind: 'action', id: 'resourceWizard', label: '添加资源', description: '按步骤添加生成、向量化或重排序服务。', actionId: 'open-resource-wizard', placement: 'inline', buttonLabel: '打开向导', popup: LLM_RESOURCE_WIZARD_POPUP },
+                { kind: 'action', id: 'resourceManager', label: '管理资源', description: '查看、测试、启用、编辑或删除已有资源。', actionId: 'open-resource-manager', placement: 'inline', buttonLabel: '打开', popup: LLM_RESOURCE_MANAGER_POPUP },
             ] },
             { kind: 'section', id: 'resourceTesting', label: '能力测试', children: [
                 { kind: 'action', id: 'rerankTest', label: 'Rerank 测试', description: '用一组示例文档检查排序效果。', actionId: 'open-rerank-test', placement: 'inline', buttonLabel: '开始测试', popup: popup('rerank-test') },
@@ -56,10 +57,6 @@ export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
             { kind: 'section', id: 'runtimeLimits', label: '额度与任务', children: [
                 { kind: 'action', id: 'budgetManager', label: '使用额度与熔断', description: '限制插件的请求频率、Token、等待时间和成本。', actionId: 'open-budget-manager', placement: 'inline', buttonLabel: '配置', popup: popup('budget-manager') },
                 { kind: 'action', id: 'queueManager', label: '请求队列', description: '查看正在等待和运行的任务，也可以取消任务。', actionId: 'open-queue-manager', placement: 'inline', buttonLabel: '查看', popup: popup('queue-manager') },
-            ] },
-            { kind: 'section', id: 'runtimePermissions', label: '权限与展示', children: [
-                { kind: 'action', id: 'permissionManager', label: '后台权限', description: '决定哪些插件任务可以静默运行。', actionId: 'open-permission-manager', placement: 'inline', buttonLabel: '配置', popup: popup('permission-manager') },
-                { kind: 'action', id: 'displayRules', label: '展示规则', description: '设置普通任务和后台任务如何显示结果。', actionId: 'open-display-rules', placement: 'inline', buttonLabel: '配置', popup: popup('display-rules') },
             ] },
         ] },
         { kind: 'section', id: 'diagnostics', label: '诊断', children: [
@@ -85,35 +82,53 @@ export const LLM_SETTINGS_SCHEMA: SettingsSchema = {
             ] },
         ] },
     ],
-};
+} as const satisfies SettingsSchema;
 
-const DEFAULT_SETTINGS = DEFAULT_LLM_SETTINGS as unknown as SettingsValues;
-
-function withLogFields(values: SettingsValues): SettingsValues {
-    const logging = (values.requestLogging && typeof values.requestLogging === 'object' ? values.requestLogging : {}) as Record<string, unknown>;
+function toSettingsValues(settings: LLMHubSettings): SettingsValues {
+    const logging = settings.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
     return {
-        ...values,
+        enabled: settings.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
+        generationSource: settings.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
+        globalProfile: settings.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
+        maxTokensMode: settings.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
+        maxTokens: settings.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        timeoutMs: settings.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
         'requestLogging.enabled': logging.enabled ?? DEFAULT_LLM_SETTINGS.requestLogging.enabled,
         'requestLogging.detailMode': logging.detailMode ?? DEFAULT_LLM_SETTINGS.requestLogging.detailMode,
         'requestLogging.maxEntries': logging.maxEntries ?? DEFAULT_LLM_SETTINGS.requestLogging.maxEntries,
         'requestLogging.retentionDays': logging.retentionDays ?? DEFAULT_LLM_SETTINGS.requestLogging.retentionDays,
-        'requestLogging.maxBytesMb': Number(logging.maxBytes ?? DEFAULT_LLM_SETTINGS.requestLogging.maxBytes) / (1024 * 1024),
-    } as unknown as SettingsValues;
+        'requestLogging.maxBytesMb': (logging.maxBytes ?? DEFAULT_LLM_SETTINGS.requestLogging.maxBytes) / (1024 * 1024),
+    };
 }
 
-function withoutLogFields(values: SettingsValues): Record<string, unknown> {
-    const next = { ...values } as Record<string, unknown>;
-    const existing = next.requestLogging && typeof next.requestLogging === 'object' ? next.requestLogging as Record<string, unknown> : {};
-    next.requestLogging = {
-        ...existing,
-        enabled: typeof next['requestLogging.enabled'] === 'boolean' ? next['requestLogging.enabled'] : existing.enabled,
-        detailMode: typeof next['requestLogging.detailMode'] === 'string' ? next['requestLogging.detailMode'] : existing.detailMode,
-        maxEntries: typeof next['requestLogging.maxEntries'] === 'number' ? next['requestLogging.maxEntries'] : existing.maxEntries,
-        retentionDays: typeof next['requestLogging.retentionDays'] === 'number' ? next['requestLogging.retentionDays'] : existing.retentionDays,
-        maxBytes: typeof next['requestLogging.maxBytesMb'] === 'number' ? Math.round(next['requestLogging.maxBytesMb'] * 1024 * 1024) : existing.maxBytes,
+function applySettingsValues(current: LLMHubSettings, values: SettingsValues): LLMHubSettings {
+    const existingLogging = current.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
+    const detailMode = values['requestLogging.detailMode'];
+    return {
+        ...current,
+        enabled: typeof values.enabled === 'boolean' ? values.enabled : current.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
+        generationSource: values.generationSource === 'custom' || values.generationSource === 'tavern'
+            ? values.generationSource
+            : current.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
+        globalProfile: typeof values.globalProfile === 'string' ? values.globalProfile : current.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
+        maxTokensMode: values.maxTokensMode === 'inherit' || values.maxTokensMode === 'manual' || values.maxTokensMode === 'adaptive'
+            ? values.maxTokensMode
+            : current.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
+        maxTokens: typeof values.maxTokens === 'number' ? values.maxTokens : current.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        timeoutMs: typeof values.timeoutMs === 'number' ? values.timeoutMs : current.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
+        requestLogging: {
+            ...existingLogging,
+            enabled: typeof values['requestLogging.enabled'] === 'boolean' ? values['requestLogging.enabled'] : existingLogging.enabled,
+            detailMode: detailMode === 'full' || detailMode === 'failed-full' || detailMode === 'summary' || detailMode === 'off'
+                ? detailMode
+                : existingLogging.detailMode,
+            maxEntries: typeof values['requestLogging.maxEntries'] === 'number' ? values['requestLogging.maxEntries'] : existingLogging.maxEntries,
+            retentionDays: typeof values['requestLogging.retentionDays'] === 'number' ? values['requestLogging.retentionDays'] : existingLogging.retentionDays,
+            maxBytes: typeof values['requestLogging.maxBytesMb'] === 'number'
+                ? Math.round(values['requestLogging.maxBytesMb'] * 1024 * 1024)
+                : existingLogging.maxBytes,
+        },
     };
-    delete next['requestLogging.enabled']; delete next['requestLogging.detailMode']; delete next['requestLogging.maxEntries']; delete next['requestLogging.retentionDays']; delete next['requestLogging.maxBytesMb'];
-    return next;
 }
 
 export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceRepository, statusSource: LlmSettingsStatusSource, notify?: (notification: ToastNotification) => void): SettingsAdapter {
@@ -123,7 +138,7 @@ export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceReposi
         try {
             await statusSource.refreshNow();
             const status = await statusSource.loadStatus();
-            if (status.serviceStatus?.tone !== 'error') return;
+            if (status.generationStatus?.tone !== 'error') return;
             notify?.({ level: 'warning', title: '模型来源不可用', message: '所选大语言模型来源当前不可用，请检查酒馆连接或自定义资源配置。', code: 'LLM_GENERATION_SOURCE_UNAVAILABLE', durationMs: 4200 });
         } catch { /* Status and toast are best effort after the setting has committed. */ }
     };
@@ -134,20 +149,22 @@ export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceReposi
         try { notify?.({ level: 'error', title: '设置保存失败', message: `模型来源设置未能保存（${code}），请检查运行状态。`, code, durationMs: 5200 }); } catch { /* Keep the original save failure authoritative. */ }
     };
     return {
-        async load(): Promise<SettingsValues> { const loaded = withLogFields(await repository.loadSettings() as unknown as SettingsValues); generationSource = sourceOf(loaded); return loaded; },
+        async load(): Promise<SettingsValues> { const loaded = toSettingsValues(await repository.loadSettings()); generationSource = sourceOf(loaded); return loaded; },
         async save(values): Promise<void> {
             const nextSource = sourceOf(values);
             const sourceChanged = generationSource !== undefined && generationSource !== nextSource;
             let saved: SettingsValues;
-            try { saved = withLogFields(await repository.saveSettings(withoutLogFields(values) as LLMHubSettings & Record<string, unknown>) as unknown as SettingsValues); }
+            try {
+                const current = await repository.loadSettings();
+                saved = toSettingsValues(await repository.saveSettings(applySettingsValues(current, values) as LLMHubSettings & Record<string, unknown>));
+            }
             catch (failure) { reportSaveFailure(failure); throw failure; }
             generationSource = sourceOf(saved);
             if (sourceChanged) void warnIfSelectedSourceUnavailable();
         },
-        async reset(): Promise<SettingsValues> { const reset = withLogFields(await repository.reset() as unknown as SettingsValues); generationSource = sourceOf(reset); return reset; },
+        async reset(): Promise<SettingsValues> { const reset = toSettingsValues(await repository.reset()); generationSource = sourceOf(reset); return reset; },
+        subscribe: (listener) => repository.subscribeSettings((settings) => listener(toSettingsValues(settings))),
         loadStatus: () => statusSource.loadStatus(),
         subscribeStatus: (listener) => statusSource.subscribeStatus(listener),
     };
 }
-
-export { DEFAULT_SETTINGS };

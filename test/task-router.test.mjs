@@ -117,6 +117,34 @@ test('Tavern prompt-only structured output requests isolated host generation', a
   assert.equal(result.debugRequest.nativeSchemaSent, false);
 });
 
+test('Tavern provider selects transport from the actual SillyTavern source boundary', async () => {
+  let current = { provider: 'custom', model: 'deepseek-v4-flash' };
+  const tavern = new TavernProvider({
+    id: BUILTIN_TAVERN_RESOURCE_ID,
+    generation: {
+      async available() { return true; },
+      async current() { return current; },
+      async models() { return [current.model]; },
+      async generate() { return { text: '{}' }; },
+      async test() { return { text: 'OK' }; },
+    },
+  });
+
+  const customIdentity = await tavern.getStructuredOutputIdentity();
+  assert.equal(customIdentity.vendor, 'deepseek');
+  assert.deepEqual(tavern.getStructuredOutputCapability(customIdentity), {
+    transports: ['prompt_only'],
+    preferred: 'prompt_only',
+  });
+
+  current = { provider: 'deepseek', model: 'deepseek-v4-flash' };
+  const nativeIdentity = await tavern.getStructuredOutputIdentity();
+  assert.deepEqual(tavern.getStructuredOutputCapability(nativeIdentity), {
+    transports: ['tavern_json_schema', 'prompt_only'],
+    preferred: 'tavern_json_schema',
+  });
+});
+
 test('Tavern provider reports a safe actionable reason when the host adapter rejects generation', async () => {
   const tavern = new TavernProvider({
     id: BUILTIN_TAVERN_RESOURCE_ID,
@@ -131,23 +159,22 @@ test('Tavern provider reports a safe actionable reason when the host adapter rej
 
   await assert.rejects(
     tavern.request({ messages: [{ role: 'user', content: 'hello' }] }),
-    (error) => error?.reasonCode === 'provider_unavailable' && /酒馆生成调用失败/u.test(error.message),
+    (error) => error?.details?.reasonCode === 'INTERNAL_ERROR' && error?.details?.stage === 'llm.provider.tavern',
   );
 });
 
 test('LLM service errors retain provider reason codes for consumers', async () => {
   const handlers = createLlmSdkServiceHandlers({
-    async runTask() { return { ok: false, error: '模型返回内容不是有效 JSON', reasonCode: 'invalid_json' }; },
+    async runTask() { return { ok: false, error: '模型返回内容不是有效 JSON', reasonCode: 'INVALID_JSON' }; },
     async embed() { return {}; },
     async rerank() { return {}; },
     registerConsumer() {},
     unregisterConsumer() {},
-    async waitForOverlayClose() {},
   });
 
   await assert.rejects(
     handlers.runTask({ task: 'memory_extract', input: {}, outputSchema: {} }, new AbortController().signal),
-    (error) => error?.code === 'PAYLOAD_INVALID' && error?.details?.reasonCode === 'invalid_json',
+    (error) => error?.code === 'INVALID_PAYLOAD' && error?.details?.reasonCode === 'INVALID_JSON',
   );
 });
 

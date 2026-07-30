@@ -10,7 +10,7 @@ import type {
     ProviderConnectionResult,
     ProviderModelListResult,
 } from './types';
-import { providerHttpError } from './provider-errors';
+import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 
 export class ClaudeProvider implements LLMProvider {
@@ -47,6 +47,7 @@ export class ClaudeProvider implements LLMProvider {
             tools: true,
             embeddings: false,
             rerank: false,
+            structuredOutput: { transports: ['json_schema', 'prompt_only'], preferred: 'json_schema' },
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
         this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'claude', baseUrl: this.baseUrl, model: this.model });
@@ -138,8 +139,7 @@ export class ClaudeProvider implements LLMProvider {
         });
 
         if (!response.ok) {
-            await response.text().catch(() => undefined);
-            throw providerHttpError('Claude', response.status);
+            throw await providerHttpErrorFromResponse('Claude', response);
         }
 
         const data = await response.json();
@@ -173,13 +173,14 @@ export class ClaudeProvider implements LLMProvider {
         throw new Error('ClaudeProvider 不支持 rerank');
     }
 
-    async testConnection(): Promise<ProviderConnectionResult> {
+    async testConnection(signal?: AbortSignal): Promise<ProviderConnectionResult> {
         const start = Date.now();
         try {
             await this.request({
                 messages: [{ role: 'user', content: 'Hi' }],
                 model: this.model,
                 maxTokens: 8,
+                signal,
             });
             return {
                 ok: true,
@@ -188,27 +189,29 @@ export class ClaudeProvider implements LLMProvider {
                 latencyMs: Date.now() - start,
             };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            return {
-                ok: false,
-                message: `网络错误: ${msg}`,
-                errorCode: 'NETWORK_ERROR',
-                detail: msg,
-                latencyMs: Date.now() - start,
-            };
+            return providerConnectionFailure(error, {
+                stage: 'llm.provider.test',
+                providerKind: this.kind,
+                resourceId: this.id,
+                model: this.model,
+            }, Date.now() - start);
         }
     }
 
-    async listModels(): Promise<ProviderModelListResult> {
+    async listModels(signal?: AbortSignal): Promise<ProviderModelListResult> {
         try {
             const res = await this.fetchImpl(`${this.baseUrl}/models`, {
                 method: 'GET',
                 headers: this.buildHeaders(),
+                signal,
             });
 
             if (!res.ok) {
-                const text = await res.text().catch(() => '');
-                return { ok: false, models: [], message: `获取模型列表失败 (${res.status})`, detail: text };
+                return providerModelListFailure(await providerHttpErrorFromResponse(this.kind, res), {
+                    stage: 'llm.provider.models',
+                    providerKind: this.kind,
+                    resourceId: this.id,
+                });
             }
 
             const json = await res.json();
@@ -221,8 +224,11 @@ export class ClaudeProvider implements LLMProvider {
 
             return { ok: true, models, message: `共 ${models.length} 个模型` };
         } catch (error: unknown) {
-            const msg = error instanceof Error ? error.message : String(error);
-            return { ok: false, models: [], message: `网络错误: ${msg}`, errorCode: 'NETWORK_ERROR', detail: msg };
+            return providerModelListFailure(error, {
+                stage: 'llm.provider.models',
+                providerKind: this.kind,
+                resourceId: this.id,
+            });
         }
     }
 }

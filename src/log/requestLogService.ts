@@ -1,7 +1,7 @@
 import { logger } from '../runtime/logger';
+import { isSSHelperReasonCode } from '@ss-helper/sdk';
 import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type {
-    CapabilityKind,
     LLMRequestLogEntry,
     LLMRequestLogQueryOptions,
     LLMRequestLogRequestSnapshot,
@@ -21,41 +21,26 @@ function normalizeOptionalText(value: unknown): string | undefined {
     return normalized || undefined;
 }
 
-function normalizeOptionalNumber(value: unknown): number | undefined {
-    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+function upsertMemoryLog(entry: LLMRequestLogEntry): void {
+    const existing = memoryLogs.findIndex((row) => row.logId === entry.logId);
+    if (existing >= 0) memoryLogs.splice(existing, 1, entry);
+    else memoryLogs.unshift(entry);
+    if (memoryLogs.length > REQUEST_LOG_MAX_RECORDS) memoryLogs.length = REQUEST_LOG_MAX_RECORDS;
 }
 
-/**
- * 功能：将数据库中的任务类型值归一化为受控类型。
- * @param value 原始任务类型
- * @returns 归一化后的任务类型
- */
-function normalizeTaskKind(value: unknown): CapabilityKind {
-    const normalized = String(value || '').trim();
-    if (normalized === 'embedding' || normalized === 'rerank') {
-        return normalized;
-    }
-    return 'generation';
+function filterMemoryLogs(opts?: LLMRequestLogQueryOptions): LLMRequestLogEntry[] {
+    return memoryLogs
+        .filter((row) => !opts?.sourcePluginId || row.sourcePluginId === opts.sourcePluginId)
+        .filter((row) => !opts?.state || opts.state === 'all' || row.state === opts.state)
+        .filter((row) => !opts?.search || JSON.stringify(row).toLowerCase().includes(opts.search.toLowerCase()));
 }
 
-/**
- * 功能：将日志中的中间状态归一化为最终展示状态。
- * @param value 原始状态值。
- * @returns 归一化后的状态。
- */
-function normalizeLogState(value: unknown): RequestState {
-    const normalized = String(value || '').trim();
-    if (normalized === 'overlay_waiting' || normalized === 'result_ready') {
-        return 'completed';
-    }
-    if (normalized === 'queued' || normalized === 'running' || normalized === 'completed' || normalized === 'failed' || normalized === 'cancelled') {
-        return normalized;
-    }
-    return 'completed';
-}
+
+
 
 type AttemptTag = LLMRequestLogEntry['attemptTag'];
-type AttemptOutcome = LLMRequestLogEntry['attemptOutcome'];
+type AttemptOutcome = NonNullable<LLMRequestLogEntry['attemptOutcome']>;
+type AttemptPhase = LLMRequestLogEntry['attemptPhase'];
 
 export interface RecordAttemptInput {
     record: RequestRecord;
@@ -64,92 +49,168 @@ export interface RecordAttemptInput {
     attemptTag: AttemptTag;
     attemptOutcome: AttemptOutcome;
     isFinalAttempt: boolean;
+    attemptPhase?: AttemptPhase;
+    plannedTransport?: LLMRequestLogEntry['plannedTransport'];
+    actualTransport?: LLMRequestLogEntry['actualTransport'];
 }
 
 export class RequestLogService {
     constructor(private readonly workspaceRepository?: LlmWorkspaceRepository) {}
 
     async listLogs(opts?: LLMRequestLogQueryOptions): Promise<LLMRequestLogEntry[]> {
-        if (this.workspaceRepository) return (await this.workspaceRepository.queryLogs(opts)).filter((row) => Boolean((row as Record<string, unknown>).requestId && (row as Record<string, unknown>).logId)) as unknown as LLMRequestLogEntry[];
-        const rows = memoryLogs.slice().sort((a, b) => b.queuedAt - a.queuedAt).filter((row) => !opts?.sourcePluginId || row.sourcePluginId === opts.sourcePluginId).filter((row) => !opts?.state || opts.state === 'all' || row.state === opts.state).filter((row) => !opts?.search || JSON.stringify(row).toLowerCase().includes(opts.search.toLowerCase())).slice(opts?.offset ?? 0, (opts?.offset ?? 0) + (opts?.limit ?? 100));
-        return rows;
+        const persisted = this.workspaceRepository && typeof this.workspaceRepository.queryLogs === 'function'
+            ? (await this.workspaceRepository.queryLogs(opts)).filter((row) => Boolean((row as Record<string, unknown>).requestId && (row as Record<string, unknown>).logId)) as unknown as LLMRequestLogEntry[]
+            : [];
+        const rows = new Map<string, LLMRequestLogEntry>(persisted.map((row) => [row.logId, row]));
+        for (const row of filterMemoryLogs(opts)) rows.set(row.logId, row);
+        const offset = opts?.offset ?? 0;
+        const limit = opts?.limit ?? 100;
+        return [...rows.values()].sort((left, right) => right.queuedAt - left.queuedAt).slice(offset, offset + limit);
     }
 
     async clearLogs(): Promise<number> {
-        if (this.workspaceRepository) return this.workspaceRepository.clearLogs();
-        const count = memoryLogs.length; memoryLogs.length = 0; return count;
+        const localCount = memoryLogs.length;
+        memoryLogs.length = 0;
+        if (this.workspaceRepository && typeof this.workspaceRepository.clearLogs === 'function') {
+            return (await this.workspaceRepository.clearLogs()) + localCount;
+        }
+        return localCount;
+    }
+
+    async beginAttempt(input: {
+        record: RequestRecord;
+        attemptId: string;
+        attemptPhase: AttemptPhase;
+        plannedTransport?: LLMRequestLogEntry['plannedTransport'];
+    }): Promise<void> {
+        const entry = this.buildAttemptEntry({
+            record: input.record,
+            attemptId: input.attemptId,
+            state: 'queued',
+            attemptPhase: input.attemptPhase,
+            plannedTransport: input.plannedTransport,
+            isFinalAttempt: false,
+        });
+        await this.persistLogEntry(entry);
+    }
+
+    async markAttemptRunning(input: {
+        record: RequestRecord;
+        attemptId: string;
+        attemptPhase: AttemptPhase;
+        plannedTransport?: LLMRequestLogEntry['plannedTransport'];
+    }): Promise<void> {
+        const entry = this.buildAttemptEntry({
+            record: input.record,
+            attemptId: input.attemptId,
+            state: 'running',
+            attemptPhase: input.attemptPhase,
+            plannedTransport: input.plannedTransport,
+            isFinalAttempt: false,
+        });
+        await this.persistLogEntry(entry);
     }
 
     async recordAttempt(input: RecordAttemptInput): Promise<void> {
-        const { record, requestId, result, attemptTag, attemptOutcome, isFinalAttempt } = input;
-        if (record.validity.isCancelled || record.validity.isSuperseded || record.validity.isObsolete) {
-            return;
-        }
+        const { record, requestId: attemptId, result, attemptTag, attemptOutcome, isFinalAttempt } = input;
+        const logEntry = this.buildAttemptEntry({
+            record,
+            attemptId,
+            state: result.ok ? 'completed' : result.reasonCode === 'CANCELLED' ? 'cancelled' : 'failed',
+            attemptPhase: input.attemptPhase ?? record.activeAttemptPhase ?? (record.attemptIndex > 1 ? 'transient_retry' : 'initial'),
+            plannedTransport: input.plannedTransport,
+            actualTransport: input.actualTransport,
+            attemptOutcome,
+            isFinalAttempt,
+            response: this.buildResultResponseSnapshot(record, result),
+        });
+        logEntry.attemptTag = attemptTag;
+        await this.persistLogEntry(logEntry);
+    }
+
+    private buildAttemptEntry(input: {
+        record: RequestRecord;
+        attemptId: string;
+        state: RequestState;
+        attemptPhase: AttemptPhase;
+        plannedTransport?: LLMRequestLogEntry['plannedTransport'];
+        actualTransport?: LLMRequestLogEntry['actualTransport'];
+        attemptOutcome?: AttemptOutcome;
+        isFinalAttempt: boolean;
+        response?: LLMRequestLogResponseSnapshot;
+    }): LLMRequestLogEntry {
+        const { record, attemptId } = input;
         const sourcePluginId = normalizeOptionalText(record.scope?.pluginId) || normalizeOptionalText(record.consumer) || FALLBACK_SOURCE_PLUGIN_ID;
         const chatKey = normalizeOptionalText(record.chatKey);
         const sessionId = normalizeOptionalText(record.scope?.sessionId);
         const requestSnapshot = {
-            ...(record.requestLogSnapshot || {
-                taskKind: record.taskKind,
-                taskDescription: record.taskDescription,
-            }),
+            taskKind: record.taskKind,
+            ...(record.requestLogSnapshot?.schemaSummary
+                ? { schemaSummary: record.requestLogSnapshot.schemaSummary }
+                : {}),
+            ...(record.requestLogSnapshot?.schemaHash
+                ? { schemaHash: record.requestLogSnapshot.schemaHash }
+                : {}),
         } as LLMRequestLogRequestSnapshot;
-        const responseSnapshot = this.buildResultResponseSnapshot(record, result);
-        const latencyMs = record.finishedAt && record.startedAt ? Math.max(0, record.finishedAt - record.startedAt) : undefined;
-        const logEntry: LLMRequestLogEntry = {
-            logId: `${requestId}_${record.finishedAt || Date.now()}`,
+        const finishedAt = input.state === 'completed' || input.state === 'failed' || input.state === 'cancelled'
+            ? (record.finishedAt ?? Date.now())
+            : undefined;
+        const latencyMs = finishedAt && record.startedAt ? Math.max(0, finishedAt - record.startedAt) : undefined;
+        return {
+            logId: attemptId,
             llmTaskId: record.llmTaskId,
-            requestId,
+            requestId: record.requestId,
+            parentRequestId: record.enqueueOptions.parentRequestId,
+            attemptId,
             sourcePluginId,
             consumer: record.consumer,
             taskKey: record.taskKey,
             taskDescription: record.taskDescription,
             taskKind: record.taskKind,
-            state: result.ok ? 'completed' : 'failed',
+            state: input.state,
             attemptIndex: Math.max(1, Number(record.attemptIndex || 1)),
-            attemptTag,
-            attemptOutcome,
-            isFinalAttempt,
+            attemptPhase: input.attemptPhase,
+            attemptTag: record.attemptIndex > 1 ? '重试' : '初次请求',
+            attemptOutcome: input.attemptOutcome,
+            isFinalAttempt: input.isFinalAttempt,
+            plannedTransport: input.plannedTransport,
+            actualTransport: input.actualTransport,
             chatKey,
             sessionId,
             queuedAt: record.queuedAt,
             startedAt: record.startedAt,
-            finishedAt: record.finishedAt,
+            finishedAt,
             latencyMs,
             request: requestSnapshot,
-            response: responseSnapshot,
+            response: input.response ?? {},
         };
-        await this.persistLogEntry(logEntry);
     }
 
     async archiveRecord(record: RequestRecord): Promise<void> {
-        if (!ARCHIVABLE_STATES.has(record.state as RequestState)) {
-            logger.info('[RequestLog][PersistSkip]', {
-                llmTaskId: record.llmTaskId,
-                requestId: record.requestId,
-                consumer: record.consumer,
-                taskKey: record.taskKey,
-                state: record.state,
-                reason: 'state_not_archivable',
-            });
-            return;
-        }
+        if (!ARCHIVABLE_STATES.has(record.state as RequestState)) return;
 
         const sourcePluginId = normalizeOptionalText(record.scope?.pluginId) || normalizeOptionalText(record.consumer) || FALLBACK_SOURCE_PLUGIN_ID;
         const chatKey = normalizeOptionalText(record.chatKey);
         const sessionId = normalizeOptionalText(record.scope?.sessionId);
         const requestSnapshot = {
-            ...(record.requestLogSnapshot || {
-                taskKind: record.taskKind,
-                taskDescription: record.taskDescription,
-            }),
+            taskKind: record.taskKind,
+            ...(record.requestLogSnapshot?.schemaSummary
+                ? { schemaSummary: record.requestLogSnapshot.schemaSummary }
+                : {}),
+            ...(record.requestLogSnapshot?.schemaHash
+                ? { schemaHash: record.requestLogSnapshot.schemaHash }
+                : {}),
         } as LLMRequestLogRequestSnapshot;
         const responseSnapshot = this.buildLogResponseSnapshot(record);
         const latencyMs = record.finishedAt && record.startedAt ? Math.max(0, record.finishedAt - record.startedAt) : undefined;
         const logEntry: LLMRequestLogEntry = {
-            logId: `${record.requestId}_${record.finishedAt || Date.now()}`,
+            // An active Provider attempt already owns a queued/running row. Cancellation
+            // terminalizes that row instead of appending a second row with the same attemptId.
+            logId: record.activeAttemptRequestId ?? `${record.requestId}_${record.finishedAt || Date.now()}`,
             llmTaskId: record.llmTaskId,
             requestId: record.requestId,
+            parentRequestId: record.enqueueOptions.parentRequestId,
+            attemptId: record.activeAttemptRequestId ?? record.requestId,
             sourcePluginId,
             consumer: record.consumer,
             taskKey: record.taskKey,
@@ -157,6 +218,7 @@ export class RequestLogService {
             taskKind: record.taskKind,
             state: record.state as RequestState,
             attemptIndex: Math.max(1, Number(record.attemptIndex || 1)),
+            attemptPhase: record.activeAttemptPhase ?? (record.attemptIndex > 1 ? 'transient_retry' : 'initial'),
             attemptTag: record.attemptIndex > 1 ? '重试' : '初次请求',
             attemptOutcome: '取消',
             isFinalAttempt: true,
@@ -185,18 +247,13 @@ export class RequestLogService {
                 finishedAt: record.meta.finishedAt,
                 latencyMs: record.meta.latencyMs,
                 fallbackUsed: record.meta.fallbackUsed,
+                usage: record.meta.usage,
             }
             : undefined;
 
         return {
             meta,
-            finalError: record.debug?.finalError,
-            reasonCode: record.debug?.reasonCode,
-            validationErrors: Array.isArray(record.debug?.validationErrors) ? record.debug?.validationErrors.slice(0, 50) : undefined,
-            rawResponseText: record.debug?.rawResponseText,
-            providerResponse: record.debug?.providerResponse,
-            parsedResponse: record.debug?.parsedResponse,
-            normalizedResponse: record.debug?.normalizedResponse,
+            ...(record.debug?.failure === undefined ? {} : { failure: record.debug.failure }),
         };
     }
 
@@ -212,18 +269,25 @@ export class RequestLogService {
                 finishedAt: result.meta.finishedAt,
                 latencyMs: result.meta.latencyMs,
                 fallbackUsed: result.meta.fallbackUsed,
+                usage: result.meta.usage,
             }
             : undefined;
 
+        const failure = !result.ok ? result.failure ?? record.debug?.failure : undefined;
         return {
             meta,
-            finalError: result.ok ? undefined : result.error,
-            reasonCode: result.ok ? undefined : result.reasonCode,
-            validationErrors: Array.isArray(record.debug?.validationErrors) ? record.debug?.validationErrors.slice(0, 50) : undefined,
-            rawResponseText: record.debug?.rawResponseText,
-            providerResponse: record.debug?.providerResponse,
-            parsedResponse: record.debug?.parsedResponse,
-            normalizedResponse: record.debug?.normalizedResponse,
+            ...(failure !== undefined
+                ? { failure }
+                : !result.ok && isSSHelperReasonCode(result.reasonCode)
+                    ? {
+                        failure: {
+                            reasonCode: result.reasonCode,
+                            stage: 'llm.request',
+                            requestId: record.requestId,
+                            ...(record.activeAttemptRequestId ? { attemptId: record.activeAttemptRequestId } : {}),
+                        },
+                    }
+                    : {}),
         };
     }
 
@@ -240,15 +304,15 @@ export class RequestLogService {
             attemptTag: logEntry.attemptTag,
             attemptOutcome: logEntry.attemptOutcome,
             chatKey: logEntry.chatKey || '(none)',
-            reasonCode: logEntry.response?.reasonCode,
+            reasonCode: logEntry.response?.failure?.reasonCode,
         });
 
         try {
             if (this.workspaceRepository) {
                 await this.workspaceRepository.saveLog(logEntry as unknown as Record<string, unknown> as never);
-                return;
+            } else {
+                upsertMemoryLog(logEntry);
             }
-            memoryLogs.unshift(logEntry); if (memoryLogs.length > REQUEST_LOG_MAX_RECORDS) memoryLogs.length = REQUEST_LOG_MAX_RECORDS;
             logger.success('[RequestLog][PersistSuccess]', {
                 llmTaskId: logEntry.llmTaskId,
                 requestId: logEntry.requestId,
@@ -267,10 +331,12 @@ export class RequestLogService {
                 state: logEntry.state,
                 taskKey: logEntry.taskKey,
                 attemptIndex: logEntry.attemptIndex,
-                error: String((error as Error)?.message || error),
+                reasonCode: 'LOG_UNAVAILABLE',
             });
-            // 日志属于诊断旁路；持久化失败不能让已经完成或失败的 LLM 请求再次失败。
-            return;
+            // Logging is diagnostic infrastructure.  Keep a bounded local
+            // copy for this session, but never discard a provider result or
+            // issue a duplicate paid request solely because SQLite is down.
+            upsertMemoryLog(logEntry);
         }
     }
 }
