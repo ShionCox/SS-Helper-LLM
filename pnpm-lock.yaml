@@ -380,7 +380,7 @@ packages:
     resolution: {integrity: sha512-XExJS3cLqgrmNBIP3bBw6+1oQ1ksGjFh0+oClDKFYpCCqx/hlqwWO5KO/S63fzUo67SxI9dMrF0y5T/Ey7h8Zw==}
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-0.0.1.tgz':
-    resolution: {integrity: sha512-IpTsnL4b++5ls/EGSWUMpG5nfVet6274YWggXF1UF/LkAppxUEkVP9PmmJEgCbrAACbPF/LXIsT7FGIQiOx7rw==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
+    resolution: {integrity: sha512-umDUlD26TLdzrastziJxOp7vl2jQgwY1rwl5c9g6tHZnnJ0yEwrPbRe+lQlmuNmYXKd+McA/vXxVX+pdeS8oXQ==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
     version: 0.0.1
     engines: {node: '>=20'}
 

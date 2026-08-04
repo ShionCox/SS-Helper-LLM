@@ -41,8 +41,10 @@ export class RequestOrchestrator {
     private readonly queue: RequestRecord[] = [];
     private readonly history: RequestRecord[] = [];
     private readonly archived = new WeakSet<RequestRecord>();
-    private activeRequest: RequestRecord | null = null;
-    private processing = false;
+    private readonly activeRequests = new Map<string, RequestRecord>();
+    private readonly activeCount: Record<CapabilityKind, number> = { generation: 0, embedding: 0, rerank: 0 };
+    private readonly limits: Readonly<Record<CapabilityKind, number>> = Object.freeze({ generation: 2, embedding: 1, rerank: 1 });
+    private scheduling = false;
     private disposed = false;
     private executeCallback: ((record: RequestRecord) => Promise<LLMRunResult<unknown>>) | null = null;
     private archiveCallback: ((record: RequestRecord) => void) | null = null;
@@ -163,13 +165,16 @@ export class RequestOrchestrator {
                 ...(record.taskDescription === undefined ? {} : { taskDescription: record.taskDescription }),
                 queuedAt: record.queuedAt,
             })),
-            active: this.activeRequest === null ? null : {
-                requestId: this.activeRequest.requestId,
-                consumer: this.activeRequest.consumer,
-                taskKey: this.activeRequest.taskKey,
-                ...(this.activeRequest.taskDescription === undefined ? {} : { taskDescription: this.activeRequest.taskDescription }),
-                state: this.activeRequest.state,
-            },
+            active: (() => {
+                const active = this.activeRequests.values().next().value as RequestRecord | undefined;
+                return active === undefined ? null : {
+                    requestId: active.requestId,
+                    consumer: active.consumer,
+                    taskKey: active.taskKey,
+                    ...(active.taskDescription === undefined ? {} : { taskDescription: active.taskDescription }),
+                    state: active.state,
+                };
+            })(),
             recentHistory: this.history.slice(-20).map((record) => ({
                 requestId: record.requestId,
                 consumer: record.consumer,
@@ -194,30 +199,41 @@ export class RequestOrchestrator {
         const pending = [...this.queue];
         this.queue.length = 0;
         for (const record of pending) this.finishCancelled(record, 'LLM 请求编排器已关闭');
-        if (this.activeRequest) {
-            this.activeRequest.validity.isCancelled = true;
+        for (const activeRequest of this.activeRequests.values()) {
+            activeRequest.validity.isCancelled = true;
             const diagnostic = describeSSHelperFailure(createSSHelperError('CANCELLED', {
                 stage: 'llm.orchestrator.dispose',
-                requestId: this.activeRequest.requestId,
+                requestId: activeRequest.requestId,
             }));
-            this.activeRequest.resolveResult?.({ ok: false, error: diagnostic.title, reasonCode: diagnostic.reasonCode });
+            activeRequest.resolveResult?.({ ok: false, error: diagnostic.title, reasonCode: diagnostic.reasonCode });
         }
         this.executeCallback = null;
         this.archiveCallback = null;
     }
 
     private async processQueue(): Promise<void> {
-        if (this.disposed || this.processing) return;
-        const record = this.queue.shift();
-        if (!record) return;
-        if (this.isInvalid(record)) {
-            this.finishCancelled(record, '请求已作废');
-            void this.processQueue();
-            return;
+        if (this.disposed || this.scheduling) return;
+        this.scheduling = true;
+        try {
+            while (!this.disposed) {
+                const index = this.queue.findIndex((candidate) => this.activeCount[candidate.taskKind] < this.limits[candidate.taskKind]);
+                if (index < 0) break;
+                const [record] = this.queue.splice(index, 1);
+                if (!record) break;
+                if (this.isInvalid(record)) {
+                    this.finishCancelled(record, '请求已作废');
+                    continue;
+                }
+                this.activeRequests.set(record.requestId, record);
+                this.activeCount[record.taskKind] += 1;
+                void this.executeRecord(record);
+            }
+        } finally {
+            this.scheduling = false;
         }
+    }
 
-        this.processing = true;
-        this.activeRequest = record;
+    private async executeRecord(record: RequestRecord): Promise<void> {
         record.state = 'running';
         record.startedAt = Date.now();
         logger.info('[RequestLifecycle][Running]', {
@@ -307,8 +323,7 @@ export class RequestOrchestrator {
                 stage: failure.stage,
             });
         } finally {
-            if (this.activeRequest === record) this.activeRequest = null;
-            this.processing = false;
+            if (this.activeRequests.delete(record.requestId)) this.activeCount[record.taskKind] = Math.max(0, this.activeCount[record.taskKind] - 1);
             void this.processQueue();
         }
     }
@@ -340,7 +355,8 @@ export class RequestOrchestrator {
     }
 
     private findRecord(requestId: string): RequestRecord | undefined {
-        if (this.activeRequest?.requestId === requestId) return this.activeRequest;
+        const active = this.activeRequests.get(requestId);
+        if (active) return active;
         return this.queue.find((record) => record.requestId === requestId);
     }
 

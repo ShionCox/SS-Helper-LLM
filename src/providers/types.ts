@@ -5,6 +5,25 @@
 
 import type { SSHelperFailureContext } from '@ss-helper/sdk';
 import type { StructuredOutputIdentity, StructuredOutputPlan, StructuredOutputTransport } from '../schema/structured-output-plan';
+import type { ProviderToolAdapter } from '../tools/tool-adapter';
+
+export interface ProviderRequestInit extends RequestInit {
+    /** SS-Helper Bridge absolute request budget. Native fetch ignores this field. */
+    readonly timeoutMs?: number;
+    /** SS-Helper Bridge inactivity budget after the first response chunk. */
+    readonly idleTimeoutMs?: number;
+}
+
+export type ProviderFetch = (input: RequestInfo | URL, init?: ProviderRequestInit) => Promise<Response>;
+
+export interface ProviderResponseDiagnostics {
+    readonly httpStatus?: number;
+    readonly contentType?: string;
+    readonly receivedBytes?: number;
+    readonly streamed?: boolean;
+    readonly streamEventCount?: number;
+    readonly receivedAt?: number;
+}
 
 export interface StructuredOutputCapability {
     readonly transports: readonly StructuredOutputTransport[];
@@ -27,6 +46,7 @@ export interface LLMRequest {
     maxTokens?: number;
     structuredOutput?: StructuredOutputPlan;
     signal?: AbortSignal;
+    timeoutMs?: number;
 }
 
 export interface LLMResponse {
@@ -39,16 +59,20 @@ export interface LLMResponse {
         actualTransport: StructuredOutputPlan['transport'];
         fallbackReason?: string;
     };
+    diagnostics?: ProviderResponseDiagnostics;
 }
 
 export interface EmbedRequest {
     texts: string[];
     model?: string;
+    dimensions?: number;
     signal?: AbortSignal;
+    timeoutMs?: number;
 }
 
 export interface EmbedResponse {
     embeddings: number[][];
+    diagnostics?: ProviderResponseDiagnostics;
 }
 
 export interface RerankRequest {
@@ -57,10 +81,12 @@ export interface RerankRequest {
     topK?: number;
     model?: string;
     signal?: AbortSignal;
+    timeoutMs?: number;
 }
 
 export interface RerankResponse {
     results: Array<{ index: number; score: number; doc: string }>;
+    diagnostics?: ProviderResponseDiagnostics;
 }
 
 // ── 检测与模型列表 ──
@@ -100,4 +126,5 @@ export interface LLMProvider {
     dispose?(): void;
     getStructuredOutputIdentity?(model?: string): Promise<StructuredOutputIdentity> | StructuredOutputIdentity;
     getStructuredOutputCapability?(identity: StructuredOutputIdentity): Promise<StructuredOutputCapability> | StructuredOutputCapability;
+    createToolAdapter?(): ProviderToolAdapter;
 }

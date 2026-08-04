@@ -165,7 +165,14 @@ test('Tavern provider reports a safe actionable reason when the host adapter rej
 
 test('LLM service errors retain provider reason codes for consumers', async () => {
   const handlers = createLlmSdkServiceHandlers({
-    async runTask() { return { ok: false, error: '模型返回内容不是有效 JSON', reasonCode: 'INVALID_JSON' }; },
+    async runTask() {
+      return {
+        ok: false,
+        error: '模型返回内容不是有效 JSON',
+        reasonCode: 'INVALID_JSON',
+        meta: { usage: { promptTokens: 12, completionTokens: 3, totalTokens: 15 } },
+      };
+    },
     async embed() { return {}; },
     async rerank() { return {}; },
     registerConsumer() {},
@@ -174,7 +181,11 @@ test('LLM service errors retain provider reason codes for consumers', async () =
 
   await assert.rejects(
     handlers.runTask({ task: 'memory_extract', input: {}, outputSchema: {} }, new AbortController().signal),
-    (error) => error?.code === 'INVALID_PAYLOAD' && error?.details?.reasonCode === 'INVALID_JSON',
+    (error) => error?.code === 'INVALID_PAYLOAD'
+      && error?.details?.reasonCode === 'INVALID_JSON'
+      && error?.details?.inputTokens === 12
+      && error?.details?.outputTokens === 3
+      && error?.details?.totalTokens === 15,
   );
 });
 
@@ -194,38 +205,42 @@ function generationRouter(recommendedResourceId) {
   return router;
 }
 
-test('Tavern generation source rejects every custom override and fallback', () => {
+test('Tavern generation source fails closed for an explicit custom task assignment', () => {
   const router = generationRouter('custom-a');
   router.applyGenerationSource('tavern');
   router.applyTaskAssignments([{ pluginId: 'fixture.consumer', taskKey: 'generate', taskKind: 'generation', resourceId: 'custom-b', isStale: false }]);
   router.applyPluginAssignments([{ pluginId: 'fixture.consumer', generation: { resourceId: 'custom-a' } }]);
   router.applyGlobalAssignments({ generation: { resourceId: 'custom-b' } });
 
-  const route = router.resolveRoute({
+  assert.throws(() => router.resolveRoute({
     consumer: 'fixture.consumer',
     taskKind: 'generation',
     taskKey: 'generate',
     requiredCapabilities: ['chat', 'json'],
     routeHint: { resourceId: 'custom-a' },
-  });
+  }), (error) => error?.details?.reasonCode === 'LLM_TASK_ROUTE_UNAVAILABLE');
+  router.applyTaskAssignments([]);
+  const route = router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'generation', taskKey: 'generate', requiredCapabilities: ['chat', 'json'], routeHint: { resourceId: 'custom-a' } });
   assert.equal(route.resourceId, BUILTIN_TAVERN_RESOURCE_ID);
   assert.equal(route.resolvedBy, 'builtin_tavern_fallback');
 });
 
-test('custom generation source rejects Tavern overrides and preserves custom routing priority', () => {
+test('custom generation source fails closed for Tavern task assignments and otherwise preserves custom priority', () => {
   const router = generationRouter(BUILTIN_TAVERN_RESOURCE_ID);
   router.applyGenerationSource('custom');
   router.applyTaskAssignments([{ pluginId: 'fixture.consumer', taskKey: 'generate', taskKind: 'generation', resourceId: BUILTIN_TAVERN_RESOURCE_ID, isStale: false }]);
   router.applyPluginAssignments([{ pluginId: 'fixture.consumer', generation: { resourceId: BUILTIN_TAVERN_RESOURCE_ID } }]);
   router.applyGlobalAssignments({ generation: { resourceId: 'custom-a' } });
 
-  const route = router.resolveRoute({
+  assert.throws(() => router.resolveRoute({
     consumer: 'fixture.consumer',
     taskKind: 'generation',
     taskKey: 'generate',
     requiredCapabilities: ['chat', 'json'],
     routeHint: { resourceId: BUILTIN_TAVERN_RESOURCE_ID },
-  });
+  }), (error) => error?.details?.reasonCode === 'LLM_TASK_ROUTE_UNAVAILABLE');
+  router.applyTaskAssignments([]);
+  const route = router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'generation', taskKey: 'generate', requiredCapabilities: ['chat', 'json'], routeHint: { resourceId: BUILTIN_TAVERN_RESOURCE_ID } });
   assert.equal(route.resourceId, 'custom-a');
   assert.equal(route.resolvedBy, 'user_global_default');
 
@@ -246,7 +261,7 @@ test('custom generation fails closed when no custom provider is available', () =
   router.applyGenerationSource('custom');
   assert.throws(
     () => router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] }),
-    /无法为 consumer/u,
+    (error) => error?.details?.reasonCode === 'PROVIDER_UNAVAILABLE',
   );
 });
 
@@ -254,8 +269,8 @@ test('embedding and rerank never use Tavern and retain custom capability fallbac
   const router = new TaskRouter();
   router.registerProvider(provider(BUILTIN_TAVERN_RESOURCE_ID), 'generation', ['chat', 'json']);
   router.applyGenerationSource('tavern');
-  assert.throws(() => router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'embedding' }), /无法为 consumer/u);
-  assert.throws(() => router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'rerank' }), /无法为 consumer/u);
+  assert.throws(() => router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'embedding' }), (error) => error?.details?.reasonCode === 'PROVIDER_UNAVAILABLE');
+  assert.throws(() => router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'rerank' }), (error) => error?.details?.reasonCode === 'PROVIDER_UNAVAILABLE');
 
   router.registerProvider(provider('custom-multi'), 'generation', ['chat', 'json', 'embeddings', 'rerank']);
   assert.equal(router.resolveRoute({ consumer: 'fixture.consumer', taskKind: 'embedding', requiredCapabilities: ['embeddings'] }).resourceId, 'custom-multi');

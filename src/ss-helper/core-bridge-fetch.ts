@@ -8,6 +8,8 @@ import {
   createSSHelperError,
   isSSHelperReasonCode,
 } from '@ss-helper/sdk';
+import type { ProviderFetch, ProviderRequestInit } from '../providers/types';
+import { attachProviderResponseDebug } from '../providers/provider-response-diagnostics.js';
 
 const BRIDGE_PATH = '/api/plugins/ss-helper-sdk/internal/bridge/v0/call' as const;
 
@@ -30,8 +32,8 @@ function bridgeRecord(value: PlainData | undefined): Readonly<Record<string, Pla
     : undefined;
 }
 
-export function createCoreBridgeFetch(request: CoreBridgeRequest): typeof fetch {
-  return (async (input: RequestInfo | URL, init: RequestInit = {}): Promise<Response> => {
+export function createCoreBridgeFetch(request: CoreBridgeRequest): ProviderFetch {
+  return async (input: RequestInfo | URL, init: ProviderRequestInit = {}): Promise<Response> => {
     const requestId = globalThis.crypto?.randomUUID?.() ?? `http_${Date.now()}_${Math.random().toString(36).slice(2)}`;
     const source = input instanceof Request ? input : undefined;
     const url = input instanceof URL ? input.toString() : typeof input === 'string' ? input : input.url;
@@ -57,6 +59,8 @@ export function createCoreBridgeFetch(request: CoreBridgeRequest): typeof fetch 
           method,
           headers: plainHeaders(init.headers ?? source?.headers),
           ...(body === undefined || body === null ? {} : { body }),
+          ...(init.timeoutMs === undefined ? {} : { timeoutMs: init.timeoutMs }),
+          ...(init.idleTimeoutMs === undefined ? {} : { idleTimeoutMs: init.idleTimeoutMs }),
         },
       },
     }, signal === undefined || signal === null ? undefined : { signal });
@@ -83,9 +87,27 @@ export function createCoreBridgeFetch(request: CoreBridgeRequest): typeof fetch 
     const contentType = typeof data?.contentType === 'string'
       ? data.contentType
       : 'application/json';
+    if (data?.incomplete === true) {
+      const error = createSSHelperError('HTTP_RESPONSE_PROTOCOL_INVALID', {
+        stage: 'llm.bridge.http.response',
+        requestId,
+        httpStatus: status,
+      });
+      throw attachProviderResponseDebug(error, {
+        ...(serializedBody ? { rawResponseText: serializedBody } : {}),
+        providerResponse: {
+          incomplete: true,
+          diagnostics: {
+            httpStatus: status,
+            contentType,
+            ...(typeof data.receivedBytes === 'number' ? { receivedBytes: data.receivedBytes } : {}),
+          },
+        },
+      });
+    }
     return new Response(serializedBody, {
       status,
       headers: { 'content-type': contentType },
     });
-  }) as typeof fetch;
+  };
 }

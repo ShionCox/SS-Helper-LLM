@@ -8,10 +8,15 @@ import type {
     RerankRequest,
     RerankResponse,
     ProviderConnectionResult,
-    ProviderModelListResult,
+    ProviderModelListResult, ProviderFetch, ProviderResponseDiagnostics,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import { AnthropicMessagesToolAdapter } from '../tools/anthropic-messages-tool-adapter';
+import type { ProviderToolAdapter } from '../tools/tool-adapter';
+import { createSSHelperError } from '@ss-helper/sdk';
+import { parseSseJson } from './sse';
+import { responseDiagnostics } from './provider-response-diagnostics';
 
 export class ClaudeProvider implements LLMProvider {
     id: string;
@@ -24,8 +29,9 @@ export class ClaudeProvider implements LLMProvider {
     private model: string;
     private anthropicVersion: string;
     private customParams: Record<string, unknown>;
-    private fetchImpl: typeof fetch;
+    private fetchImpl: ProviderFetch;
     private readonly structuredOutputIdentity: StructuredOutputIdentity;
+    private readonly streamingEnabled: boolean;
 
     constructor(config: {
         id: string;
@@ -34,7 +40,8 @@ export class ClaudeProvider implements LLMProvider {
         model?: string;
         anthropicVersion?: string;
         customParams?: Record<string, unknown>;
-        fetchImpl?: typeof fetch;
+        fetchImpl?: ProviderFetch;
+        streamingEnabled?: boolean;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
@@ -51,6 +58,7 @@ export class ClaudeProvider implements LLMProvider {
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
         this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'claude', baseUrl: this.baseUrl, model: this.model });
+        this.streamingEnabled = config.streamingEnabled !== false;
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -111,6 +119,71 @@ export class ClaudeProvider implements LLMProvider {
             .trim();
     }
 
+    private assembleMessageStream(chunks: readonly Record<string, unknown>[]): Record<string, unknown> {
+        const complete = chunks.find((chunk) => Array.isArray(chunk.content));
+        if (complete) return complete;
+        const blocks = new Map<number, Record<string, unknown>>();
+        const partialJson = new Map<number, string>();
+        let inputTokens = 0;
+        let outputTokens = 0;
+        let stopReason: unknown;
+        for (const chunk of chunks) {
+            const event = String(chunk.__event ?? chunk.type ?? '');
+            if (event === 'error') throw createSSHelperError('PROVIDER_RESPONSE_INVALID', { stage: 'llm.provider.claude_stream.error', resourceId: this.id });
+            const message = chunk.message && typeof chunk.message === 'object' && !Array.isArray(chunk.message) ? chunk.message as Record<string, unknown> : undefined;
+            const messageUsage = message?.usage as Record<string, unknown> | undefined;
+            if (messageUsage) inputTokens = Number(messageUsage.input_tokens ?? inputTokens);
+            const index = Number(chunk.index);
+            const block = chunk.content_block && typeof chunk.content_block === 'object' && !Array.isArray(chunk.content_block) ? chunk.content_block as Record<string, unknown> : undefined;
+            if (block && Number.isInteger(index)) blocks.set(index, { ...block });
+            const delta = chunk.delta && typeof chunk.delta === 'object' && !Array.isArray(chunk.delta) ? chunk.delta as Record<string, unknown> : undefined;
+            if (delta && Number.isInteger(index)) {
+                const current = blocks.get(index) ?? {};
+                if (delta.type === 'text_delta' && typeof delta.text === 'string') current.text = `${String(current.text ?? '')}${delta.text}`;
+                if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') partialJson.set(index, `${partialJson.get(index) ?? ''}${delta.partial_json}`);
+                blocks.set(index, current);
+            }
+            if (event === 'content_block_stop' && Number.isInteger(index) && partialJson.has(index)) {
+                try { blocks.set(index, { ...(blocks.get(index) ?? {}), input: JSON.parse(partialJson.get(index)!) }); }
+                catch { throw createSSHelperError('PROVIDER_RESPONSE_INVALID', { stage: 'llm.provider.claude_stream.tool_json', resourceId: this.id }); }
+            }
+            if (delta?.stop_reason !== undefined) stopReason = delta.stop_reason;
+            const usage = chunk.usage && typeof chunk.usage === 'object' && !Array.isArray(chunk.usage) ? chunk.usage as Record<string, unknown> : undefined;
+            if (usage?.output_tokens !== undefined) outputTokens = Number(usage.output_tokens);
+        }
+        if (blocks.size === 0) throw createSSHelperError('PROVIDER_RESPONSE_INVALID', { stage: 'llm.provider.claude_stream.empty', resourceId: this.id });
+        return { content: [...blocks.entries()].sort(([left], [right]) => left - right).map(([, block]) => block), usage: { input_tokens: inputTokens, output_tokens: outputTokens }, stop_reason: stopReason };
+    }
+
+    private async sendMessageStream(body: Record<string, unknown>, signal?: AbortSignal, timeoutMs = 180_000): Promise<{ data: Record<string, unknown>; diagnostics: ProviderResponseDiagnostics }> {
+        const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
+            method: 'POST', headers: this.buildHeaders(), body: JSON.stringify({ ...body, stream: true }),
+            signal, timeoutMs, idleTimeoutMs: 30_000,
+        });
+        if (!response.ok) throw await providerHttpErrorFromResponse('Claude stream', response);
+        const text = await response.text();
+        const chunks = parseSseJson(text, 'llm.provider.claude_stream.parse', this.id);
+        return { data: this.assembleMessageStream(chunks), diagnostics: responseDiagnostics(response, text, { streamed: true, streamEventCount: chunks.length }) };
+    }
+
+    createToolAdapter(): ProviderToolAdapter {
+        return new AnthropicMessagesToolAdapter({
+            resourceId: this.id,
+            defaultModel: this.model,
+            send: async (body, signal) => {
+                const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
+                    method: 'POST',
+                    headers: this.buildHeaders(),
+                    body: JSON.stringify(this.withCustomParams(body)),
+                    signal,
+                });
+                if (!response.ok) throw await providerHttpErrorFromResponse('Claude', response);
+                return await response.json() as Record<string, unknown>;
+            },
+            ...(this.streamingEnabled ? { sendStream: async (body: Record<string, unknown>, signal?: AbortSignal) => [(await this.sendMessageStream(this.withCustomParams(body), signal)).data] } : {}),
+        });
+    }
+
     async request(req: LLMRequest): Promise<LLMResponse> {
         const split = this.splitMessages(req.messages);
         const body: Record<string, any> = this.withCustomParams({
@@ -129,20 +202,20 @@ export class ClaudeProvider implements LLMProvider {
                     },
                 }
                 : {}),
+            stream: this.streamingEnabled,
         });
 
-        const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
-            method: 'POST',
-            headers: this.buildHeaders(),
-            body: JSON.stringify(body),
-            signal: req.signal,
-        });
-
-        if (!response.ok) {
-            throw await providerHttpErrorFromResponse('Claude', response);
-        }
-
-        const data = await response.json();
+        const transport = this.streamingEnabled
+            ? await this.sendMessageStream(body, req.signal, req.timeoutMs)
+            : await (async () => {
+                const response = await this.fetchImpl(`${this.baseUrl}/messages`, {
+                    method: 'POST', headers: this.buildHeaders(), body: JSON.stringify(body), signal: req.signal, timeoutMs: req.timeoutMs,
+                });
+                if (!response.ok) throw await providerHttpErrorFromResponse('Claude', response);
+                const data = await response.json();
+                return { data, diagnostics: responseDiagnostics(response, data, { streamed: false }) };
+            })();
+        const data: any = transport.data;
         const promptTokens = Number(data?.usage?.input_tokens ?? 0);
         const completionTokens = Number(data?.usage?.output_tokens ?? 0);
 
@@ -154,6 +227,7 @@ export class ClaudeProvider implements LLMProvider {
                 totalTokens: promptTokens + completionTokens,
             },
             finishReason: data?.stop_reason,
+            diagnostics: transport.diagnostics,
             ...(req.structuredOutput === undefined ? {} : { structuredOutput: { plannedTransport: req.structuredOutput.transport, actualTransport: req.structuredOutput.transport } }),
             debugRequest: {
                 providerKind: this.kind,

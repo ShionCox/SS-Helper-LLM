@@ -21,7 +21,7 @@ function success(record, data = record.taskKey) {
   };
 }
 
-test('completed requests immediately release the queue without an overlay-close signal', async () => {
+test('generation requests use the bounded two-request lane without an overlay-close signal', async () => {
   const orchestrator = new RequestOrchestrator();
   let releaseFirst;
   const firstGate = new Promise((resolve) => { releaseFirst = resolve; });
@@ -37,8 +37,8 @@ test('completed requests immediately release the queue without an overlay-close 
   const second = orchestrator.enqueue('fixture.consumer', 'second', 'generation');
   await Promise.resolve();
 
-  assert.deepEqual(executed, ['first']);
-  assert.equal(orchestrator.getQueueSnapshot().pending.length, 1);
+  assert.deepEqual(executed, ['first', 'second']);
+  assert.equal(orchestrator.getQueueSnapshot().pending.length, 0);
 
   releaseFirst();
   assert.equal((await first.resultPromise).ok, true);
@@ -48,7 +48,7 @@ test('completed requests immediately release the queue without an overlay-close 
   const snapshot = orchestrator.getQueueSnapshot();
   assert.equal(snapshot.active, null);
   assert.deepEqual(snapshot.pending, []);
-  assert.deepEqual(snapshot.recentHistory.map((entry) => [entry.taskKey, entry.state]), [
+  assert.deepEqual(snapshot.recentHistory.map((entry) => [entry.taskKey, entry.state]).sort(), [
     ['first', 'completed'],
     ['second', 'completed'],
   ]);

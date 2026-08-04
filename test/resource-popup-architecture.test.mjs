@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { ResourceVerificationCoordinator } from '../dist/index.js';
+import { ResourceVerificationCoordinator, ResourceWizardController } from '../dist/index.js';
 
 const resource = {
   id: 'resource-test',
@@ -14,6 +14,63 @@ const resource = {
   enabled: true,
   capabilities: ['chat', 'json'],
 };
+
+function resourceWizard(source) {
+  return new ResourceWizardController({
+    mode: source ? 'edit' : 'create',
+    source,
+    hasStoredSecret: source !== undefined,
+    timeoutMs: 30_000,
+    repository: {},
+    ui: {},
+    notify() {},
+    verification: {},
+    toolServices: {},
+  });
+}
+
+test('resource wizard shows only purpose-specific connection fields', () => {
+  const controller = resourceWizard();
+  controller.change('apiType', 'xai');
+  let snapshot = controller.snapshot();
+  assert.equal(snapshot.values.connectionMode, 'official');
+  assert.equal(snapshot.values.baseUrl, 'https://api.x.ai/v1');
+  assert.equal(snapshot.values.toolDialect, 'openai_chat_compatible');
+  assert.deepEqual(snapshot.disabledFieldIds, ['baseUrl']);
+  assert.equal(snapshot.hiddenFieldIds.includes('toolDialect'), false);
+  assert.equal(snapshot.hiddenFieldIds.includes('embeddingPath'), true);
+  assert.equal(snapshot.hiddenFieldIds.includes('rerankProtocol'), true);
+
+  controller.change('type', 'embedding');
+  snapshot = controller.snapshot();
+  assert.equal(snapshot.hiddenFieldIds.includes('toolDialect'), true);
+  assert.equal(snapshot.hiddenFieldIds.includes('embeddingPath'), false);
+  assert.equal(snapshot.hiddenFieldIds.includes('embeddingDimensions'), false);
+  assert.equal(snapshot.hiddenFieldIds.includes('rerankProtocol'), true);
+
+  controller.change('type', 'rerank');
+  snapshot = controller.snapshot();
+  assert.equal(snapshot.hiddenFieldIds.includes('embeddingPath'), true);
+  assert.equal(snapshot.hiddenFieldIds.includes('rerankProtocol'), false);
+  assert.equal(snapshot.hiddenFieldIds.includes('rerankPath'), false);
+  controller.change('rerankProtocol', 'chat');
+  assert.equal(controller.snapshot().hiddenFieldIds.includes('rerankPath'), true);
+  controller.dispose();
+});
+
+test('editing a generic Grok relay keeps its endpoint when switching to the xAI template', () => {
+  const controller = resourceWizard({
+    id: 'grok-relay', type: 'generation', source: 'custom', apiType: 'generic', label: 'Grok relay',
+    baseUrl: 'https://relay.example.test/v1', model: 'grok-model', enabled: true,
+  });
+  controller.change('apiType', 'xai');
+  const snapshot = controller.snapshot();
+  assert.equal(snapshot.values.baseUrl, 'https://relay.example.test/v1');
+  assert.equal(snapshot.values.connectionMode, 'relay');
+  assert.equal(snapshot.values.toolDialect, 'openai_chat_compatible');
+  assert.equal(snapshot.disabledFieldIds.includes('baseUrl'), false);
+  controller.dispose();
+});
 
 test('resource verification checks network, auth, model, and capability with one disposable provider', async () => {
   const originalFetch = globalThis.fetch;
@@ -117,6 +174,43 @@ test('HTTP resources use the injected Core Bridge transport for discovery and ve
   }
 });
 
+test('xAI discovery and verification avoid the Tavern proxy response logger', async () => {
+  const calls = [];
+  let tavernCalls = 0;
+  const fetchImpl = async (url, init = {}) => {
+    calls.push({ url: String(url), method: init.method ?? 'GET' });
+    if (String(url).endsWith('/models')) {
+      return new Response(JSON.stringify({ data: [{ id: 'grok-test' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'OK' } }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  const coordinator = new ResourceVerificationCoordinator({
+    fetchImpl,
+    request: async () => {
+      tavernCalls += 1;
+      throw new Error('xAI must not use the Tavern chat-completions proxy');
+    },
+  });
+  const xaiResource = { ...resource, apiType: 'xai', model: 'grok-test' };
+  const discovered = await coordinator.discoverModels(xaiResource, 'secret');
+  const verified = await coordinator.verify(xaiResource, 'secret');
+
+  assert.equal(discovered.ok, true);
+  assert.equal(verified.ok, true);
+  assert.equal(tavernCalls, 0);
+  assert.deepEqual(calls.map((call) => call.url), [
+    'https://api.example.test/v1/models',
+    'https://api.example.test/v1/chat/completions',
+    'https://api.example.test/v1/models',
+  ]);
+});
+
 test('tavern same-origin probe discovers models with a draft key and verifies the selected model before persistence', async () => {
   const calls = [];
   const request = async (input, options) => {
@@ -191,6 +285,7 @@ test('resource verification honors an already-aborted caller signal', async () =
 test('legacy resource popup DOM, prompt editing, and save-before-test paths are removed', async () => {
   const plugin = await readFile(new URL('../src/ss-helper/plugin.ts', import.meta.url), 'utf8');
   const resourcePopups = await readFile(new URL('../src/ss-helper/resource-popups.ts', import.meta.url), 'utf8');
+  const resourceStyles = await readFile(new URL('../src/ui/request-log-viewer.css', import.meta.url), 'utf8');
   assert.doesNotMatch(plugin, /function\s+(?:button|field)\s*\(/u);
   assert.doesNotMatch(plugin, /text_pole|stx-ui-btn|window\.prompt/u);
   assert.doesNotMatch(plugin, /步骤 1：选择用途|配置已保存；连接测试通过后可启用/u);
@@ -198,7 +293,27 @@ test('legacy resource popup DOM, prompt editing, and save-before-test paths are 
   assert.doesNotMatch(resourcePopups, /window\.confirm|document\.createElement\(['"]select['"]\)/u);
   assert.match(resourcePopups, /ResourceVerificationCoordinator/u);
   assert.match(resourcePopups, /createMenu|presentation:\s*'workspace'/u);
+  assert.match(resourcePopups, /验证工具调用|verifyToolCapability/u);
+  assert.match(resourcePopups, /ss-helper-llm-resource-checked-primary/u);
+  assert.match(resourceStyles, /ss-helper-llm-resource-row\s*\{\s*height:\s*54px/u);
+  assert.match(resourceStyles, /grid-template-columns:[^;]+170px;/u);
+  assert.match(resourceStyles, /resource-columns\s*>\s*:last-child\s*\{\s*text-align:\s*right/u);
   assert.match(resourcePopups, /listResourceHealth|saveResourceHealth|deleteResource/u);
+  assert.match(resourcePopups, /工具调用（Agent，可选）[\s\S]+force:\s*true/u);
+  assert.match(resourcePopups, /工具调用验证未通过，不能用于 Agent 模式/u);
   assert.match(resourcePopups, /enabled:\s*true/u);
+  for (const field of ['customParams', 'toolDialect', 'privacyPolicy']) {
+    assert.match(resourcePopups, new RegExp(`this\\.#source\\?\\.${field}`, 'u'));
+  }
   assert.match(resourcePopups, /await this\.#verification\.verify[\s\S]+await this\.#repository\.setResourceSecret[\s\S]+await this\.#repository\.saveSettings/u);
+});
+
+test('LLM UI has no Memory-owned task routing surface and protects consumer assignments', async () => {
+  const plugin = await readFile(new URL('../src/ss-helper/plugin.ts', import.meta.url), 'utf8');
+  const settings = await readFile(new URL('../src/ss-helper/settings.ts', import.meta.url), 'utf8');
+  assert.doesNotMatch(plugin, /route-manager|MEMORY_ROUTING_TASKS|memory_extract_(?:single|entities|narrative|inventory|repair)/u);
+  assert.doesNotMatch(settings, /route-manager|routeManager|open-route-manager/u);
+  assert.match(plugin, /editableGenericRoutingSettings[\s\S]+taskAssignments:\s*_consumerOwnedTaskAssignments/u);
+  assert.match(plugin, /mergeGenericRoutingSettings[\s\S]+Object\.hasOwn\(edited, 'taskAssignments'\)[\s\S]+current\.taskAssignments/u);
+  assert.doesNotMatch(plugin, /pluginAssignments:[^\n]+taskAssignments/u);
 });

@@ -111,9 +111,11 @@ test('settings adapter exposes only schema fields and preserves popup-managed co
   await Promise.resolve();
   assertSettingsValuesMatchSchema(snapshots.at(-1));
 
-  await adapter.save({ ...loaded, globalProfile: 'precise', 'requestLogging.maxBytesMb': 64 });
+  await adapter.save({ ...loaded, globalProfile: 'precise', maxTokensMode: 'manual', maxTokens: 12288, maxRequestsPerMinute: 30, 'requestLogging.maxBytesMb': 64 });
   const stored = await repository.loadSettings();
   assert.equal(stored.globalProfile, 'precise');
+  assert.deepEqual(stored.maxTokensControl, { mode: 'manual', manualValue: 12288 });
+  assert.equal(stored.maxRequestsPerMinute, 30);
   assert.equal(stored.requestLogging.maxBytes, 64 * 1024 * 1024);
   assert.equal(stored.resources[0].id, 'embed-main');
   assert.equal(stored.globalAssignments.embedding.resourceId, 'embed-main');
@@ -141,7 +143,7 @@ test('settings schema exposes five progressive pages and generic popup actions',
   assert.deepEqual(Object.fromEntries(sections.map((section) => [section.id, section.children.map((field) => field.label)])), {
     start: ['服务状态', '生成偏好', '请求与展示'],
     resources: ['资源管理', '能力测试'],
-    routing: ['路由配置', '高级配置'],
+    routing: ['通用路由', '高级配置'],
     runtime: ['额度与任务'],
     diagnostics: ['检查与日志', '日志记录策略', '数据管理', '关于'],
   });
@@ -151,6 +153,14 @@ test('settings schema exposes five progressive pages and generic popup actions',
   assert.deepEqual(
     [generationSource?.kind, generationSource?.defaultValue, generationSource?.options?.map((option) => option.value)],
     ['select', 'tavern', ['tavern', 'custom']],
+  );
+  assert.deepEqual(
+    [allFields.find((field) => field.id === 'streamingEnabled')?.kind, allFields.find((field) => field.id === 'streamingEnabled')?.defaultValue],
+    ['toggle', true],
+  );
+  assert.deepEqual(
+    [allFields.find((field) => field.id === 'maxRequestsPerMinute')?.kind, allFields.find((field) => field.id === 'maxRequestsPerMinute')?.defaultValue],
+    ['number', 0],
   );
   assert.equal(allFields.some((field) => field.id === 'detailedLogs'), false);
   assert.equal(allFields.find((field) => field.id === 'requestLogging.detailMode')?.defaultValue, 'full');
@@ -163,7 +173,6 @@ test('settings schema exposes five progressive pages and generic popup actions',
     resourceWizard: ['resources', 'open-resource-wizard', 'resource-wizard', '打开向导'],
     resourceManager: ['resources', 'open-resource-manager', 'resource-manager', '打开'],
     rerankTest: ['resources', 'open-rerank-test', 'rerank-test', '开始测试'],
-    routeManager: ['routing', 'open-route-manager', 'route-manager', '配置'],
     routePreview: ['routing', 'open-route-preview', 'route-preview', '预览'],
     advanced: ['routing', 'open-advanced', 'advanced-routing', '编辑'],
     budgetManager: ['runtime', 'open-budget-manager', 'budget-manager', '配置'],
@@ -173,18 +182,18 @@ test('settings schema exposes five progressive pages and generic popup actions',
     backup: ['diagnostics', 'open-backup', 'backup', '管理'],
     reset: ['diagnostics', 'reset-llm', 'reset-confirm', '重置'],
   };
-  assert.equal(actions.length, 12);
+  assert.equal(actions.length, 11);
   assert.deepEqual(Object.fromEntries(actions.map((field) => [field.id, [field.tabId, field.actionId, field.popup?.name, field.buttonLabel]])), expectedActions);
   assert.ok(actions.every((field) => field.placement === 'inline'));
   assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
 });
 
-test('LLM browser repository stores strict allowlisted logs and excludes prompts, responses and credentials', async () => {
+test('LLM browser repository summary policy keeps semantic metadata and excludes prompts, responses and credentials', async () => {
   const workspace = new MemoryWorkspace();
   const secrets = new MemorySecrets();
   const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.ready();
-  const expectedDefaults = { enabled: true, generationSource: 'tavern', globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
+  const expectedDefaults = { enabled: true, generationSource: 'tavern', streamingEnabled: true, maxRequestsPerMinute: 0, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
   const initialSettings = await repository.loadSettings();
   assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
@@ -194,20 +203,21 @@ test('LLM browser repository stores strict allowlisted logs and excludes prompts
   await repository.saveSettings({ enabled: true, globalProfile: 'economy', maxTokensMode: 'manual', maxTokens: 4096 });
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
   assert.deepEqual(settingsDefaults(await repository.reset()), expectedDefaults);
+  await repository.saveSettings({ requestLogging: { enabled: true, detailMode: 'summary', maxEntries: 500, retentionDays: 30, maxBytes: 100 * 1024 * 1024 } });
   await repository.setResourceSecret('resource-test', 'secret-value', { label: 'Test' });
   assert.equal([...workspace.records.values()].some((record) => JSON.stringify(record.value).includes('secret-value')), false, 'new keys must never be written to the plaintext workspace collection');
   assert.equal(secrets.records.get('resource:resource-test')?.value, 'secret-value');
   assert.equal(await repository.hasResourceSecret('resource-test'), true);
   assert.equal(await repository.getResourceSecret('resource-test'), 'secret-value');
-  await repository.saveLog({ logId: 'fixture-log', requestId: 'fixture-request', attemptId: 'fixture-attempt', request: { taskKind: 'generation', schemaHash: 'fnv1a32:1234abcd', taskDescription: 'visible prompt', metrics: { total: 1 }, body: 'must persist', headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
+  await repository.saveLog({ logId: 'fixture-log', requestId: 'fixture-request', attemptId: 'fixture-attempt', taskDescription: '测试用途', request: { taskKind: 'generation', schemaHash: 'fnv1a32:1234abcd', generationInput: { body: 'must persist' }, headers: { authorization: 'Bearer secret-value' } }, response: { meta: { resourceId: 'resource-test' }, body: 'visible response' }, state: 'completed', sourcePluginId: 'fixture' });
   const logs = await repository.queryLogs({ sourcePluginId: 'fixture' });
   assert.equal(logs.length, 1);
   assert.equal(logs[0].contentMode, 'summary');
   assert.equal(logs[0].logFormatVersion, 3);
+  assert.equal(logs[0].taskDescription, '测试用途');
   assert.equal(logs[0].request.schemaHash, 'fnv1a32:1234abcd');
   const persistedLog = JSON.stringify(logs[0]);
   assert.equal(persistedLog.includes('must persist'), false);
-  assert.equal(persistedLog.includes('visible prompt'), false);
   assert.equal(persistedLog.includes('visible response'), false);
   assert.equal(persistedLog.includes('secret-value'), false);
   await assert.rejects(
@@ -271,6 +281,75 @@ test('provider factory covers direct browser generation and rerank resources', (
   openai.dispose?.(); rerank.dispose?.();
 });
 
+test('xAI resources use the official endpoint and OpenAI-compatible tool transport', async () => {
+  const calls = [];
+  const xai = createProviderFromResource({
+    id: 'xai', type: 'generation', source: 'custom', apiType: 'xai', label: 'xAI', model: 'grok-model',
+  }, 'secret-value', async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ data: [{ id: 'grok-model' }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  });
+  assert.equal(xai.apiType, 'xai');
+  assert.equal(xai.createToolAdapter().dialect, 'openai_chat_compatible');
+  assert.equal((await xai.listModels()).ok, true);
+  assert.deepEqual(calls, ['https://api.x.ai/v1/models']);
+  xai.dispose?.();
+});
+
+test('tool capability snapshots are strictly persisted without provider payloads and removed with their resource', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.ready();
+  assert.ok(workspace.collections.includes('tool-capabilities'));
+  const capability = {
+    status: 'failed', resourceId: 'tool-resource', model: 'tool-model', dialect: 'openai_chat_compatible',
+    parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'none', reasoningReplay: 'none',
+    verifiedAt: 1_700_000_000_000, expiresAt: 1_700_000_600_000, probeVersion: 2, failureCode: 'LLM_MODEL_PROBE_FAILED',
+  };
+  await repository.saveToolCapability('fnv1a64:0123456789abcdef', capability);
+  assert.deepEqual(await repository.listToolCapabilities(), [{ cacheKey: 'fnv1a64:0123456789abcdef', capability }]);
+  assert.doesNotMatch(JSON.stringify(workspace.records.get('tool-capabilities:fnv1a64:0123456789abcdef')?.value), /api[_-]?key|authorization|provider response/iu);
+  await assert.rejects(repository.saveToolCapability('unsafe-key', capability), { code: 'INVALID_PAYLOAD' });
+
+  await repository.saveSettings({ resources: [{ id: 'tool-resource', type: 'generation', source: 'custom', apiType: 'openai', label: 'Tool', model: 'tool-model', enabled: true }] });
+  await repository.deleteResource('tool-resource');
+  assert.deepEqual(await repository.listToolCapabilities(), []);
+});
+
+test('embedding resources use the configured operation path and dimensions', async () => {
+  const originalFetch = globalThis.fetch;
+  let requestedUrl = '';
+  let requestedBody;
+  globalThis.fetch = async (input, init = {}) => {
+    requestedUrl = String(input);
+    requestedBody = JSON.parse(String(init.body));
+    return new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  try {
+    const embedding = createProviderFromResource({
+      id: 'embedding', type: 'embedding', source: 'custom', apiType: 'openai', label: 'Embedding',
+      baseUrl: 'https://provider.example/v1', model: 'embed-model', embeddingPath: '/custom/embeddings', embeddingDimensions: 3,
+    }, 'embedding-secret');
+    const response = await embedding.embed({ texts: ['hello'] });
+    assert.equal(requestedUrl, 'https://provider.example/v1/custom/embeddings');
+    assert.deepEqual(requestedBody, { model: 'embed-model', input: ['hello'], dimensions: 3 });
+    assert.deepEqual(response.embeddings, [[0.1, 0.2, 0.3]]);
+    embedding.dispose?.();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('chat and native rerank resource protocols both expose rerank execution', () => {
+  const chat = createProviderFromResource({ id: 'chat-rerank', type: 'rerank', source: 'custom', apiType: 'deepseek', label: 'Chat rank', baseUrl: 'https://provider.example/v1', model: 'deepseek-chat', rerankProtocol: 'chat' }, 'secret');
+  const native = createProviderFromResource({ id: 'native-rerank', type: 'rerank', source: 'custom', apiType: 'generic', label: 'Native rank', baseUrl: 'https://provider.example', model: 'rank', rerankProtocol: 'native', rerankPath: '/rank' }, 'secret');
+  assert.equal(typeof chat.rerank, 'function');
+  assert.equal(typeof native.rerank, 'function');
+  assert.equal(chat.capabilities.rerank, true);
+  assert.equal(native.capabilities.rerank, true);
+  chat.dispose?.(); native.dispose?.();
+});
+
 test('request log policy supports summary mode and prunes by count', async () => {
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
@@ -310,7 +389,7 @@ test('request log reason filtering is applied before limit and offset', async ()
   assert.ok(logs.every((row) => row.response.failure.reasonCode === 'AUTH_FAILED'));
 });
 
-test('legacy request logs are rewritten once to the strict v3 allowlist', async () => {
+test('explicit legacy log sanitization rewrites once to the current summary allowlist', async () => {
   const workspace = new MemoryWorkspace();
   const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.ready();
@@ -352,17 +431,56 @@ test('Workspace mutations use unique idempotency keys even when the clock is fro
     Date.now = originalNow;
   }
   assert.equal((await repository.loadSettings()).globalProfile, 'precise');
-  assert.equal(new Set(workspace.transactionKeys.filter(Boolean)).size, 2);
+  const settingsKeys = workspace.transactionKeys.filter((key) => key?.startsWith('llm-settings:'));
+  assert.equal(settingsKeys.length, 2);
+  assert.equal(new Set(settingsKeys).size, 2);
 });
 
 test('settings validation rejects coercion and malformed nested routing values', async () => {
   const repository = new LlmWorkspaceRepository(new MemoryWorkspace(), new MemorySecrets());
+  await repository.saveSettings({ resources: [{ id: 'xai-ok', type: 'generation', source: 'custom', apiType: 'xai', label: 'xAI', baseUrl: 'https://api.x.ai/v1', model: 'grok-model' }] });
+  assert.equal((await repository.loadSettings()).resources[0].apiType, 'xai');
   await assert.rejects(repository.saveSettings({ enabled: 'false' }), { code: 'INVALID_PAYLOAD' });
   await assert.rejects(repository.saveSettings({ globalProfile: 'unknown' }), { code: 'INVALID_PAYLOAD' });
   await assert.rejects(repository.saveSettings({ generationSource: 'automatic' }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ maxRequestsPerMinute: -1 }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ maxRequestsPerMinute: 1.5 }), { code: 'INVALID_PAYLOAD' });
   await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad', type: 'generation', source: 'custom', label: 'Bad', enabled: 'false' }] }), { code: 'INVALID_PAYLOAD' });
   await assert.rejects(repository.saveSettings({ globalAssignments: { generation: { resourceId: 42 } } }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad-embed', type: 'embedding', source: 'custom', apiType: 'deepseek', label: 'Bad embed', embeddingPath: '/embeddings' }] }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad-xai-embed', type: 'embedding', source: 'custom', apiType: 'xai', label: 'Bad xAI embed', embeddingPath: '/embeddings' }] }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad-xai-rerank', type: 'rerank', source: 'custom', apiType: 'xai', label: 'Bad xAI rerank', rerankProtocol: 'native', rerankPath: '/rerank' }] }), { code: 'INVALID_PAYLOAD' });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'bad-rerank', type: 'rerank', source: 'custom', apiType: 'generic', label: 'Bad rerank', rerankProtocol: 'native', rerankPath: 'https://wrong.example/rerank' }] }), { code: 'INVALID_PAYLOAD' });
   assert.equal((await repository.loadSettings()).globalProfile, 'balanced');
+});
+
+test('stored log sanitization removes Provider request echoes without discarding full response diagnostics', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.ready();
+  await workspace.put({
+    collection: 'request-logs',
+    id: 'unsafe-current-log',
+    value: {
+      logId: 'unsafe-current-log', requestId: 'unsafe-current-request', sourcePluginId: 'fixture',
+      state: 'failed', taskKind: 'generation', contentMode: 'full', logFormatVersion: 3, createdAt: 2,
+      response: {
+        rawResponseText: 'VISIBLE_MODEL_RESPONSE',
+        providerResponse: { content: 'VISIBLE_PROVIDER_RESPONSE', debugRequest: { payload: { messages: [{ content: 'PROMPT_ECHO_SENTINEL' }] } } },
+        parsedResponse: { visible: true },
+      },
+    },
+  });
+  assert.equal(await repository.sanitizeStoredLogs(), 1);
+  assert.equal(await repository.sanitizeStoredLogs(), 0);
+  const [log] = await repository.queryLogs({ sourcePluginId: 'fixture' });
+  const serialized = JSON.stringify(log);
+  assert.equal(log.contentMode, 'full');
+  assert.equal(log.response.rawResponseText, 'VISIBLE_MODEL_RESPONSE');
+  assert.equal(log.response.providerResponse.content, 'VISIBLE_PROVIDER_RESPONSE');
+  assert.equal(log.response.providerResponse.debugRequest, '[未记录]');
+  assert.deepEqual(log.response.parsedResponse, { visible: true });
+  assert.equal(serialized.includes('PROMPT_ECHO_SENTINEL'), false);
 });
 
 test('clearLogs paginates beyond one thousand records and can resume after a failed batch', async () => {
@@ -534,6 +652,8 @@ test('generation source hot-switches Tavern to custom and back without crossing 
     assert.deepEqual(unavailable.checks[0], { id: 'generation', source: 'custom', configured: false, available: false, reason: 'credential_missing' });
     await repository.setResourceSecret(resource.id, 'runtime-secret');
     assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'two' }] }, signal)).text, 'custom-ok');
+    const routing = await handlers.getTaskRouting({ taskKeys: [] }, 'ss-helper.memory');
+    assert.equal(routing.resources.find((item) => item.resourceId === resource.id)?.capabilities.includes('tools'), true);
 
     await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'tavern' });
     assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'three' }], route: resource.id }, signal)).text, 'tavern-ok');
@@ -608,7 +728,7 @@ test('Claude, Gemini and custom rerank adapters keep provider credentials and er
     const headers = new Headers(init.headers);
     calls.push({ url, headers });
     if (url.includes('/messages')) return new Response(JSON.stringify({ content: [{ type: 'text', text: 'claude-ok' }], usage: { input_tokens: 1, output_tokens: 2 } }), { status: 200 });
-    if (url.includes('generateContent')) return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'gemini-ok' }] } }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 2, totalTokenCount: 3 } }), { status: 200 });
+    if (url.includes('GenerateContent')) return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: 'gemini-ok' }] } }], usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 2, totalTokenCount: 3 } }), { status: 200 });
     return new Response(JSON.stringify({ results: [{ index: 0, relevance_score: 0.9, document: 'doc' }] }), { status: 200 });
   };
   try {

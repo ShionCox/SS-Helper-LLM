@@ -12,6 +12,7 @@ import type {
     TaskAssignment,
 } from '../schema/types';
 import type { ConsumerRegistry } from '../registry/consumer-registry';
+import { createSSHelperError } from '@ss-helper/sdk';
 
 /** 内置酒馆资源固定 ID */
 export const BUILTIN_TAVERN_RESOURCE_ID = '__builtin_tavern__';
@@ -169,14 +170,19 @@ export class TaskRouter {
         // 2. 任务分配
         if (taskKey) {
             const assignment = this.taskAssignments.get(`${consumer}::${taskKey}`);
-            if (assignment?.resourceId && !assignment.isStale) {
-                if (this.providerSatisfiesTask(assignment.resourceId, taskKind, requiredCapabilities)) {
+            if (assignment) {
+                if (assignment.resourceId && !assignment.isStale && this.providerSatisfiesTask(assignment.resourceId, taskKind, requiredCapabilities)) {
                     return {
                         resourceId: assignment.resourceId,
                         model: assignment.model || this.resolveDefaultModel(assignment.resourceId),
                         resolvedBy: 'user_task_override',
                     };
                 }
+                throw createSSHelperError('LLM_TASK_ROUTE_UNAVAILABLE', {
+                    stage: 'llm.router.task_assignment',
+                    ...(assignment.resourceId === undefined ? {} : { resourceId: assignment.resourceId }),
+                    ...(assignment.model === undefined ? {} : { model: assignment.model }),
+                });
             }
         }
 
@@ -256,7 +262,9 @@ export class TaskRouter {
             }
         }
 
-        throw new Error(`[TaskRouter] 无法为 consumer="${consumer}" taskKind="${taskKind}" 找到可用资源`);
+        throw createSSHelperError('PROVIDER_UNAVAILABLE', {
+            stage: 'llm.router.resolve',
+        });
     }
 
     // ─── 能力查询 ───
@@ -284,6 +292,10 @@ export class TaskRouter {
 
     getResourceType(resourceId: string): ResourceType | undefined {
         return this.resourceTypes.get(resourceId);
+    }
+
+    getDefaultModel(resourceId: string): string | undefined {
+        return this.resolveDefaultModel(resourceId);
     }
 
     // ─── 内部方法 ───

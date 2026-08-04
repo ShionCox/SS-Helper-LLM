@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { OpenAIProvider, TavernProvider } from '../dist/index.js';
+import { createCoreBridgeFetch } from '../dist/src/ss-helper/core-bridge-fetch.js';
 
 function rerankProvider(content) {
   return new OpenAIProvider({
@@ -20,9 +21,35 @@ const rerankRequest = {
   topK: 1,
 };
 
+test('an incomplete successful Bridge response becomes a protocol failure with private response evidence', async () => {
+  const rawResponseText = 'data: {"choices":[';
+  const bridgeFetch = createCoreBridgeFetch(async () => ({
+    ok: true,
+    body: {
+      ok: true,
+      data: {
+        status: 200,
+        ok: true,
+        body: rawResponseText,
+        contentType: 'text/event-stream',
+        receivedBytes: 19,
+        incomplete: true,
+      },
+    },
+  }));
+  await assert.rejects(
+    bridgeFetch('https://provider.invalid/v1/chat/completions', { method: 'POST' }),
+    (error) => error?.details?.reasonCode === 'HTTP_RESPONSE_PROTOCOL_INVALID'
+      && error.rawResponseText === rawResponseText
+      && error.providerResponse?.incomplete === true
+      && !JSON.stringify(error).includes(rawResponseText),
+  );
+});
+
 test('OpenAI-compatible rerank accepts one strict root object and applies topK after validation', async () => {
   const result = await rerankProvider('{"results":[{"index":1,"score":0.9},{"index":0,"score":0.2}]}').rerank(rerankRequest);
   assert.deepEqual(result.results, [{ index: 1, score: 0.9, doc: 'second' }]);
+  assert.deepEqual([result.diagnostics.httpStatus, result.diagnostics.streamed], [200, false]);
 });
 
 for (const [name, content, reasonCode] of [

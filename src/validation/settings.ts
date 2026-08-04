@@ -2,8 +2,8 @@ import { createSSHelperError } from '@ss-helper/sdk';
 import type { BudgetConfig } from '../budget/budget-manager';
 import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, PluginAssignment, ResourceConfig, TaskAssignment } from '../schema/types';
 
-const TOP_LEVEL = new Set(['enabled', 'generationSource', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'requestLogging']);
-const RESOURCE_KEYS = new Set(['id', 'type', 'source', 'apiType', 'label', 'baseUrl', 'model', 'enabled', 'rerankPath', 'capabilities', 'customParams']);
+const TOP_LEVEL = new Set(['enabled', 'generationSource', 'streamingEnabled', 'maxRequestsPerMinute', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'requestLogging']);
+const RESOURCE_KEYS = new Set(['id', 'type', 'source', 'apiType', 'label', 'baseUrl', 'model', 'enabled', 'embeddingPath', 'embeddingDimensions', 'rerankPath', 'rerankProtocol', 'capabilities', 'customParams', 'toolDialect', 'privacyPolicy']);
 const BUDGET_KEYS = new Set(['maxRPM', 'maxTokens', 'maxLatencyMs']);
 const MAX_JSON_BYTES = 256 * 1024;
 const LOG_DETAIL_MODES = ['full', 'failed-full', 'summary', 'off'] as const;
@@ -41,6 +41,17 @@ function enumString<T extends string>(value: unknown, name: string, allowed: rea
   return normalized;
 }
 
+function nonNegativeInteger(value: unknown, name: string, max: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > max) invalid(`${name} 必须是有效的非负整数`);
+  return value;
+}
+
+function operationPath(value: unknown, name: string): string {
+  const path = string(value, name, 512);
+  if (!path.startsWith('/') || path.startsWith('//') || path.includes('?') || path.includes('#')) invalid(`${name} 必须是以单个 / 开头且不含查询参数或片段的路径`);
+  return path.replace(/\/+$/u, '') || '/';
+}
+
 function rejectDeprecated(value: unknown, depth = 0): void {
   if (depth > 12) invalid('设置嵌套过深');
   if (Array.isArray(value)) { if (value.length > 1_000) invalid('设置数组过长'); value.forEach((item) => rejectDeprecated(item, depth + 1)); return; }
@@ -58,7 +69,7 @@ function validateResource(value: unknown): ResourceConfig {
   const source = string(record.source, 'resource.source', 32);
   if (!['generation', 'embedding', 'rerank'].includes(type) || source !== 'custom') invalid('resource 类型无效');
   const apiType = string(record.apiType, 'resource.apiType', 32);
-  if (!['auto', 'openai', 'deepseek', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
+  if (!['auto', 'openai', 'xai', 'deepseek', 'kimi', 'glm', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
   let baseUrl: string | undefined;
   if (record.baseUrl !== undefined) {
     baseUrl = string(record.baseUrl, 'resource.baseUrl', 2_048);
@@ -78,13 +89,38 @@ function validateResource(value: unknown): ResourceConfig {
   if (record.customParams !== undefined) rejectDeprecated(record.customParams);
   const id = string(record.id, 'resource.id', 128);
   if (id === '__builtin_tavern__') invalid('resource.id 保留给酒馆资源');
+  const toolDialect = record.toolDialect === undefined ? undefined : enumString(record.toolDialect, 'resource.toolDialect', [
+    'openai_responses', 'anthropic_messages', 'gemini_interactions', 'deepseek_chat', 'kimi_chat', 'glm_chat', 'openai_chat_compatible',
+  ] as const);
+  const privacyPolicy = record.privacyPolicy === undefined ? undefined : (() => {
+    const policy = object(record.privacyPolicy, 'resource.privacyPolicy');
+    for (const key of Object.keys(policy)) if (!['conversationStateMode', 'storeProviderState', 'allowRemoteRetention'].includes(key)) invalid(`resource.privacyPolicy.${key} 不受支持`);
+    const conversationStateMode = enumString(policy.conversationStateMode, 'resource.privacyPolicy.conversationStateMode', ['local_replay', 'provider_managed'] as const);
+    if (typeof policy.storeProviderState !== 'boolean' || typeof policy.allowRemoteRetention !== 'boolean') invalid('resource.privacyPolicy 布尔字段无效');
+    const remote = conversationStateMode === 'provider_managed';
+    if (remote !== policy.storeProviderState || remote !== policy.allowRemoteRetention) invalid('供应商托管状态必须同时明确允许 store 与远端留存');
+    return { conversationStateMode, storeProviderState: policy.storeProviderState, allowRemoteRetention: policy.allowRemoteRetention };
+  })();
+  if (type !== 'embedding' && (record.embeddingPath !== undefined || record.embeddingDimensions !== undefined)) invalid('只有 embedding 资源可以配置 embeddingPath 或 embeddingDimensions');
+  if (type !== 'rerank' && (record.rerankPath !== undefined || record.rerankProtocol !== undefined)) invalid('只有 rerank 资源可以配置 rerankPath 或 rerankProtocol');
+  const embeddingPath = record.embeddingPath === undefined ? undefined : operationPath(record.embeddingPath, 'resource.embeddingPath');
+  const embeddingDimensions = record.embeddingDimensions === undefined ? undefined : positiveInteger(record.embeddingDimensions, 'resource.embeddingDimensions', 100_000);
+  const rerankPath = record.rerankPath === undefined ? undefined : operationPath(record.rerankPath, 'resource.rerankPath');
+  const rerankProtocol = record.rerankProtocol === undefined ? undefined : enumString(record.rerankProtocol, 'resource.rerankProtocol', ['native', 'chat'] as const);
+  if (apiType === 'xai' && type !== 'generation') invalid('xAI / Grok 服务模板仅支持生成资源');
+  if (type === 'embedding' && ['claude', 'deepseek', 'kimi', 'glm'].includes(apiType)) invalid('当前服务模板不提供 embedding 协议，请改用 OpenAI-compatible、Gemini 或通用兼容服务');
+  if (type === 'rerank' && rerankProtocol === 'chat' && ['claude', 'gemini'].includes(apiType)) invalid('聊天模型重排仅支持 OpenAI-compatible 系协议');
   return {
     id, type: type as ResourceConfig['type'], source: 'custom', apiType: apiType as ResourceConfig['apiType'],
     label: string(record.label, 'resource.label', 128), ...(baseUrl ? { baseUrl } : {}),
     ...(record.model === undefined || record.model === '' ? {} : { model: string(record.model, 'resource.model', 256) }),
     ...(record.enabled === undefined ? {} : { enabled: typeof record.enabled === 'boolean' ? record.enabled : invalid('resource.enabled 必须是布尔值') }),
-    ...(record.rerankPath === undefined ? {} : { rerankPath: string(record.rerankPath, 'resource.rerankPath', 512) }),
+    ...(embeddingPath === undefined ? {} : { embeddingPath }),
+    ...(embeddingDimensions === undefined ? {} : { embeddingDimensions }),
+    ...(rerankPath === undefined ? {} : { rerankPath }),
+    ...(rerankProtocol === undefined ? {} : { rerankProtocol }),
     ...(capabilities ? { capabilities } : {}), ...(record.customParams === undefined ? {} : { customParams: structuredClone(object(record.customParams, 'resource.customParams')) }),
+    ...(toolDialect ? { toolDialect } : {}), ...(privacyPolicy ? { privacyPolicy } : {}),
   };
 }
 
@@ -207,6 +243,8 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
   const result = structuredClone(input) as LLMHubSettings;
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') invalid('enabled 必须是布尔值');
   if (input.generationSource !== undefined) result.generationSource = enumString(input.generationSource, 'generationSource', ['tavern', 'custom'] as const);
+  if (input.streamingEnabled !== undefined && typeof input.streamingEnabled !== 'boolean') invalid('streamingEnabled 必须是布尔值');
+  if (input.maxRequestsPerMinute !== undefined) result.maxRequestsPerMinute = nonNegativeInteger(input.maxRequestsPerMinute, 'maxRequestsPerMinute', 60_000);
   if (input.timeoutMs !== undefined) result.timeoutMs = positiveInteger(input.timeoutMs, 'timeoutMs', 600_000);
   if (input.maxTokens !== undefined) result.maxTokens = positiveInteger(input.maxTokens, 'maxTokens', 1_000_000);
   if (input.maxTokensMode !== undefined) result.maxTokensMode = enumString(input.maxTokensMode, 'maxTokensMode', ['inherit', 'manual', 'adaptive'] as const);

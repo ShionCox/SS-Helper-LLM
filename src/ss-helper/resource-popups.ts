@@ -6,8 +6,10 @@ import {
   type PopupMenuHandle,
   type PopupUiContext,
   type PopupWizardAdapter,
+  type PopupWizardCheckSnapshot,
   type PopupWizardDefinition,
   type PopupWizardSnapshot,
+  type ProviderToolDialect,
   type SSHelperFailureContext,
   type SSHelperReasonCode,
 } from '@ss-helper/sdk';
@@ -23,18 +25,27 @@ import {
   type ResourceVerificationSnapshot,
 } from './resource-verification';
 import { createCoreBridgeFetch } from './core-bridge-fetch';
+import type { LlmServiceHandlers } from './services';
 
 type WizardStepId = 'purpose' | 'provider' | 'connection' | 'verification';
 type ApiType = Exclude<ResourceConfig['apiType'], 'auto'>;
-type ResourceNotifier = (level: 'success' | 'error', title: string, message: string, code: string) => void;
+type ConnectionMode = 'official' | 'relay';
+type ResourceNotifier = (level: 'success' | 'warning' | 'error', title: string, message: string, code: string) => void;
+type ResourceToolServices = Pick<LlmServiceHandlers, 'getTaskRouting' | 'verifyToolCapability'>;
 
 interface ResourceDraft {
   type: ResourceType;
   apiType: ApiType;
+  connectionMode: ConnectionMode;
   label: string;
   baseUrl: string;
   apiKey: string;
   model: string;
+  toolDialect: ProviderToolDialect;
+  embeddingPath: string;
+  embeddingDimensions: number | '';
+  rerankProtocol: 'native' | 'chat';
+  rerankPath: string;
 }
 
 interface ResourceWizardState {
@@ -42,7 +53,7 @@ interface ResourceWizardState {
   readonly completed: Set<WizardStepId>;
   draft: ResourceDraft;
   fieldErrors: Record<string, string>;
-  checks: ResourceVerificationSnapshot;
+  checks: ResourceVerificationSnapshot & { readonly toolCalls: PopupWizardCheckSnapshot };
   busy: boolean;
   dirty: boolean;
   modelOptions: readonly { value: string; label: string }[];
@@ -51,17 +62,23 @@ interface ResourceWizardState {
 }
 
 const STEP_IDS: readonly WizardStepId[] = ['purpose', 'provider', 'connection', 'verification'];
-const PROVIDERS: readonly ApiType[] = ['openai', 'deepseek', 'claude', 'gemini', 'generic'];
+const PROVIDERS: readonly ApiType[] = ['openai', 'xai', 'deepseek', 'kimi', 'glm', 'claude', 'gemini', 'generic'];
 const PROVIDER_LABELS: Readonly<Record<ApiType, string>> = Object.freeze({
   openai: 'OpenAI-compatible',
+  xai: 'xAI / Grok',
   deepseek: 'DeepSeek',
+  kimi: 'Kimi',
+  glm: 'GLM',
   claude: 'Claude',
   gemini: 'Gemini',
   generic: '通用兼容服务',
 });
 const PROVIDER_URLS: Readonly<Record<ApiType, string>> = Object.freeze({
   openai: 'https://api.openai.com/v1',
+  xai: 'https://api.x.ai/v1',
   deepseek: 'https://api.deepseek.com',
+  kimi: 'https://api.moonshot.cn/v1',
+  glm: 'https://open.bigmodel.cn/api/paas/v4',
   claude: 'https://api.anthropic.com/v1',
   gemini: 'https://generativelanguage.googleapis.com/v1beta',
   generic: '',
@@ -72,12 +89,13 @@ const PURPOSE_LABELS: Readonly<Record<ResourceType, string>> = Object.freeze({
   rerank: '重排序',
 });
 
-function emptyChecks(): ResourceVerificationSnapshot {
+function emptyChecks(): ResourceWizardState['checks'] {
   return {
     network: { state: 'idle', description: '等待检查服务地址' },
     auth: { state: 'idle', description: '等待检查 API Key' },
     model: { state: 'idle', description: '等待检查模型' },
     capability: { state: 'idle', description: '等待检查用途能力' },
+    toolCalls: { state: 'idle', description: '生成模型保存后自动验证；失败不影响普通生成' },
   };
 }
 
@@ -85,8 +103,8 @@ function providerOptions(type: ResourceType): readonly { value: string; label: s
   const allowed = type === 'generation'
     ? PROVIDERS
     : type === 'embedding'
-      ? PROVIDERS.filter((provider) => provider !== 'claude' && provider !== 'deepseek')
-      : PROVIDERS.filter((provider) => provider === 'openai' || provider === 'deepseek' || provider === 'generic');
+      ? PROVIDERS.filter((provider) => !['xai', 'claude', 'deepseek', 'kimi', 'glm'].includes(provider))
+      : PROVIDERS.filter((provider) => provider === 'openai' || provider === 'deepseek' || provider === 'kimi' || provider === 'glm' || provider === 'generic');
   return allowed.map((value) => ({ value, label: PROVIDER_LABELS[value] }));
 }
 
@@ -112,6 +130,32 @@ function parseBaseUrl(value: string): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+function inferConnectionMode(apiType: ApiType, baseUrl: string): ConnectionMode {
+  const official = PROVIDER_URLS[apiType];
+  if (!official) return 'relay';
+  return parseBaseUrl(baseUrl) === parseBaseUrl(official) ? 'official' : 'relay';
+}
+
+function defaultToolDialect(apiType: ApiType, connectionMode: ConnectionMode = 'official'): ProviderToolDialect {
+  if (apiType === 'openai') return connectionMode === 'relay' ? 'openai_chat_compatible' : 'openai_responses';
+  if (apiType === 'deepseek') return 'deepseek_chat';
+  if (apiType === 'kimi') return 'kimi_chat';
+  if (apiType === 'glm') return 'glm_chat';
+  if (apiType === 'claude') return 'anthropic_messages';
+  if (apiType === 'gemini') return 'gemini_interactions';
+  return 'openai_chat_compatible';
+}
+
+function isOpenAiToolProtocol(value: ProviderToolDialect): boolean {
+  return value === 'openai_chat_compatible' || value === 'openai_responses';
+}
+
+function parseOperationPath(value: string): string | undefined {
+  const path = value.trim();
+  if (!path.startsWith('/') || path.startsWith('//') || path.includes('?') || path.includes('#')) return undefined;
+  return path.replace(/\/+$/u, '') || '/';
 }
 
 const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
@@ -160,6 +204,10 @@ const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
       description: '填写地址、密钥和模型',
       fields: [
         { kind: 'text', id: 'label', label: '资源名称', placeholder: '例如：主要生成服务', validation: { required: true, min: 1, max: 128 } },
+        { kind: 'segmented', id: 'connectionMode', label: '连接方式', description: '官方直连使用标准地址；第三方中转允许填写兼容服务地址。', options: [
+          { value: 'official', label: '官方直连' },
+          { value: 'relay', label: '第三方中转' },
+        ], validation: { required: true } },
         { kind: 'text', id: 'baseUrl', label: 'Base URL', placeholder: 'https://api.example.com/v1', validation: { required: true, max: 2048 } },
         { kind: 'text', id: 'apiKey', label: 'API Key', description: '编辑资源时留空代表继续使用现有密钥。', secret: true, validation: { max: 65536 } },
         {
@@ -172,6 +220,17 @@ const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
           customPlaceholder: '输入模型 ID',
           validation: { required: true },
         },
+        { kind: 'segmented', id: 'toolDialect', label: 'Agent 工具协议', description: '只影响 Agent 工具续轮；中转站默认使用 Chat Completions。', options: [
+          { value: 'openai_chat_compatible', label: 'Chat Completions' },
+          { value: 'openai_responses', label: 'Responses API' },
+        ], validation: { required: true } },
+        { kind: 'text', id: 'embeddingPath', label: '向量接口路径', description: '仅用于向量化资源，例如 /embeddings。', placeholder: '/embeddings', validation: { max: 512 } },
+        { kind: 'number', id: 'embeddingDimensions', label: '向量维度', description: '可选；留空时使用模型默认维度。', validation: { min: 1, max: 100000 }, step: 1, showStepper: true },
+        { kind: 'segmented', id: 'rerankProtocol', label: '重排协议', description: '原生调用 /rerank；聊天模型通过严格 JSON 评分完成重排。', options: [
+          { value: 'native', label: '原生接口' },
+          { value: 'chat', label: '聊天模型' },
+        ] },
+        { kind: 'text', id: 'rerankPath', label: '重排接口路径', description: '仅用于原生重排资源，例如 /rerank。', placeholder: '/rerank', validation: { max: 512 } },
       ],
     },
     {
@@ -190,11 +249,12 @@ const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
       { id: 'auth', label: '鉴权', icon: 'shield-halved', description: 'API Key 有效' },
       { id: 'model', label: '模型', icon: 'cube', description: '模型存在并可以调用' },
       { id: 'capability', label: '用途能力', icon: 'brackets-curly', description: '支持所选资源用途' },
+      { id: 'toolCalls', label: '工具调用（Agent，可选）', icon: 'screwdriver-wrench', description: '失败不影响保存和普通生成' },
     ],
   },
 };
 
-class ResourceWizardController implements PopupWizardAdapter {
+export class ResourceWizardController implements PopupWizardAdapter {
   readonly #listeners = new Set<() => void>();
   readonly #verification: ResourceVerificationCoordinator;
   readonly #abortController = new AbortController();
@@ -205,6 +265,7 @@ class ResourceWizardController implements PopupWizardAdapter {
   readonly #repository: LlmWorkspaceRepository;
   readonly #ui: PopupUiContext;
   readonly #notify: ResourceNotifier;
+  readonly #toolServices: ResourceToolServices;
   readonly #state: ResourceWizardState;
   #modelDiscoveryAbort?: AbortController;
   #modelDiscoveryTimer?: ReturnType<typeof setTimeout>;
@@ -218,6 +279,7 @@ class ResourceWizardController implements PopupWizardAdapter {
     ui: PopupUiContext;
     notify: ResourceNotifier;
     verification: ResourceVerificationCoordinator;
+    toolServices: ResourceToolServices;
   }) {
     this.#mode = options.mode;
     this.#source = options.source;
@@ -227,15 +289,24 @@ class ResourceWizardController implements PopupWizardAdapter {
     this.#ui = options.ui;
     this.#notify = options.notify;
     this.#verification = options.verification;
+    this.#toolServices = options.toolServices;
     const sourceType = options.source?.type ?? 'generation';
     const sourceApiType = options.source?.apiType === 'auto' || options.source?.apiType === undefined ? 'generic' : options.source.apiType;
+    const sourceBaseUrl = options.source?.baseUrl ?? PROVIDER_URLS[sourceApiType];
+    const sourceConnectionMode = inferConnectionMode(sourceApiType, sourceBaseUrl);
     const draft: ResourceDraft = {
       type: sourceType,
       apiType: sourceApiType,
+      connectionMode: sourceConnectionMode,
       label: options.mode === 'copy' ? `${options.source?.label ?? '资源'}（副本）` : options.source?.label ?? '',
-      baseUrl: options.source?.baseUrl ?? PROVIDER_URLS[sourceApiType],
+      baseUrl: sourceBaseUrl,
       apiKey: '',
       model: options.source?.model ?? '',
+      toolDialect: options.source?.toolDialect ?? defaultToolDialect(sourceApiType, options.source ? 'official' : sourceConnectionMode),
+      embeddingPath: options.source?.embeddingPath ?? '/embeddings',
+      embeddingDimensions: options.source?.embeddingDimensions ?? '',
+      rerankProtocol: options.source?.rerankProtocol ?? (sourceApiType === 'generic' ? 'native' : 'chat'),
+      rerankPath: options.source?.rerankPath ?? '/rerank',
     };
     this.#state = {
       activeStepId: 'purpose',
@@ -254,6 +325,9 @@ class ResourceWizardController implements PopupWizardAdapter {
 
   snapshot(): PopupWizardSnapshot {
     const checks = Object.fromEntries(Object.entries(this.#state.checks).map(([id, check]) => [id, { ...check }]));
+    const draft = this.#state.draft;
+    const showToolProtocol = draft.type === 'generation'
+      && (draft.apiType === 'openai' || draft.apiType === 'xai' || (draft.apiType === 'generic' && isOpenAiToolProtocol(draft.toolDialect)));
     return {
       activeStepId: this.#state.activeStepId,
       completedStepIds: [...this.#state.completed],
@@ -263,6 +337,14 @@ class ResourceWizardController implements PopupWizardAdapter {
         apiType: providerOptions(this.#state.draft.type),
         model: this.#state.modelOptions,
       },
+      disabledFieldIds: draft.connectionMode === 'official' && PROVIDER_URLS[draft.apiType] ? ['baseUrl'] : [],
+      hiddenFieldIds: [
+        ...(PROVIDER_URLS[draft.apiType] ? [] : ['connectionMode']),
+        ...(showToolProtocol ? [] : ['toolDialect']),
+        ...(draft.type === 'embedding' ? [] : ['embeddingPath', 'embeddingDimensions']),
+        ...(draft.type === 'rerank' ? [] : ['rerankProtocol']),
+        ...(draft.type === 'rerank' && draft.rerankProtocol === 'native' ? [] : ['rerankPath']),
+      ],
       dirty: this.#state.dirty,
       busy: this.#state.busy,
       submitDisabled: this.#state.busy || Object.keys(this.#validateStep(this.#state.activeStepId, false)).length > 0,
@@ -284,22 +366,36 @@ class ResourceWizardController implements PopupWizardAdapter {
       if (!providerOptions(draft.type).some((option) => option.value === draft.apiType)) {
         draft.apiType = (providerOptions(draft.type)[0]?.value ?? 'generic') as ApiType;
         draft.baseUrl = PROVIDER_URLS[draft.apiType];
+        draft.connectionMode = PROVIDER_URLS[draft.apiType] ? 'official' : 'relay';
+        draft.toolDialect = defaultToolDialect(draft.apiType, draft.connectionMode);
       }
     } else if (fieldId === 'apiType' && typeof value === 'string' && PROVIDERS.includes(value as ApiType)) {
       const previousDefault = PROVIDER_URLS[draft.apiType];
+      const previousWasOfficial = draft.connectionMode === 'official' || (!!previousDefault && parseBaseUrl(draft.baseUrl) === parseBaseUrl(previousDefault));
       draft.apiType = value as ApiType;
-      if (!draft.baseUrl || draft.baseUrl === previousDefault) draft.baseUrl = PROVIDER_URLS[draft.apiType];
+      if (!draft.baseUrl || previousWasOfficial) draft.baseUrl = PROVIDER_URLS[draft.apiType];
+      draft.connectionMode = inferConnectionMode(draft.apiType, draft.baseUrl);
+      draft.toolDialect = defaultToolDialect(draft.apiType, draft.connectionMode);
+    } else if (fieldId === 'connectionMode' && (value === 'official' || value === 'relay')) {
+      draft.connectionMode = value;
+      if (value === 'official' && PROVIDER_URLS[draft.apiType]) draft.baseUrl = PROVIDER_URLS[draft.apiType];
+      draft.toolDialect = defaultToolDialect(draft.apiType, value);
     } else if (fieldId === 'label' && typeof value === 'string') draft.label = value;
     else if (fieldId === 'baseUrl' && typeof value === 'string') draft.baseUrl = value;
     else if (fieldId === 'apiKey' && typeof value === 'string') draft.apiKey = value;
     else if (fieldId === 'model' && typeof value === 'string') draft.model = value;
+    else if (fieldId === 'toolDialect' && (value === 'openai_chat_compatible' || value === 'openai_responses')) draft.toolDialect = value;
+    else if (fieldId === 'embeddingPath' && typeof value === 'string') draft.embeddingPath = value;
+    else if (fieldId === 'embeddingDimensions' && (typeof value === 'number' || value === '')) draft.embeddingDimensions = value;
+    else if (fieldId === 'rerankProtocol' && (value === 'native' || value === 'chat')) draft.rerankProtocol = value;
+    else if (fieldId === 'rerankPath' && typeof value === 'string') draft.rerankPath = value;
     else return;
     this.#state.dirty = true;
     this.#state.checks = emptyChecks();
     this.#state.status = undefined;
     this.#state.fieldErrors = this.#validateStep(this.#state.activeStepId, false);
     this.#emit();
-    if (fieldId === 'type' || fieldId === 'apiType' || fieldId === 'baseUrl' || fieldId === 'apiKey') {
+    if (fieldId === 'type' || fieldId === 'apiType' || fieldId === 'connectionMode' || fieldId === 'baseUrl' || fieldId === 'apiKey') {
       this.#state.modelOptions = [];
       this.#scheduleModelDiscovery();
     }
@@ -384,6 +480,17 @@ class ResourceWizardController implements PopupWizardAdapter {
         model: this.#state.draft.model.trim() || undefined,
         enabled: false,
         capabilities: capabilities(this.#state.draft.type),
+        ...(this.#source?.customParams === undefined ? {} : { customParams: this.#source.customParams }),
+        ...(this.#state.draft.type === 'generation' ? { toolDialect: this.#state.draft.toolDialect } : {}),
+        ...(this.#source?.privacyPolicy === undefined ? {} : { privacyPolicy: this.#source.privacyPolicy }),
+        ...(this.#state.draft.type === 'embedding' ? {
+          embeddingPath: parseOperationPath(this.#state.draft.embeddingPath) ?? '/embeddings',
+          ...(typeof this.#state.draft.embeddingDimensions === 'number' ? { embeddingDimensions: this.#state.draft.embeddingDimensions } : {}),
+        } : {}),
+        ...(this.#state.draft.type === 'rerank' ? {
+          rerankProtocol: this.#state.draft.rerankProtocol,
+          ...(this.#state.draft.rerankProtocol === 'native' ? { rerankPath: parseOperationPath(this.#state.draft.rerankPath) ?? '/rerank' } : {}),
+        } : {}),
       };
       const result = await this.#verification.discoverModels(candidate, key, {
         signal: controller.signal,
@@ -436,6 +543,17 @@ class ResourceWizardController implements PopupWizardAdapter {
       if (!draft.model.trim()) errors.model = '请输入模型 ID';
       if ((this.#mode !== 'edit' || !this.#hasStoredSecret) && !draft.apiKey.trim()) errors.apiKey = '请输入 API Key';
       if (draft.apiKey.length > 65_536) errors.apiKey = 'API Key 过长';
+      if (draft.connectionMode === 'official' && !PROVIDER_URLS[draft.apiType]) errors.connectionMode = '当前服务没有可用的官方地址';
+      if (draft.type === 'generation' && (draft.apiType === 'openai' || draft.apiType === 'xai' || draft.apiType === 'generic')
+        && !isOpenAiToolProtocol(draft.toolDialect)) errors.toolDialect = '请选择 Chat Completions 或 Responses API';
+      if (draft.type === 'embedding') {
+        if (parseOperationPath(draft.embeddingPath) === undefined) errors.embeddingPath = '请输入以单个 / 开头且不含查询参数或片段的路径';
+        if (draft.embeddingDimensions !== '' && (!Number.isInteger(draft.embeddingDimensions) || draft.embeddingDimensions <= 0 || draft.embeddingDimensions > 100_000)) errors.embeddingDimensions = '向量维度必须是 1 到 100000 的整数';
+      }
+      if (draft.type === 'rerank') {
+        if (draft.rerankProtocol !== 'native' && draft.rerankProtocol !== 'chat') errors.rerankProtocol = '请选择重排协议';
+        if (draft.rerankProtocol === 'native' && parseOperationPath(draft.rerankPath) === undefined) errors.rerankPath = '请输入以单个 / 开头且不含查询参数或片段的路径';
+      }
     }
     if (!includeRequired && !this.#state.dirty && step === 'purpose') return {};
     return errors;
@@ -468,17 +586,28 @@ class ResourceWizardController implements PopupWizardAdapter {
         model: this.#state.draft.model.trim(),
         enabled: true,
         capabilities: capabilities(this.#state.draft.type),
+        ...(this.#source?.customParams === undefined ? {} : { customParams: this.#source.customParams }),
+        ...(this.#state.draft.type === 'generation' ? { toolDialect: this.#state.draft.toolDialect } : {}),
+        ...(this.#source?.privacyPolicy === undefined ? {} : { privacyPolicy: this.#source.privacyPolicy }),
+        ...(this.#state.draft.type === 'embedding' ? {
+          embeddingPath: parseOperationPath(this.#state.draft.embeddingPath),
+          ...(typeof this.#state.draft.embeddingDimensions === 'number' ? { embeddingDimensions: this.#state.draft.embeddingDimensions } : {}),
+        } : {}),
+        ...(this.#state.draft.type === 'rerank' ? {
+          rerankProtocol: this.#state.draft.rerankProtocol,
+          ...(this.#state.draft.rerankProtocol === 'native' ? { rerankPath: parseOperationPath(this.#state.draft.rerankPath) } : {}),
+        } : {}),
       };
       const verificationStartedAt = Date.now();
       const result = await this.#verification.verify(candidate, key, {
         signal: this.#abortController.signal,
         timeoutMs: this.#timeoutMs,
         onProgress: (checks) => {
-          this.#state.checks = checks;
+          this.#state.checks = { ...checks, toolCalls: this.#state.checks.toolCalls };
           this.#emit();
         },
       });
-      this.#state.checks = result.checks;
+      this.#state.checks = { ...result.checks, toolCalls: this.#state.checks.toolCalls };
       if (!result.ok) {
         this.#state.status = { tone: 'error', message: '连接测试未通过，配置尚未保存。', code: result.reasonCode ?? 'LLM_PROVIDER_TEST_FAILED' };
         this.#notify('error', '资源验证失败', '请检查标记的连接项目后重试。', result.reasonCode ?? 'LLM_PROVIDER_TEST_FAILED');
@@ -501,9 +630,55 @@ class ResourceWizardController implements PopupWizardAdapter {
           durationMs: Math.max(0, Date.now() - verificationStartedAt),
         },
       });
+      let toolCapability: 'verified' | 'failed' | 'unavailable' | 'unchanged' = 'unchanged';
+      let toolFailureCode: string | undefined;
+      const sourceBaseUrl = this.#source?.baseUrl ? parseBaseUrl(this.#source.baseUrl) : undefined;
+      const shouldVerifyTools = candidate.type === 'generation' && this.#toolServices.verifyToolCapability !== undefined && (
+        this.#mode !== 'edit'
+        || this.#source?.type !== candidate.type
+        || this.#source?.apiType !== candidate.apiType
+        || sourceBaseUrl !== candidate.baseUrl
+        || this.#source?.model !== candidate.model
+        || this.#source?.toolDialect !== candidate.toolDialect
+        || this.#state.draft.apiKey.trim().length > 0
+      );
+      if (candidate.type !== 'generation') {
+        this.#state.checks = { ...this.#state.checks, toolCalls: { state: 'idle', description: '当前资源用途不需要 Agent 工具验证' } };
+      } else if (shouldVerifyTools) {
+        this.#state.checks = { ...this.#state.checks, toolCalls: { state: 'running', description: '正在验证原生工具调用能力…' } };
+        this.#emit();
+        try {
+          const response = await this.#toolServices.verifyToolCapability!({ resourceId: id, model: candidate.model, force: true }, this.#abortController.signal, 'ss-helper.llm');
+          if (response.capability.status === 'verified') {
+            toolCapability = 'verified';
+            this.#state.checks = { ...this.#state.checks, toolCalls: { state: 'success', description: '已验证，可用于 Agent 模式' } };
+          } else {
+            toolCapability = 'failed';
+            toolFailureCode = response.capability.failureCode ?? 'LLM_MODEL_PROBE_FAILED';
+            this.#state.checks = { ...this.#state.checks, toolCalls: { state: 'error', description: '验证未通过；仍可用于普通生成和单次提取' } };
+          }
+        } catch (error) {
+          toolCapability = 'unavailable';
+          toolFailureCode = safeCode(error, 'LLM_MODEL_PROBE_FAILED', 'llm.resource.tool_probe.persist');
+          this.#state.checks = { ...this.#state.checks, toolCalls: { state: 'error', description: '验证结果未能保存；当前按未验证处理' } };
+        }
+      } else {
+        const routing = await this.#toolServices.getTaskRouting?.({}, 'ss-helper.llm').catch(() => undefined);
+        const capability = routing?.resources.find((resource) => resource.resourceId === id)?.toolCapabilities;
+        this.#state.checks = { ...this.#state.checks, toolCalls: capability?.status === 'verified'
+          ? { state: 'success', description: '连接信息未变化，保留已有验证结果' }
+          : capability?.status === 'failed'
+            ? { state: 'error', description: '连接信息未变化，保留已有未通过结果' }
+            : { state: 'idle', description: '连接信息未变化，当前仍未验证' } };
+      }
       this.#state.dirty = false;
-      this.#state.status = { tone: 'success', message: '资源已验证、保存并启用。' };
-      this.#notify('success', '资源已启用', `${candidate.label} 已通过连接测试。`, 'LLM_RESOURCE_ENABLED');
+      if (toolCapability === 'failed' || toolCapability === 'unavailable') {
+        this.#state.status = { tone: 'warning', message: '资源已保存；工具调用验证未通过，不能用于 Agent 模式。', ...(toolFailureCode ? { code: toolFailureCode } : {}) };
+        this.#notify('warning', '资源已保存，Agent 不可用', `${candidate.label} 可用于普通生成和单次提取；工具调用验证未通过。`, toolFailureCode ?? 'LLM_TOOL_CAPABILITY_UNVERIFIED');
+      } else {
+        this.#state.status = { tone: 'success', message: toolCapability === 'verified' ? '资源已保存，并通过工具调用验证。' : '资源已验证、保存并启用。' };
+        this.#notify('success', '资源已启用', `${candidate.label} 已通过连接测试。`, 'LLM_RESOURCE_ENABLED');
+      }
       this.#emit();
       this.#ui.close();
     } catch (error) {
@@ -549,6 +724,7 @@ async function renderResourceWizard(
   session: PluginSession,
   ui: PopupUiContext,
   notify: ResourceNotifier,
+  toolServices: ResourceToolServices,
 ): Promise<() => void> {
   const settings = await repository.loadSettings();
   const record = typeof input === 'object' && input !== null && !Array.isArray(input) ? input as Readonly<Record<string, PlainData>> : {};
@@ -565,6 +741,7 @@ async function renderResourceWizard(
     ui,
     notify,
     verification: verificationCoordinator(session),
+    toolServices,
   });
   const handle = ui.mountWizard(RESOURCE_WIZARD_DEFINITION, controller);
   return () => {
@@ -578,16 +755,20 @@ async function renderResourceManager(
   repository: LlmWorkspaceRepository,
   session: PluginSession,
   ui: PopupUiContext,
+  toolServices: ResourceToolServices,
 ): Promise<() => void> {
   let disposed = false;
   let provider = 'all';
   let statusFilter = 'all';
   let settings = await repository.loadSettings();
   let healthRecords = await repository.listResourceHealth();
+  let toolCapabilities = new Map<string, Awaited<ReturnType<NonNullable<LlmServiceHandlers['getTaskRouting']>>>['resources'][number]['toolCapabilities']>();
   let loadSequence = 0;
   const testControllers = new Map<string, AbortController>();
+  const toolTestControllers = new Map<string, AbortController>();
   const menuHandles = new Set<PopupMenuHandle>();
   const testing = new Set<string>();
+  const toolTesting = new Set<string>();
   const mutating = new Set<string>();
   const shell = container.ownerDocument.createElement('div');
   shell.className = 'ss-helper-llm-resource-manager';
@@ -736,6 +917,47 @@ async function renderResourceManager(
       if (!disposed) await load();
     }
   };
+  const verifyToolCalls = async (resource: ResourceConfig): Promise<void> => {
+    if (toolTesting.has(resource.id)) return;
+    if (resource.type !== 'generation' || resource.enabled === false || !resource.model || toolServices.verifyToolCapability === undefined) {
+      throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
+        stage: 'llm.resource.tool_probe.precondition',
+        resourceId: resource.id,
+        ...(resource.model ? { model: resource.model } : {}),
+      });
+    }
+    const controller = new AbortController();
+    toolTestControllers.set(resource.id, controller);
+    toolTesting.add(resource.id);
+    status.textContent = `正在验证 ${resource.label} 的原生工具调用能力…`;
+    render();
+    try {
+      const response = await toolServices.verifyToolCapability({
+        resourceId: resource.id,
+        model: resource.model,
+        force: true,
+      }, controller.signal, 'ss-helper.llm');
+      if (controller.signal.aborted) return;
+      toolCapabilities.set(resource.id, response.capability);
+      if (response.capability.status !== 'verified') {
+        const code = response.capability.failureCode ?? 'LLM_MODEL_PROBE_FAILED';
+        status.textContent = `${resource.label} 的工具调用验证未通过（${code}）。`;
+        showToast('error', '工具调用验证失败', '当前资源仍不能用于 Agent 模式。', code);
+        return;
+      }
+      status.textContent = `${resource.label} 已通过原生工具调用验证；能力按资源和模型缓存。`;
+      showToast('success', '工具调用已验证', `${resource.label} 可以用于 Agent 模式。`, 'LLM_TOOL_CAPABILITY_VERIFIED');
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      const code = safeCode(error, 'LLM_MODEL_PROBE_FAILED', 'llm.resource.tool_probe');
+      status.textContent = `${resource.label} 的工具调用验证失败（${code}）。`;
+      showToast('error', '工具调用验证失败', '当前资源仍不能用于 Agent 模式。', code);
+    } finally {
+      toolTesting.delete(resource.id);
+      toolTestControllers.delete(resource.id);
+      if (!disposed) await load();
+    }
+  };
   const toggleResource = async (resource: ResourceConfig): Promise<void> => {
     if (mutating.has(resource.id)) return;
     mutating.add(resource.id);
@@ -778,6 +1000,7 @@ async function renderResourceManager(
       if (action === 'edit') session.ui.openPopup(LLM_RESOURCE_WIZARD_POPUP, { mode: 'edit', resourceId: resource.id });
       else if (action === 'copy') session.ui.openPopup(LLM_RESOURCE_WIZARD_POPUP, { mode: 'copy', resourceId: resource.id });
       else if (action === 'test') await testResource(resource);
+      else if (action === 'verify-tools') await verifyToolCalls(resource);
       else if (action === 'toggle') await toggleResource(resource);
       else if (action === 'delete') await deleteResource(resource);
     } catch (error) {
@@ -879,18 +1102,43 @@ async function renderResourceManager(
         const providerName = container.ownerDocument.createElement('span');
         providerName.textContent = PROVIDER_LABELS[resource.apiType === 'auto' ? 'generic' : resource.apiType];
         const model = container.ownerDocument.createElement('span');
-        model.textContent = resource.model ?? '未指定';
-        model.title = resource.model ?? '未指定';
+        const modelDetails = resource.type === 'embedding'
+          ? [resource.model ?? '未指定', resource.embeddingDimensions ? `${resource.embeddingDimensions} 维` : '模型默认维度', resource.embeddingPath ?? '/embeddings']
+          : resource.type === 'rerank'
+            ? [resource.model ?? '未指定', resource.rerankProtocol === 'chat' ? '聊天重排' : '原生重排', resource.rerankProtocol === 'chat' ? '' : resource.rerankPath ?? '/rerank']
+            : [resource.model ?? '未指定'];
+        model.textContent = modelDetails.filter(Boolean).join(' · ');
+        model.title = model.textContent;
         const state = container.ownerDocument.createElement('span');
         state.className = 'ss-helper-llm-resource-state';
         state.textContent = testing.has(resource.id) ? '测试中' : mutating.has(resource.id) ? '处理中' : resource.enabled === false ? '已停用' : health?.state === 'success' ? '正常' : health?.state === 'failed' ? '失败' : '未测试';
         const checked = container.ownerDocument.createElement('span');
         checked.className = 'ss-helper-llm-resource-checked';
-        checked.textContent = testing.has(resource.id) ? '正在检查连接…' : formatCheckedAt(health);
+        const checkedPrimary = container.ownerDocument.createElement('span');
+        checkedPrimary.className = 'ss-helper-llm-resource-checked-primary';
+        const checkedAt = container.ownerDocument.createElement('span');
+        checkedAt.textContent = testing.has(resource.id) ? '正在检查连接…' : formatCheckedAt(health);
+        checkedPrimary.append(checkedAt);
         if (health?.failure !== undefined) {
           const code = container.ownerDocument.createElement('code');
           code.textContent = health.failure.reasonCode;
-          checked.append(code);
+          checkedPrimary.append(code);
+        }
+        checked.append(checkedPrimary);
+        if (resource.type === 'generation') {
+          const capability = toolCapabilities.get(resource.id);
+          const toolState = container.ownerDocument.createElement('span');
+          toolState.className = 'ss-helper-llm-resource-tool-state';
+          toolState.textContent = toolTesting.has(resource.id)
+            ? '工具调用验证中…'
+            : capability?.expiresAt !== undefined && capability.expiresAt <= Date.now()
+              ? '工具调用验证已过期'
+              : capability?.status === 'verified'
+                ? `工具调用已验证 · ${capability.dialect}`
+                : capability?.status === 'failed'
+                  ? `工具调用验证未通过 · ${capability.failureCode ?? 'LLM_MODEL_PROBE_FAILED'}`
+                  : '工具调用未验证';
+          checked.append(toolState);
         }
         const actions = container.ownerDocument.createElement('div');
         actions.className = 'ss-helper-llm-resource-actions';
@@ -907,6 +1155,7 @@ async function renderResourceManager(
           items: [
             { id: 'copy', label: '复制资源', icon: 'copy', disabled: mutating.has(resource.id) },
             { id: 'test', label: testing.has(resource.id) ? '正在测试' : '测试连接', icon: 'flask', disabled: testing.has(resource.id) || mutating.has(resource.id) },
+            ...(resource.type === 'generation' ? [{ id: 'verify-tools', label: toolTesting.has(resource.id) ? '正在验证工具调用' : '验证工具调用', icon: 'screwdriver-wrench', disabled: toolTesting.has(resource.id) || testing.has(resource.id) || mutating.has(resource.id) || resource.enabled === false || !resource.model }] : []),
             { id: 'toggle', label: resource.enabled === false ? '启用资源' : '停用资源', icon: resource.enabled === false ? 'toggle-on' : 'toggle-off', separatorBefore: true, disabled: mutating.has(resource.id) },
             { id: 'delete', label: '删除资源', icon: 'trash', tone: 'danger', separatorBefore: true, disabled: mutating.has(resource.id) },
           ],
@@ -922,10 +1171,15 @@ async function renderResourceManager(
   };
   const load = async (): Promise<void> => {
     const sequence = ++loadSequence;
-    const [nextSettings, nextHealth] = await Promise.all([repository.loadSettings(), repository.listResourceHealth()]);
+    const [nextSettings, nextHealth, routing] = await Promise.all([
+      repository.loadSettings(),
+      repository.listResourceHealth(),
+      toolServices.getTaskRouting?.({}, 'ss-helper.llm').catch(() => undefined),
+    ]);
     if (disposed || sequence !== loadSequence) return;
     settings = nextSettings;
     healthRecords = [...nextHealth];
+    toolCapabilities = new Map((routing?.resources ?? []).map((resource) => [resource.resourceId, resource.toolCapabilities]));
     render();
   };
   search.addEventListener('input', render);
@@ -938,14 +1192,16 @@ async function renderResourceManager(
     disposed = true;
     for (const controller of testControllers.values()) controller.abort();
     testControllers.clear();
+    for (const controller of toolTestControllers.values()) controller.abort();
+    toolTestControllers.clear();
     disposeMenus();
     unsubscribe();
     container.replaceChildren();
   };
 }
 
-export function registerResourcePopups(session: PluginSession, repository: LlmWorkspaceRepository): () => void {
-  const notify = (level: 'success' | 'error', title: string, message: string, code: string): void => session.ui.showToast({ level, title, message, code });
+export function registerResourcePopups(session: PluginSession, repository: LlmWorkspaceRepository, toolServices: ResourceToolServices = {}): () => void {
+  const notify = (level: 'success' | 'warning' | 'error', title: string, message: string, code: string): void => session.ui.showToast({ level, title, message, code });
   const wizardCleanup = session.registerPopup({
     token: LLM_RESOURCE_WIZARD_POPUP,
     title: '添加资源',
@@ -955,7 +1211,7 @@ export function registerResourcePopups(session: PluginSession, repository: LlmWo
       const ui = requireUi(popupUi);
       let cleanup = (): void => undefined;
       let disposed = false;
-      void renderResourceWizard(input, repository, session, ui, notify)
+      void renderResourceWizard(input, repository, session, ui, notify, toolServices)
         .then((value) => { if (disposed) value(); else cleanup = value; })
         .catch((error) => {
           if (disposed) return;
@@ -973,7 +1229,7 @@ export function registerResourcePopups(session: PluginSession, repository: LlmWo
       const ui = requireUi(popupUi);
       let cleanup = (): void => undefined;
       let disposed = false;
-      void renderResourceManager(container, repository, session, ui)
+      void renderResourceManager(container, repository, session, ui, toolServices)
         .then((value) => { if (disposed) value(); else cleanup = value; })
         .catch((error) => {
           if (disposed) return;

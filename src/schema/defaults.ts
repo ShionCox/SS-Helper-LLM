@@ -2,12 +2,14 @@ import type { LLMHubSettings } from './types';
 
 export type LlmSettingsDefaults = Required<Pick<
     LLMHubSettings,
-    'enabled' | 'generationSource' | 'globalProfile' | 'maxTokensMode' | 'maxTokens' | 'timeoutMs'
+    'enabled' | 'generationSource' | 'streamingEnabled' | 'maxRequestsPerMinute' | 'globalProfile' | 'maxTokensMode' | 'maxTokens' | 'timeoutMs'
 >> & { requestLogging: Required<import('./types').LLMRequestLoggingSettings> };
 
 export const DEFAULT_LLM_SETTINGS: Readonly<LlmSettingsDefaults> = Object.freeze({
     enabled: true,
     generationSource: 'tavern',
+    streamingEnabled: true,
+    maxRequestsPerMinute: 0,
     globalProfile: 'balanced',
     maxTokensMode: 'adaptive',
     maxTokens: 2048,

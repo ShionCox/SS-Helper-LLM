@@ -1,3 +1,4 @@
+import { createSSHelperError } from '@ss-helper/sdk';
 import type {
     LLMProvider,
     LLMProviderCapabilities,
@@ -8,10 +9,14 @@ import type {
     RerankRequest,
     RerankResponse,
     ProviderConnectionResult,
-    ProviderModelListResult,
+    ProviderModelListResult, ProviderFetch,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import { GeminiInteractionsToolAdapter } from '../tools/gemini-interactions-tool-adapter';
+import type { ProviderToolAdapter } from '../tools/tool-adapter';
+import { parseSseJson } from './sse';
+import { responseDiagnostics } from './provider-response-diagnostics';
 
 export class GeminiProvider implements LLMProvider {
     id: string;
@@ -23,8 +28,10 @@ export class GeminiProvider implements LLMProvider {
     private baseUrl: string;
     private model: string;
     private customParams: Record<string, unknown>;
-    private fetchImpl: typeof fetch;
+    private fetchImpl: ProviderFetch;
     private readonly structuredOutputIdentity: StructuredOutputIdentity;
+    private readonly embeddingDimensions?: number;
+    private readonly streamingEnabled: boolean;
 
     constructor(config: {
         id: string;
@@ -32,8 +39,10 @@ export class GeminiProvider implements LLMProvider {
         baseUrl?: string;
         model?: string;
         enableRerank?: boolean;
+        embeddingDimensions?: number;
         customParams?: Record<string, unknown>;
-        fetchImpl?: typeof fetch;
+        fetchImpl?: ProviderFetch;
+        streamingEnabled?: boolean;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
@@ -44,10 +53,12 @@ export class GeminiProvider implements LLMProvider {
             json: true,
             tools: true,
             embeddings: true,
-            rerank: config.enableRerank === true,
+            rerank: false,
             structuredOutput: { transports: ['json_schema', 'prompt_only'], preferred: 'json_schema' },
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
+        this.embeddingDimensions = config.embeddingDimensions;
+        this.streamingEnabled = config.streamingEnabled !== false;
         this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'gemini', baseUrl: this.baseUrl, model: this.model });
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
@@ -108,6 +119,50 @@ export class GeminiProvider implements LLMProvider {
             .trim();
     }
 
+    private assembleGenerateStream(chunks: readonly Record<string, unknown>[]): Record<string, unknown> {
+        if (chunks.length === 1 && Array.isArray(chunks[0]?.candidates)) return chunks[0]!;
+        let text = '';
+        let finishReason: unknown;
+        let usageMetadata: unknown;
+        for (const chunk of chunks) {
+            const candidates = Array.isArray(chunk.candidates) ? chunk.candidates as Array<Record<string, unknown>> : [];
+            const candidate = candidates[0];
+            const content = candidate?.content && typeof candidate.content === 'object' && !Array.isArray(candidate.content) ? candidate.content as Record<string, unknown> : undefined;
+            const parts = Array.isArray(content?.parts) ? content.parts as Array<Record<string, unknown>> : [];
+            text += parts.map((part) => typeof part.text === 'string' ? part.text : '').join('');
+            if (candidate?.finishReason !== undefined) finishReason = candidate.finishReason;
+            if (chunk.usageMetadata !== undefined) usageMetadata = chunk.usageMetadata;
+        }
+        if (!text && finishReason === undefined) throw createSSHelperError('PROVIDER_RESPONSE_INVALID', { stage: 'llm.provider.gemini_stream.empty', resourceId: this.id });
+        return { candidates: [{ content: { parts: [{ text }] }, finishReason }], ...(usageMetadata === undefined ? {} : { usageMetadata }) };
+    }
+
+    createToolAdapter(): ProviderToolAdapter {
+        return new GeminiInteractionsToolAdapter({
+            resourceId: this.id,
+            defaultModel: this.model,
+            send: async (body, signal) => {
+                const response = await this.fetchImpl(`${this.baseUrl}/interactions`, {
+                    method: 'POST',
+                    headers: this.buildHeaders(),
+                    body: JSON.stringify(this.withCustomParams(body)),
+                    signal,
+                });
+                if (!response.ok) throw await providerHttpErrorFromResponse('Gemini Interactions', response);
+                return await response.json() as Record<string, unknown>;
+            },
+            ...(this.streamingEnabled ? { sendStream: async (body: Record<string, unknown>, signal?: AbortSignal) => {
+                const response = await this.fetchImpl(`${this.baseUrl}/interactions`, {
+                    method: 'POST', headers: this.buildHeaders(),
+                    body: JSON.stringify(this.withCustomParams({ ...body, stream: true })),
+                    signal, timeoutMs: 180_000, idleTimeoutMs: 30_000,
+                });
+                if (!response.ok) throw await providerHttpErrorFromResponse('Gemini Interactions stream', response);
+                return parseSseJson(await response.text(), 'llm.provider.gemini_interactions_stream.parse', this.id);
+            } } : {}),
+        });
+    }
+
     async request(req: LLMRequest): Promise<LLMResponse> {
         const split = this.splitMessages(req.messages);
         const generationConfig: Record<string, unknown> = {
@@ -123,30 +178,46 @@ export class GeminiProvider implements LLMProvider {
             ...(Object.keys(generationConfig).length > 0 ? { generationConfig } : {}),
         });
 
-        const response = await this.fetchImpl(`${this.baseUrl}/models/${encodeURIComponent(req.model || this.model)}:generateContent`, {
+        const operation = this.streamingEnabled ? 'streamGenerateContent?alt=sse' : 'generateContent';
+        const response = await this.fetchImpl(`${this.baseUrl}/models/${encodeURIComponent(req.model || this.model)}:${operation}`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),
             signal: req.signal,
+            timeoutMs: req.timeoutMs,
+            ...(this.streamingEnabled ? { idleTimeoutMs: 30_000 } : {}),
         });
 
         if (!response.ok) {
             throw await providerHttpErrorFromResponse('Gemini', response);
         }
 
-        const data = await response.json();
-        const promptTokens = Number(data?.usageMetadata?.promptTokenCount ?? 0);
-        const completionTokens = Number(data?.usageMetadata?.candidatesTokenCount ?? 0);
-        const totalTokens = Number(data?.usageMetadata?.totalTokenCount ?? promptTokens + completionTokens);
+        let responseBody: unknown;
+        let streamEventCount: number | undefined;
+        let resolvedData: any;
+        if (this.streamingEnabled) {
+            const text = await response.text();
+            responseBody = text;
+            const chunks = parseSseJson(text, 'llm.provider.gemini_stream.parse', this.id);
+            streamEventCount = chunks.length;
+            resolvedData = this.assembleGenerateStream(chunks);
+        } else {
+            resolvedData = await response.json();
+            responseBody = resolvedData;
+        }
+        const promptTokens = Number(resolvedData?.usageMetadata?.promptTokenCount ?? 0);
+        const completionTokens = Number(resolvedData?.usageMetadata?.candidatesTokenCount ?? 0);
+        const totalTokens = Number(resolvedData?.usageMetadata?.totalTokenCount ?? promptTokens + completionTokens);
 
         return {
-            content: this.extractText(data),
+            content: this.extractText(resolvedData),
             usage: {
                 promptTokens,
                 completionTokens,
                 totalTokens,
             },
-            finishReason: data?.candidates?.[0]?.finishReason,
+            finishReason: resolvedData?.candidates?.[0]?.finishReason,
+            diagnostics: responseDiagnostics(response, responseBody, { streamed: this.streamingEnabled, ...(streamEventCount === undefined ? {} : { streamEventCount }) }),
             ...(req.structuredOutput === undefined ? {} : { structuredOutput: { plannedTransport: req.structuredOutput.transport, actualTransport: req.structuredOutput.transport } }),
             debugRequest: {
                 providerKind: this.kind,
@@ -161,9 +232,10 @@ export class GeminiProvider implements LLMProvider {
     async embed(req: EmbedRequest): Promise<EmbedResponse> {
         const model = req.model || this.model || 'gemini-embedding-001';
         const batch = req.texts.length > 1;
+        const dimensions = req.dimensions ?? this.embeddingDimensions;
         const body = this.withCustomParams(batch
-            ? { requests: req.texts.map((text) => ({ model: `models/${model}`, content: { parts: [{ text }] } })) }
-            : { content: { parts: [{ text: req.texts[0] ?? '' }] } });
+            ? { requests: req.texts.map((text) => ({ model: `models/${model}`, content: { parts: [{ text }] }, ...(dimensions === undefined ? {} : { outputDimensionality: dimensions }) })) }
+            : { content: { parts: [{ text: req.texts[0] ?? '' }] }, ...(dimensions === undefined ? {} : { outputDimensionality: dimensions }) });
 
         const modelPath = model.startsWith('models/') ? model : `models/${model}`;
         const response = await this.fetchImpl(`${this.baseUrl}/${modelPath}:${batch ? 'batchEmbedContents' : 'embedContent'}`, {
@@ -184,9 +256,20 @@ export class GeminiProvider implements LLMProvider {
                 ? [data.embedding]
                 : [];
 
-        return {
-            embeddings: rawEmbeddings.map((item: any) => Array.isArray(item?.values) ? item.values : Array.isArray(item) ? item : []),
-        };
+        const embeddings = rawEmbeddings.map((item: any) => Array.isArray(item?.values) ? item.values : Array.isArray(item) ? item : []);
+        const invalidIndex = embeddings.findIndex((vector: unknown[]) => vector.length === 0
+            || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))
+            || (dimensions !== undefined && vector.length !== dimensions));
+        if (embeddings.length !== req.texts.length || invalidIndex >= 0) {
+            throw createSSHelperError('PROVIDER_RESPONSE_INVALID', {
+                stage: 'llm.provider.embedding.validate', providerKind: this.kind, resourceId: this.id,
+                path: invalidIndex >= 0 ? `$.embeddings[${invalidIndex}]` : '$.embeddings',
+                expected: dimensions === undefined
+                    ? `${req.texts.length} finite non-empty embedding vectors`
+                    : `${req.texts.length} finite embedding vectors with ${dimensions} dimensions`,
+            });
+        }
+        return { embeddings, diagnostics: responseDiagnostics(response, data, { streamed: false }) };
     }
 
     async rerank(_req: RerankRequest): Promise<RerankResponse> {

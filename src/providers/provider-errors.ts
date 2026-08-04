@@ -21,6 +21,9 @@ const RESPONSE_FORMAT_ERROR_CODES = new Set([
     'unsupported_response_format', 'response_format_unsupported', 'json_schema_unsupported',
     'unsupported_json_schema', 'response_format_not_supported',
 ]);
+const STREAM_ERROR_CODES = new Set([
+    'stream_unsupported', 'unsupported_stream', 'stream_not_supported', 'streaming_unsupported',
+]);
 const CONTENT_FILTER_CODES = new Set(['content_filter', 'content_filtered', 'safety_blocked']);
 const TOKEN_LIMIT_CODES = new Set(['context_length_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded']);
 
@@ -62,6 +65,9 @@ function reasonForHttpStatus(status: number, classification: SafeProviderHttpCla
     const code = classification.code?.toLowerCase();
     const type = classification.type?.toLowerCase();
     const param = classification.param?.toLowerCase();
+    if ((code !== undefined && STREAM_ERROR_CODES.has(code))
+        || (type !== undefined && STREAM_ERROR_CODES.has(type))
+        || param === 'stream') return 'PROVIDER_STREAM_UNSUPPORTED';
     if ((code !== undefined && MODEL_ERROR_CODES.has(code))
         || (type !== undefined && MODEL_ERROR_CODES.has(type))
         || (status === 404 && (param === 'model' || param === 'model_id'))) return 'MODEL_NOT_FOUND';

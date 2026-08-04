@@ -1,4 +1,4 @@
-import { LLM_CAPABILITY_STATUS_CHANGED_V0, createSSHelperError, readSSHelperFailure, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type PluginSession } from '@ss-helper/sdk';
+import { LLM_CAPABILITY_STATUS_CHANGED_V0, createSSHelperError, readSSHelperFailure, type HostPort, type LlmCapabilityKind, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse, type LlmSafeResourceSummary, type LlmTaskRoutingSnapshot, type PluginSession } from '@ss-helper/sdk';
 import { BudgetManager } from '../budget/budget-manager';
 import { RequestLogService } from '../log/requestLogService';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
@@ -13,12 +13,15 @@ import { ConsumerRegistry } from '../registry/consumer-registry';
 import { BUILTIN_TAVERN_RESOURCE_ID, TaskRouter } from '../router/router';
 import { LLMSDKImpl } from '../sdk/llm-sdk';
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
-import type { LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
+import type { GlobalMaxTokensControl, LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
 import { createLlmSdkServiceHandlers, publishRouteChanged, type LlmServiceHandlers } from './services';
 import { LlmWorkspaceRepository, type PreparedSettingsRuntime, type SettingsRuntimePrepareOptions } from '../storage/llm-workspace-repository';
 import { validateLlmSettings } from '../validation/settings';
 import { logger, safeFailureLogDetail } from '../runtime/logger';
 import { createCoreBridgeFetch } from './core-bridge-fetch';
+import { LlmToolTurnService } from './tool-turn-service';
+import { normalizeProviderPrivacyPolicy } from '../tools/provider-privacy-policy';
+import { RequestRateLimiter } from '../runtime/request-rate-limiter';
 
 export interface ProductionLlmProviderRegistration {
     readonly provider: LLMProvider;
@@ -33,16 +36,75 @@ export interface ProductionLlmServiceOptions {
     readonly repository?: LlmWorkspaceRepository;
 }
 
-export function createProviderFromResource(resource: ResourceConfig, apiKey: string, fetchImpl: typeof fetch = fetch): LLMProvider {
+export function createProviderFromResource(resource: ResourceConfig, apiKey: string, fetchImpl: typeof fetch = fetch, streamingEnabled = true): LLMProvider {
     const resolvedApiType = resource.apiType === 'auto' ? 'generic' : resource.apiType;
-    const identity = resolvedApiType === 'generic'
+    const identity = resolvedApiType === 'generic' || resolvedApiType === 'xai' || resolvedApiType === 'kimi' || resolvedApiType === 'glm'
         ? { vendor: 'unknown' as const, evidence: 'manual' as const, confidence: 'high' as const, ...(resource.model ? { model: resource.model } : {}) }
         : detectStructuredOutputIdentity({ manualVendor: resolvedApiType, model: resource.model });
-    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl };
-    if (resource.type === 'rerank') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath });
-    if (resolvedApiType === 'claude') return new ClaudeProvider(base);
-    if (resolvedApiType === 'gemini') return new GeminiProvider({ ...base, enableRerank: resource.capabilities?.includes('rerank') });
-    return new OpenAIProvider({ ...base, apiType: resolvedApiType, structuredOutputIdentity: identity, enableRerank: resource.capabilities?.includes('rerank') });
+    const base = { id: resource.id, apiKey, baseUrl: resource.baseUrl, model: resource.model, customParams: resource.customParams, fetchImpl, streamingEnabled };
+    if (resource.type === 'rerank' && resource.rerankProtocol !== 'chat') return new CustomRerankProvider({ ...base, baseUrl: resource.baseUrl || '', rerankPath: resource.rerankPath });
+    if (resolvedApiType === 'claude') {
+        if (resource.toolDialect && resource.toolDialect !== 'anthropic_messages') throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', { stage: 'llm.tools.adapter.configure', resourceId: resource.id });
+        return new ClaudeProvider(base);
+    }
+    if (resolvedApiType === 'gemini') {
+        if (resource.toolDialect && resource.toolDialect !== 'gemini_interactions') throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', { stage: 'llm.tools.adapter.configure', resourceId: resource.id });
+        return new GeminiProvider({ ...base, embeddingDimensions: resource.embeddingDimensions });
+    }
+    const customParams = resource.customParams && typeof resource.customParams === 'object' && !Array.isArray(resource.customParams)
+        ? resource.customParams as Record<string, unknown> : {};
+    const thinking = customParams.thinking;
+    const requireReasoningContent = resolvedApiType === 'deepseek' && (
+        /reasoner/iu.test(resource.model ?? '')
+        || thinking === true
+        || (typeof thinking === 'object' && thinking !== null && !Array.isArray(thinking) && (thinking as Record<string, unknown>).type === 'enabled')
+    );
+    const enableToolStream = (resolvedApiType === 'kimi' || resolvedApiType === 'glm') && (customParams.tool_stream === true || customParams.stream === true);
+    return new OpenAIProvider({ ...base, apiType: resolvedApiType, structuredOutputIdentity: identity, enableRerank: resource.type === 'rerank' && resource.rerankProtocol === 'chat', embeddingPath: resource.embeddingPath, embeddingDimensions: resource.embeddingDimensions, toolDialect: resource.toolDialect, requireReasoningContent, enableToolStream });
+}
+
+function configuredMaxTokensControl(settings: LLMHubSettings): GlobalMaxTokensControl {
+    const mode = settings.maxTokensMode ?? settings.maxTokensControl?.mode ?? DEFAULT_LLM_SETTINGS.maxTokensMode;
+    if (mode === 'manual') {
+        return {
+            mode,
+            manualValue: settings.maxTokens ?? settings.maxTokensControl?.manualValue ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        };
+    }
+    return {
+        mode,
+        ...(mode === 'adaptive' && settings.maxTokensControl?.adaptive
+            ? { adaptive: settings.maxTokensControl.adaptive }
+            : {}),
+    };
+}
+
+function withMaxTokensDefaults(settings: LLMHubSettings): LLMHubSettings {
+    return {
+        ...DEFAULT_LLM_SETTINGS,
+        ...settings,
+        maxTokensMode: settings.maxTokensMode ?? settings.maxTokensControl?.mode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
+        maxTokens: settings.maxTokens ?? settings.maxTokensControl?.manualValue ?? DEFAULT_LLM_SETTINGS.maxTokens,
+    };
+}
+
+function routingCapabilities(resource: ResourceConfig, provider: LLMProvider): LLMCapability[] {
+    const capabilities = new Set<LLMCapability>();
+    if (resource.type === 'embedding') {
+        if (provider.capabilities.embeddings) capabilities.add('embeddings');
+        return [...capabilities];
+    }
+    if (resource.type === 'rerank') {
+        if (provider.capabilities.rerank) capabilities.add('rerank');
+        return [...capabilities];
+    }
+    if (provider.capabilities.chat) capabilities.add('chat');
+    if (provider.capabilities.json) capabilities.add('json');
+    if (provider.capabilities.tools) capabilities.add('tools');
+    for (const capability of resource.capabilities ?? []) {
+        if (capability === 'vision' || capability === 'reasoning') capabilities.add(capability);
+    }
+    return [...capabilities];
 }
 
 export function createProductionLlmServices(
@@ -57,13 +119,14 @@ export function createProductionLlmServices(
         ? createCoreBridgeFetch((request, requestOptions) => session.host.request.send(request, requestOptions))
         : fetch;
     const initialSettings = options.settings?.() ?? {};
-    const settingsState: { value: LLMHubSettings } = { value: { ...DEFAULT_LLM_SETTINGS, ...initialSettings, maxTokensControl: initialSettings.maxTokensControl ?? { mode: 'adaptive' } } };
+    const settingsState: { value: LLMHubSettings } = { value: withMaxTokensDefaults(initialSettings) };
     router.setRegistry(registry);
     registry.setResourceCapabilityQuery((resourceId) => router.getProviderCapabilities(resourceId));
     router.registerProvider(new TavernProvider({ id: BUILTIN_TAVERN_RESOURCE_ID, generation: session.host.generation }), 'generation', ['chat', 'json']);
     const managed = new Set<string>();
     let lastGenerationRoute: string | undefined;
     let statusRevision = 0;
+    let routeRevision = 0;
     const notifyCapabilityChange = (kinds: readonly LlmCapabilityKind[]): void => {
         statusRevision += 1;
         try {
@@ -77,20 +140,53 @@ export function createProductionLlmServices(
         managed.add(registration.provider.id);
     }
 
-    const sdk = new LLMSDKImpl(router, budget, new RequestOrchestrator(), registry, new RequestLogService(repository));
+    const requestLogs = new RequestLogService(repository);
+    const requestRateLimiter = new RequestRateLimiter();
+    requestRateLimiter.setMaxRequestsPerMinute(settingsState.value.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute);
+    const describeTask = (pluginId: string, taskKey: string, taskKind: 'generation' | 'embedding' | 'rerank' = 'generation') => {
+        const registration = registry.getConsumerRegistration(pluginId);
+        const registered = registry.getTaskDescriptor(pluginId, taskKey)?.description?.trim();
+        return {
+            ...(registration?.displayName ? { consumerDisplayName: registration.displayName } : {}),
+            taskDescription: registered || (taskKind === 'embedding'
+                ? '用途未声明的向量化任务'
+                : taskKind === 'rerank'
+                    ? '用途未声明的重排任务'
+                    : '用途未声明的生成任务'),
+        };
+    };
+    const sdk = new LLMSDKImpl(router, budget, new RequestOrchestrator(), registry, requestLogs, requestRateLimiter);
+    sdk.setSettingsResolver(() => ({
+        ...settingsState.value,
+        maxTokensControl: configuredMaxTokensControl(settingsState.value),
+    }));
+    const toolTurn = new LlmToolTurnService(router, {
+        getResource: (resourceId) => settingsState.value.resources?.find((resource) => resource.id === resourceId),
+        getStreamingEnabled: () => settingsState.value.streamingEnabled !== false,
+    }, (request, callerPluginId, profileId) => sdk.resolveTaskMaxTokens({
+        consumer: callerPluginId,
+        taskKey: request.task,
+        taskKind: 'generation',
+        input: request.input,
+        ...(request.outputSchema ? { schema: request.outputSchema as object } : {}),
+        ...(request.maxTokens === undefined ? {} : { budget: { maxTokens: request.maxTokens } }),
+    }, profileId).value, repository, requestLogs, (pluginId, taskKey) => describeTask(pluginId, taskKey), requestRateLimiter);
     if (repository) {
-        void repository.sanitizeStoredLogs().then(() => repository.reconcileInterruptedLogs()).catch((error) => logger.warn(
+        void repository.sanitizeStoredLogs().catch((error) => logger.warn(
+            'LLM 请求日志安全清理失败',
+            safeFailureLogDetail(error, { reasonCode: 'LOG_UNAVAILABLE', stage: 'llm.log.sanitize' }),
+        ));
+        void repository.reconcileInterruptedLogs().catch((error) => logger.warn(
             '遗留 LLM 请求日志收敛失败',
             safeFailureLogDetail(error, { reasonCode: 'LOG_UNAVAILABLE', stage: 'llm.log.reconcile' }),
         ));
     }
-    sdk.setSettingsResolver(() => { const value = settingsState.value as LLMHubSettings & Record<string, unknown>; return { ...settingsState.value, maxTokensControl: settingsState.value.maxTokensControl ?? ({ mode: value.maxTokensMode as 'inherit' | 'manual' | 'adaptive', manualValue: Number(value.maxTokens ?? 2048) }) }; });
     let disposed = false;
     let applyGeneration = 0;
 
     const prepareRuntime = async (input: LLMHubSettings, options: SettingsRuntimePrepareOptions = {}): Promise<PreparedSettingsRuntime> => {
         const generation = ++applyGeneration;
-        const settings = { ...DEFAULT_LLM_SETTINGS, ...validateLlmSettings(input) };
+        const settings = withMaxTokensDefaults(validateLlmSettings(input));
         const resources = Array.isArray(settings.resources) ? settings.resources : [];
         const registrations: ProductionLlmProviderRegistration[] = [];
         const built: LLMProvider[] = [];
@@ -106,9 +202,13 @@ export function createProductionLlmServices(
                     resource,
                     apiKey,
                     /^https?:\/\//iu.test(resource.baseUrl ?? '') ? bridgeFetch : fetch,
+                    settings.streamingEnabled,
                 );
                 built.push(provider);
-                registrations.push({ provider, resourceType: resource.type, capabilities: resource.capabilities, defaultModel: resource.model });
+                // Routing is constrained by the resource's declared purpose so
+                // a multi-capability adapter cannot leak generation into an
+                // embedding/rerank resource (or vice versa).
+                registrations.push({ provider, resourceType: resource.type, capabilities: routingCapabilities(resource, provider), defaultModel: resource.model });
             }
             const occupied = new Set(router.getAllProviders().filter((provider) => !managed.has(provider.id)).map((provider) => provider.id));
             if (registrations.some((registration) => occupied.has(registration.provider.id))) {
@@ -138,14 +238,23 @@ export function createProductionLlmServices(
                     return;
                 }
                 const oldProviders = [...managed].map((id) => router.getProvider(id)).filter((provider): provider is LLMProvider => Boolean(provider));
+                const previousResources = settingsState.value.resources ?? [];
+                const streamingChanged = (settingsState.value.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled) !== settings.streamingEnabled;
                 settingsState.value = { ...settings };
+                requestRateLimiter.setMaxRequestsPerMinute(settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute);
                 sdk.setGlobalProfile(settings.globalProfile ?? 'balanced');
-                router.applyGenerationSource(settings.generationSource);
+                router.applyGenerationSource(settings.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource);
                 router.applyGlobalAssignments(settings.globalAssignments ?? {});
                 router.applyPluginAssignments(settings.pluginAssignments ?? []);
                 router.applyTaskAssignments(settings.taskAssignments ?? []);
                 budget.replaceConfigs(settings.budgets ?? {});
                 router.replaceManagedProviders([...managed], registrations);
+                const nextResources = settings.resources ?? [];
+                const nextById = new Map(nextResources.map((resource) => [resource.id, resource]));
+                for (const previous of previousResources) {
+                    const next = nextById.get(previous.id);
+                    if (streamingChanged || !next || JSON.stringify({ apiType: previous.apiType, baseUrl: previous.baseUrl, model: previous.model, toolDialect: previous.toolDialect, privacyPolicy: previous.privacyPolicy }) !== JSON.stringify({ apiType: next.apiType, baseUrl: next.baseUrl, model: next.model, toolDialect: next.toolDialect, privacyPolicy: next.privacyPolicy })) toolTurn.invalidateResource(previous.id);
+                }
                 managed.clear();
                 for (const registration of registrations) managed.add(registration.provider.id);
                 for (const provider of oldProviders) provider.dispose?.();
@@ -157,6 +266,7 @@ export function createProductionLlmServices(
                     lastGenerationRoute = nextGenerationRoute;
                 }
                 notifyCapabilityChange(['generation', 'embedding', 'rerank']);
+                routeRevision += 1;
                 committed = true;
             },
             dispose: (): void => {
@@ -218,6 +328,38 @@ export function createProductionLlmServices(
         return { revision: statusRevision, checks: entries };
     };
 
+    const safeResources = async (): Promise<LlmSafeResourceSummary[]> => {
+        const resources = settingsState.value.resources ?? [];
+        return Promise.all(resources.map(async (resource): Promise<LlmSafeResourceSummary> => {
+            const provider = router.getProvider(resource.id);
+            const available = resource.enabled !== false && provider !== undefined && (!repository || await repository.hasResourceSecret(resource.id));
+            const toolCapabilities = await toolTurn.getCapability(resource.id, resource.model, true);
+            return {
+                resourceId: resource.id,
+                label: resource.label,
+                type: resource.type,
+                apiType: resource.apiType,
+                ...(resource.model ? { defaultModel: resource.model } : {}),
+                enabled: resource.enabled !== false,
+                available,
+                capabilities: router.getProviderCapabilities(resource.id),
+                ...(toolCapabilities ? { toolCapabilities } : {}),
+                privacyPolicy: normalizeProviderPrivacyPolicy(resource.privacyPolicy),
+                ...(available ? {} : { unavailableReason: provider ? 'credential_missing' : 'resource_unavailable' }),
+            };
+        }));
+    };
+    const taskRoutingSnapshot = async (callerPluginId: string, taskKeys?: readonly string[]): Promise<LlmTaskRoutingSnapshot> => {
+        const allowed = taskKeys ? new Set(taskKeys) : undefined;
+        return {
+            revision: routeRevision,
+            assignments: (settingsState.value.taskAssignments ?? [])
+                .filter((assignment) => assignment.pluginId === callerPluginId && (!allowed || allowed.has(assignment.taskKey)))
+                .map((assignment) => ({ taskKey: assignment.taskKey, ...(assignment.resourceId ? { resourceId: assignment.resourceId } : {}), ...(assignment.model ? { model: assignment.model } : {}) })),
+            resources: await safeResources(),
+        };
+    };
+
     const detachRuntimePreparer = repository?.attachRuntimePreparer(prepareRuntime);
     if (repository) {
         registry.setPersistCallback((snapshots) => { void repository.saveConsumers(snapshots as unknown as Record<string, import('@ss-helper/sdk').PlainData>); });
@@ -248,5 +390,35 @@ export function createProductionLlmServices(
     const host = session.host as unknown as HostPort;
     const unlistenGeneration = host.has?.('tavern.chat.events') && host.events ? host.events.subscribe('generation-config-changed', () => notifyCapabilityChange(['generation'])) : undefined;
     const handlers = createLlmSdkServiceHandlers(sdk);
-    return { ...handlers, capabilityStatus, dispose(): void { if (disposed) return; disposed = true; applyGeneration += 1; detachRuntimePreparer?.(); unlistenGeneration?.(); sdk.dispose(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); } };
+    return {
+        ...handlers,
+        describeTask,
+        capabilityStatus,
+        toolTurn: (request, signal, callerPluginId, requestId) => toolTurn.turn(request, callerPluginId, requestId, signal),
+        cancelToolSession: (toolSessionId, callerPluginId) => toolTurn.cancel(toolSessionId, callerPluginId),
+        verifyToolCapability: async (request, signal) => {
+            const response = await toolTurn.verify(request.resourceId, request.model, request.force === true, signal);
+            notifyCapabilityChange(['generation']);
+            return response;
+        },
+        getTaskRouting: (request, callerPluginId) => taskRoutingSnapshot(callerPluginId, request.taskKeys),
+        setTaskRouting: async (request, callerPluginId) => {
+            if (request.expectedRevision !== routeRevision) throw createSSHelperError('WORKSPACE_CONFLICT', { stage: 'llm.routing.save' });
+            const incomingKeys = new Set(request.assignments.map((assignment) => assignment.taskKey));
+            const retained = (settingsState.value.taskAssignments ?? []).filter((assignment) => assignment.pluginId !== callerPluginId || !incomingKeys.has(assignment.taskKey));
+            const updates = request.assignments.flatMap((assignment) => {
+                const descriptor = registry.getTaskDescriptor(callerPluginId, assignment.taskKey);
+                if (!descriptor) throw createSSHelperError('LLM_TASK_UNSUPPORTED', { stage: 'llm.routing.save' });
+                if (!assignment.resourceId) return [];
+                const capabilities = router.getProviderCapabilities(assignment.resourceId);
+                if (!descriptor.requiredCapabilities.every((capability) => capabilities.includes(capability))) throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', { stage: 'llm.routing.save', resourceId: assignment.resourceId, ...(assignment.model ? { model: assignment.model } : {}) });
+                return [{ pluginId: callerPluginId, taskKey: assignment.taskKey, taskKind: descriptor.taskKind, resourceId: assignment.resourceId, ...(assignment.model ? { model: assignment.model } : {}), isStale: false }];
+            });
+            const next = { ...settingsState.value, taskAssignments: [...retained, ...updates] };
+            if (repository) await repository.saveSettings(next);
+            else { const prepared = await prepareRuntime(next); prepared.commit(); }
+            return taskRoutingSnapshot(callerPluginId, request.assignments.map((assignment) => assignment.taskKey));
+        },
+        dispose(): void { if (disposed) return; disposed = true; applyGeneration += 1; detachRuntimePreparer?.(); unlistenGeneration?.(); toolTurn.dispose(); sdk.dispose(); for (const provider of new Set((options.providers ?? []).map((registration) => registration.provider))) provider.dispose?.(); for (const id of managed) router.getProvider(id)?.dispose?.(); },
+    };
 }

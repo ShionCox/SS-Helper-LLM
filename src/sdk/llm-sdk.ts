@@ -21,11 +21,12 @@ import {
     type SSHelperReasonCode,
 } from '@ss-helper/sdk';
 import { detectStructuredOutputIdentity, createStructuredOutputPlan, withStructuredOutputInstruction, type StructuredOutputIdentity } from '../schema/structured-output-plan';
-import { resolveMaxTokens } from './max-tokens';
+import { resolveMaxTokens, type ResolvedMaxTokensResult } from './max-tokens';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
 import { ConsumerRegistry } from '../registry/consumer-registry';
 import { logger, safeFailureLogDetail } from '../runtime/logger';
 import { RequestLogService } from '../log/requestLogService';
+import { RequestRateLimiter } from '../runtime/request-rate-limiter';
 import type {
     LLMRunResult,
     LLMRunMeta,
@@ -162,6 +163,7 @@ export class LLMSDKImpl {
         orchestrator: RequestOrchestrator,
         registry: ConsumerRegistry,
         requestLogService: RequestLogService,
+        private readonly requestRateLimiter: RequestRateLimiter = new RequestRateLimiter(),
     ) {
         this.router = router;
         this.budgetManager = budgetManager;
@@ -172,7 +174,21 @@ export class LLMSDKImpl {
         this.globalProfileId = 'balanced';
 
         // 连接编排器与展示控制器
-        this.orchestrator.setExecuteCallback((record) => this.executeRequest(record));
+        this.orchestrator.setExecuteCallback(async (record) => {
+            const result = await this.executeRequest(record);
+            if (!record.activeAttemptRequestId) {
+                try {
+                    await this.requestLogService.recordUnattemptedRequest(record, result);
+                } catch (error) {
+                    logger.warn(`请求日志写入失败: ${record.requestId}`, safeFailureLogDetail(error, {
+                        reasonCode: 'LOG_UNAVAILABLE',
+                        stage: 'llm.log.unattempted',
+                        requestId: record.requestId,
+                    }));
+                }
+            }
+            return result;
+        });
         this.orchestrator.setArchiveCallback((record) => {
             void this.requestLogService.archiveRecord(record).catch((error) => {
                 logger.warn(`请求日志归档失败: ${record.requestId}`, safeFailureLogDetail(error, {
@@ -214,6 +230,19 @@ export class LLMSDKImpl {
 
     setSettingsResolver(resolver: () => LLMHubSettings): void {
         this.settingsResolver = resolver;
+    }
+
+    resolveTaskMaxTokens(args: RunTaskArgs, profileId?: string): ResolvedMaxTokensResult {
+        const settings = this.readSettings();
+        const taskAssignment = this.router.getTaskAssignment(args.consumer, args.taskKey);
+        return resolveMaxTokens(args, {
+            globalControl: settings.maxTokensControl,
+            taskAssignment: taskAssignment?.isStale ? undefined : taskAssignment,
+            taskRegisteredMaxTokens: this.registry.getTaskDescriptor(args.consumer, args.taskKey)?.maxTokens,
+            requestBudgetMaxTokens: args.budget?.maxTokens,
+            consumerBudgetMaxTokens: this.budgetManager.getConfig(args.consumer)?.maxTokens,
+            profileMaxTokens: this.profileManager.get(profileId || this.globalProfileId)?.maxTokens,
+        });
     }
 
     dispose(): void {
@@ -357,14 +386,62 @@ export class LLMSDKImpl {
         }
     }
 
-    private resolveTaskDescription(consumer: string, taskKey: string, explicit?: string): string {
-        const explicitText = String(explicit || '').trim();
-        if (explicitText) {
-            return explicitText;
-        }
+    private resolveTaskDescription(consumer: string, taskKey: string, taskKind: CapabilityKind, explicit?: string): string {
         const registered = this.registry.getTaskDescriptor(consumer, taskKey)?.description;
         const registeredText = String(registered || '').trim();
-        return registeredText || taskKey;
+        if (registeredText) return registeredText;
+        const explicitText = String(explicit || '').trim();
+        if (explicitText) return explicitText;
+        return taskKind === 'embedding'
+            ? '用途未声明的向量化任务'
+            : taskKind === 'rerank'
+                ? '用途未声明的重排任务'
+                : '用途未声明的生成任务';
+    }
+
+    private setRouteSnapshot(record: RequestRecord, resourceId: string, model: string | undefined, taskKind: CapabilityKind): void {
+        const provider = this.router.getProvider(resourceId) as ({ kind?: string } | undefined);
+        const resource = this.readSettings().resources?.find((item) => item.id === resourceId);
+        let endpointOrigin: string | undefined;
+        let endpointPath: string | undefined;
+        let queryParameterNames: string[] | undefined;
+        if (resource?.baseUrl) {
+            try {
+                const endpoint = new URL(resource.baseUrl);
+                endpointOrigin = endpoint.origin;
+                queryParameterNames = [...new Set(endpoint.searchParams.keys())].sort();
+                const operationPath = taskKind === 'embedding'
+                    ? resource.apiType === 'gemini'
+                        ? `/models/${encodeURIComponent(model ?? resource.model ?? '')}:embedContent`
+                        : resource.embeddingPath ?? '/embeddings'
+                    : taskKind === 'rerank'
+                        ? resource.rerankProtocol === 'chat' ? '/chat/completions' : resource.rerankPath ?? '/rerank'
+                        : resource.apiType === 'claude' ? '/messages'
+                            : resource.apiType === 'gemini'
+                                ? `/models/${encodeURIComponent(model ?? resource.model ?? '')}:${this.readSettings().streamingEnabled === false ? 'generateContent' : 'streamGenerateContent'}`
+                                : '/chat/completions';
+                const basePath = (endpoint.pathname || '/').replace(/\/+$/u, '');
+                const normalizedOperation = operationPath.startsWith('/') ? operationPath : `/${operationPath}`;
+                endpointPath = basePath.endsWith(normalizedOperation) ? basePath : `${basePath}${normalizedOperation}`;
+                if (resource.apiType === 'gemini' && taskKind === 'generation' && this.readSettings().streamingEnabled !== false) {
+                    queryParameterNames = [...new Set([...(queryParameterNames ?? []), 'alt'])].sort();
+                }
+            } catch {
+                endpointPath = String(resource.baseUrl).split(/[?#]/u, 1)[0];
+            }
+        }
+        record.routeSnapshot = {
+            resourceId,
+            resourceLabel: resource?.label ?? (resourceId === '__builtin_tavern__' ? '酒馆内置生成' : resourceId),
+            ...(model ? { model } : {}),
+            ...(provider?.kind ? { providerKind: provider.kind } : {}),
+            ...(resource?.apiType ? { apiType: resource.apiType } : {}),
+            ...(endpointOrigin ? { endpointOrigin } : {}),
+            ...(endpointPath ? { endpointPath } : {}),
+            ...(queryParameterNames?.length ? { queryParameterNames } : {}),
+            ...(resource?.customParams ? { customParameterNames: Object.keys(resource.customParams).sort() } : {}),
+            streaming: this.readSettings().streamingEnabled !== false,
+        };
     }
 
     private summarizeSchema(schema: unknown): string | undefined {
@@ -450,7 +527,7 @@ export class LLMSDKImpl {
      */
     async runTask<T>(args: RunTaskArgs): Promise<LLMRunResult<T>> {
         const taskKind: CapabilityKind = args.taskKind;
-        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, args.taskDescription);
+        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, taskKind, args.taskDescription);
 
         const record = this.orchestrator.enqueue<T>(
             args.consumer,
@@ -461,6 +538,8 @@ export class LLMSDKImpl {
             taskDescription,
         );
         record.chatKey = this.resolveRequestChatKey(args);
+        record.consumerDisplayName = this.registry.getConsumerRegistration(args.consumer)?.displayName;
+        record.workflow = args.trace;
         record.requestLogSnapshot = this.buildRequestLogSnapshot(taskKind, taskDescription, args);
         this.emitLifecycle(args, record, {
             stage: 'queued',
@@ -477,7 +556,7 @@ export class LLMSDKImpl {
      * AI 结果返回时立即完成。
      */
     async embed(args: EmbedArgs): Promise<any> {
-        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, args.taskDescription);
+        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, 'embedding', args.taskDescription);
         const record = this.orchestrator.enqueue(
             args.consumer,
             args.taskKey,
@@ -487,6 +566,8 @@ export class LLMSDKImpl {
             taskDescription,
         );
         record.chatKey = this.resolveRequestChatKey(args);
+        record.consumerDisplayName = this.registry.getConsumerRegistration(args.consumer)?.displayName;
+        record.workflow = args.trace;
         record.requestLogSnapshot = this.buildRequestLogSnapshot('embedding', taskDescription, args);
         this.emitLifecycle(args, record, {
             stage: 'queued',
@@ -502,7 +583,7 @@ export class LLMSDKImpl {
      * AI 结果返回时立即完成。
      */
     async rerank(args: RerankArgs): Promise<any> {
-        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, args.taskDescription);
+        const taskDescription = this.resolveTaskDescription(args.consumer, args.taskKey, 'rerank', args.taskDescription);
         const record = this.orchestrator.enqueue(
             args.consumer,
             args.taskKey,
@@ -512,6 +593,8 @@ export class LLMSDKImpl {
             taskDescription,
         );
         record.chatKey = this.resolveRequestChatKey(args);
+        record.consumerDisplayName = this.registry.getConsumerRegistration(args.consumer)?.displayName;
+        record.workflow = args.trace;
         record.requestLogSnapshot = this.buildRequestLogSnapshot('rerank', taskDescription, args);
         this.emitLifecycle(args, record, {
             stage: 'queued',
@@ -663,6 +746,7 @@ export class LLMSDKImpl {
                 model: llmReq.model,
                 temperature: llmReq.temperature,
                 maxTokens: llmReq.maxTokens,
+                timeoutMs: llmReq.timeoutMs,
                 maxTokensSource,
                 schemaSummary,
                 routeHint: args.routeHint,
@@ -711,6 +795,7 @@ export class LLMSDKImpl {
                     profileId: args.routeHint.profile,
                 } : undefined,
             });
+            this.setRouteSnapshot(record, resolved.resourceId, resolved.model, 'generation');
             this.emitLifecycle(args, record, {
                 stage: 'route_resolved',
                 message: `已路由到资源 ${resolved.resourceId}`,
@@ -798,13 +883,7 @@ export class LLMSDKImpl {
             structuredOutput = { ...structuredOutput, transport: fallbackTransport };
         }
 
-        const resolvedMaxTokens = resolveMaxTokens(args, {
-            globalControl: settings.maxTokensControl,
-            taskAssignment: taskAssignment?.isStale ? undefined : taskAssignment,
-            taskRegisteredMaxTokens: taskDescriptor?.maxTokens,
-            consumerBudgetMaxTokens: consumerBudget?.maxTokens,
-            profileMaxTokens: profile?.maxTokens,
-        });
+        const resolvedMaxTokens = this.resolveTaskMaxTokens(args, resolved.profileId);
         const baseMessages = Array.isArray(args.input?.messages)
                 ? args.input.messages
                 : [
@@ -819,12 +898,14 @@ export class LLMSDKImpl {
                 ];
         const buildStructuredMessages = (plan: NonNullable<LLMRequest['structuredOutput']>) =>
             withStructuredOutputInstruction(baseMessages, plan);
+        const maxLatencyMs = args.budget?.maxLatencyMs ?? consumerBudget?.maxLatencyMs ?? settings.timeoutMs;
         const llmReq: LLMRequest = {
             messages: structuredOutput === undefined ? baseMessages : buildStructuredMessages(structuredOutput),
             model: resolved.model,
             maxTokens: resolvedMaxTokens.value,
             structuredOutput,
             temperature: args.input?.temperature ?? profile?.temperature ?? 0.3,
+            ...(maxLatencyMs === undefined ? {} : { timeoutMs: maxLatencyMs }),
         };
 
         const schemaSummary = schema === undefined ? undefined : this.summarizeSchema(schema);
@@ -858,7 +939,6 @@ export class LLMSDKImpl {
             },
         };
 
-        const maxLatencyMs = args.budget?.maxLatencyMs ?? consumerBudget?.maxLatencyMs;
         this.emitLifecycle(args, record, {
             stage: 'provider_requesting',
             message: '正在请求模型',
@@ -1223,6 +1303,7 @@ export class LLMSDKImpl {
                 requiredCapabilities: ['embeddings'],
                 routeHint: args.routeHint ? { resourceId: args.routeHint.resource, model: args.routeHint.model } : undefined,
             });
+            this.setRouteSnapshot(record, resolved.resourceId, resolved.model, 'embedding');
             this.emitLifecycle(args, record, {
                 stage: 'route_resolved',
                 message: `已路由到向量资源 ${resolved.resourceId}`,
@@ -1244,22 +1325,30 @@ export class LLMSDKImpl {
 
         const provider = this.router.getProvider(resolved.resourceId);
         if (!provider?.embed) {
+            const failure = this.failure(createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
+                stage: 'llm.embedding.capability', requestId: record.requestId, resourceId: resolved.resourceId, model: resolved.model,
+            }), 'llm.embedding.capability', { requestId: record.requestId, resourceId: resolved.resourceId, model: resolved.model });
+            const diagnostic = describeSSHelperFailure(failure);
             this.attachRecordDebug(record, {
-                error: '当前资源不支持 embedding',
-                reasonCode: 'PROVIDER_UNAVAILABLE',
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
             this.emitLifecycle(args, record, {
                 stage: 'failed',
-                message: '当前资源不支持 embedding',
-                error: '当前资源不支持 embedding',
+                message: diagnostic.reason,
+                error: diagnostic.title,
+                reasonCode: failure.reasonCode,
             });
-            return { ok: false, error: '当前资源不支持 embedding' };
+            return this.failureResult(failure);
         }
 
         try {
+            const timeoutMs = this.readSettings().timeoutMs;
             this.attachProviderRequestSnapshot(record, {
                 texts: args.texts,
                 model: resolved.model,
+                dimensions: args.dimensions,
+                timeoutMs,
             });
             this.emitLifecycle(args, record, {
                 stage: 'provider_requesting',
@@ -1268,7 +1357,9 @@ export class LLMSDKImpl {
                 model: resolved.model,
                 progress: 0.65,
             });
-            const response = await provider.embed({ texts: args.texts, model: resolved.model, signal: args.signal });
+            await this.refreshRunningAttemptLog(record);
+            await this.requestRateLimiter.acquire(args.signal, record.requestId);
+            const response = await provider.embed({ texts: args.texts, model: resolved.model, dimensions: args.dimensions, signal: args.signal, timeoutMs });
             this.attachRecordDebug(record, {
                 providerResponse: response,
             });
@@ -1281,6 +1372,7 @@ export class LLMSDKImpl {
                 startedAt: record.startedAt,
                 finishedAt: Date.now(),
                 latencyMs: Date.now() - (record.startedAt || record.queuedAt),
+                ...(resolved.resolvedBy === 'fallback' ? { fallbackUsed: true } : {}),
             };
             this.emitLifecycle(args, record, {
                 stage: 'completed',
@@ -1331,6 +1423,25 @@ export class LLMSDKImpl {
         return String(record.activeAttemptRequestId || '').trim() || this.generateAttemptRequestId(record);
     }
 
+    private async refreshRunningAttemptLog(record: RequestRecord): Promise<void> {
+        const attemptId = String(record.activeAttemptRequestId || '').trim();
+        if (!attemptId || !record.activeAttemptPhase) return;
+        try {
+            await this.requestLogService.markAttemptRunning({
+                record,
+                attemptId,
+                attemptPhase: record.activeAttemptPhase,
+            });
+        } catch (error) {
+            logger.warn('Provider 发送前刷新诊断元数据失败，请求将继续执行。', safeFailureLogDetail(error, {
+                reasonCode: 'LOG_UNAVAILABLE',
+                stage: 'llm.log.before_provider',
+                requestId: record.requestId,
+                attemptId,
+            }));
+        }
+    }
+
     /**
      * 功能：记录一次尝试日志。
      * @param record 请求主记录。
@@ -1371,6 +1482,7 @@ export class LLMSDKImpl {
                 requiredCapabilities: ['rerank'],
                 routeHint: args.routeHint ? { resourceId: args.routeHint.resource, model: args.routeHint.model } : undefined,
             });
+            this.setRouteSnapshot(record, resolved.resourceId, resolved.model, 'rerank');
             this.emitLifecycle(args, record, {
                 stage: 'route_resolved',
                 message: `已路由到重排资源 ${resolved.resourceId}`,
@@ -1393,11 +1505,13 @@ export class LLMSDKImpl {
         const provider = this.router.getProvider(resolved.resourceId);
         if (provider?.rerank) {
             try {
+                const timeoutMs = this.readSettings().timeoutMs;
                 this.attachProviderRequestSnapshot(record, {
                     query: args.query,
                     docs: args.docs,
                     topK: args.topK,
                     model: resolved.model,
+                    timeoutMs,
                 });
                 this.emitLifecycle(args, record, {
                     stage: 'provider_requesting',
@@ -1406,12 +1520,15 @@ export class LLMSDKImpl {
                     model: resolved.model,
                     progress: 0.65,
                 });
+                await this.refreshRunningAttemptLog(record);
+                await this.requestRateLimiter.acquire(args.signal, record.requestId);
                 const response = await provider.rerank({
                     query: args.query,
                     docs: args.docs,
                     topK: args.topK,
                     model: resolved.model,
                     signal: args.signal,
+                    timeoutMs,
                 });
                 this.attachRecordDebug(record, {
                     providerResponse: response,
@@ -1425,6 +1542,7 @@ export class LLMSDKImpl {
                     startedAt: record.startedAt,
                     finishedAt: Date.now(),
                     latencyMs: Date.now() - (record.startedAt || record.queuedAt),
+                    ...(resolved.resolvedBy === 'fallback' ? { fallbackUsed: true } : {}),
                 };
                 this.emitLifecycle(args, record, {
                     stage: 'completed',
@@ -1455,41 +1573,23 @@ export class LLMSDKImpl {
             }
         }
 
-        // Provider 不支持 rerank：关键词覆盖率兜底
-        const tokens = args.query
-            .toLowerCase()
-            .split(/[\s，。！？,.!?\n]+/)
-            .map((token: string) => token.trim())
-            .filter((token: string) => token.length > 1);
-
-        const scored = args.docs.map((doc: string, index: number) => {
-            const lower = doc.toLowerCase();
-            let hit = 0;
-            for (const token of tokens) {
-                if (lower.includes(token)) hit += 1;
-            }
-            const score = tokens.length > 0 ? hit / tokens.length : 0;
-            return { index, score, doc };
-        });
-        scored.sort((a, b) => b.score - a.score);
+        const failure = this.failure(createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
+            stage: 'llm.rerank.capability', requestId: record.requestId, resourceId: resolved.resourceId, model: resolved.model,
+        }), 'llm.rerank.capability', { requestId: record.requestId, resourceId: resolved.resourceId, model: resolved.model });
+        const diagnostic = describeSSHelperFailure(failure);
         this.emitLifecycle(args, record, {
-            stage: 'completed',
-            message: '重排资源不支持原生接口，已使用关键词兜底完成',
-            resourceId: `${resolved.resourceId}:fallback`,
+            stage: 'failed',
+            message: diagnostic.reason,
+            error: diagnostic.title,
+            reasonCode: failure.reasonCode,
+            resourceId: resolved.resourceId,
             model: resolved.model,
-            fallbackUsed: true,
-            progress: 1,
         });
         this.attachRecordDebug(record, {
-            providerResponse: { results: scored },
+            error: diagnostic.title,
+            reasonCode: failure.reasonCode,
         });
-        return {
-            ok: true,
-            results: scored,
-            resource: `${resolved.resourceId}:fallback`,
-            fallbackUsed: true,
-            providerResponse: { results: scored },
-        };
+        return this.failureResult(failure);
     }
 
     /** 尝试单个资源执行请求 */
@@ -1529,20 +1629,37 @@ export class LLMSDKImpl {
                 return { ok: false, error: `资源 "${resourceId}" 未找到`, retryable: false, reasonCode: 'PROVIDER_UNAVAILABLE' };
             }
 
+            await this.requestRateLimiter.acquire(signal, requestId);
             const timeoutMs = Number(maxLatencyMs);
-            const response = Number.isFinite(timeoutMs) && timeoutMs > 0
-                ? await Promise.race([
-                    provider.request({ ...req, signal }),
-                    new Promise<never>((_, reject) => setTimeout(() => reject(createSSHelperError('HTTP_REQUEST_TIMEOUT', {
-                        stage: 'llm.provider.request',
-                        resourceId,
-                    })), timeoutMs)),
-                ])
-                : await provider.request({ ...req, signal });
+            const attemptController = new AbortController();
+            const onCallerAbort = (): void => attemptController.abort(signal?.reason);
+            if (signal?.aborted) onCallerAbort();
+            else signal?.addEventListener('abort', onCallerAbort, { once: true });
+            let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+            try {
+                const providerRequest = provider.request({
+                    ...req,
+                    signal: attemptController.signal,
+                    ...(Number.isFinite(timeoutMs) && timeoutMs > 0 ? { timeoutMs } : {}),
+                });
+                const response = Number.isFinite(timeoutMs) && timeoutMs > 0
+                    ? await Promise.race([
+                        providerRequest,
+                        new Promise<never>((_, reject) => {
+                            timeoutHandle = setTimeout(() => {
+                                attemptController.abort();
+                                reject(createSSHelperError('HTTP_REQUEST_TIMEOUT', {
+                                    stage: 'llm.provider.request',
+                                    resourceId,
+                                }));
+                            }, timeoutMs);
+                        }),
+                    ])
+                    : await providerRequest;
 
-            const finishReason = String((response as { finishReason?: unknown }).finishReason ?? '').trim().toLowerCase();
+                const finishReason = String((response as { finishReason?: unknown }).finishReason ?? '').trim().toLowerCase();
 
-            if (finishReason === 'length') {
+                if (finishReason === 'length') {
                 this.budgetManager.recordFailure(consumer);
                 return {
                     ok: false,
@@ -1555,9 +1672,9 @@ export class LLMSDKImpl {
                     resourceId,
                     usage: response.usage,
                 };
-            }
+                }
 
-            if (schema === undefined) {
+                if (schema === undefined) {
                 this.budgetManager.recordSuccess(consumer);
                 return {
                     ok: true,
@@ -1569,7 +1686,7 @@ export class LLMSDKImpl {
                     resourceId,
                     usage: response.usage,
                 };
-            }
+                }
 
             if (!String(response.content || '').trim()) {
                 this.budgetManager.recordFailure(consumer);
@@ -1644,11 +1761,16 @@ export class LLMSDKImpl {
                 resourceId,
                 usage: response.usage,
             };
+            } finally {
+                if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+                signal?.removeEventListener('abort', onCallerAbort);
+            }
         } catch (error) {
             this.budgetManager.recordFailure(consumer);
             const providerError = error as Error & {
                 providerRequest?: Record<string, unknown>;
                 providerResponse?: unknown;
+                rawResponseText?: string;
             };
             const failure = this.failure(error, 'llm.provider.request', {
                 resourceId,
@@ -1663,6 +1785,7 @@ export class LLMSDKImpl {
                 reasonCode: failure.reasonCode,
                 providerRequest: providerError.providerRequest,
                 providerResponse: providerError.providerResponse,
+                rawResponseText: providerError.rawResponseText,
                 failure,
             };
         }

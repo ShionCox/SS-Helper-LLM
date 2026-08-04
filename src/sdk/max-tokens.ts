@@ -105,6 +105,7 @@ export function resolveMaxTokens(args: RunTaskArgs, options: {
     globalControl?: GlobalMaxTokensControl;
     taskAssignment?: TaskAssignment;
     taskRegisteredMaxTokens?: number;
+    requestBudgetMaxTokens?: number;
     consumerBudgetMaxTokens?: number;
     profileMaxTokens?: number;
 }): ResolvedMaxTokensResult {
@@ -144,6 +145,14 @@ export function resolveMaxTokens(args: RunTaskArgs, options: {
 
     if (globalControl?.mode === 'adaptive') {
         return estimateAdaptiveMaxTokens(args, globalControl.adaptive);
+    }
+
+    const requestBudget = toPositiveInt(options.requestBudgetMaxTokens);
+    if (requestBudget) {
+        return {
+            value: requestBudget,
+            source: 'request_budget',
+        };
     }
 
     const consumerBudget = toPositiveInt(options.consumerBudgetMaxTokens);

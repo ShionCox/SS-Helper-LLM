@@ -211,6 +211,67 @@ export interface RequestDebugInfo {
     failure?: SSHelperFailureContext;
 }
 
+export interface LLMProviderRequestMetadata {
+    requestFormat: string;
+    operation?: string;
+    method?: 'GET' | 'POST';
+    providerKind?: string;
+    apiType?: ApiType;
+    resourceId?: string;
+    model?: string;
+    endpointOrigin?: string;
+    endpointPath?: string;
+    queryParameterNames?: string[];
+    headerNames?: string[];
+    authScheme?: 'bearer' | 'api_key' | 'none' | 'unknown';
+    streaming?: boolean;
+    timeoutMs?: number;
+    idleTimeoutMs?: number;
+    sentAt?: number;
+    messageCount?: number;
+    messageRoles?: string[];
+    inputCharCount?: number;
+    toolCount?: number;
+    toolNames?: string[];
+    schemaHash?: string;
+    structuredTransport?: string;
+    maxTokens?: number;
+    temperature?: number;
+    embeddingTextCount?: number;
+    rerankDocCount?: number;
+    dimensions?: number;
+    topK?: number;
+    payloadBytes?: number;
+    customParameterNames?: string[];
+}
+
+export interface LLMProviderResponseMetadata {
+    outcome: 'success' | 'http_error' | 'network_error' | 'timeout' | 'cancelled' | 'empty' | 'invalid_json' | 'schema_error' | 'protocol_error' | 'unknown_error';
+    httpStatus?: number;
+    contentType?: string;
+    receivedBytes?: number;
+    streamed?: boolean;
+    streamEventCount?: number;
+    finishReason?: string;
+    usage?: { promptTokens?: number; completionTokens?: number; totalTokens?: number };
+    latencyMs?: number;
+    receivedAt?: number;
+    providerErrorCode?: string;
+    providerErrorType?: string;
+    providerErrorParam?: string;
+}
+
+export interface LLMParseMetadata {
+    stage: string;
+    outcome: 'not_applicable' | 'success' | 'empty' | 'invalid_json' | 'schema_error' | 'protocol_error';
+    responseCharCount?: number;
+    candidateJsonCount?: number;
+    parsedRootType?: 'object' | 'array' | 'scalar' | 'unknown';
+    validationIssueCount?: number;
+    itemRejectionCount?: number;
+    issues?: Array<{ path: string; keyword: string; expected: string }>;
+}
+
 export interface LLMRequestLogRequestSnapshot {
     taskKind: CapabilityKind;
     taskDescription?: string;
@@ -240,6 +301,7 @@ export interface LLMRequestLogRequestSnapshot {
         detail?: unknown;
     };
     providerRequest?: unknown;
+    providerRequestMeta?: LLMProviderRequestMetadata;
     normalizeMode?: string;
     generationInput?: unknown;
     embeddingTexts?: string[];
@@ -263,12 +325,81 @@ export interface LLMRequestLogResponseSnapshot {
     validationIssues?: Array<{ path: string; keyword: string; expected: string }>;
     itemRejections?: LlmStructuredItemRejection[];
     rawResponseText?: string;
+    responsePreview?: {
+        kind: 'truncated_text';
+        prefix: string;
+        suffix?: string;
+        originalBytes: number;
+        retainedBytes: number;
+    };
     providerResponse?: unknown;
     parsedResponse?: unknown;
     normalizedResponse?: unknown;
+    providerResponseMeta?: LLMProviderResponseMetadata;
+    parseMeta?: LLMParseMetadata;
+}
+
+export type LLMRequestLogEntryKind = 'provider_attempt' | 'agent_turn';
+
+export interface LLMRequestLogRouteSnapshot {
+    resourceId: string;
+    resourceLabel?: string;
+    model?: string;
+    providerKind?: string;
+    apiType?: ApiType;
+    endpointOrigin?: string;
+    endpointPath?: string;
+    queryParameterNames?: string[];
+    customParameterNames?: string[];
+    streaming?: boolean;
+}
+
+export interface LLMRequestLogToolCallMetadata {
+    callId: string;
+    name: string;
+    argumentBytes: number;
+    /** Tool arguments, retained only by full log modes after sanitization. */
+    arguments?: unknown;
+}
+
+export interface LLMRequestLogToolResultMetadata {
+    callId: string;
+    name: string;
+    ok: boolean;
+    resultBytes: number;
+    readCount?: number;
+    resultCount?: number;
+    truncated?: boolean;
+    reasonCode?: string;
+    /** Tool result, retained only by full log modes after sanitization. */
+    content?: unknown;
+}
+
+export interface LLMRequestLogValueMetadata {
+    valueType: 'null' | 'array' | 'object' | 'string' | 'number' | 'boolean' | 'unknown';
+    serializedBytes: number;
+    itemCount?: number;
+    keyCount?: number;
+}
+
+export interface LLMRequestLogAgentSnapshot {
+    state: 'tool_calls' | 'final' | 'failed' | 'cancelled';
+    toolSessionId?: string;
+    toolSessionRound: number;
+    totalCalls: number;
+    capabilitySnapshotId?: string;
+    toolDescriptions?: Readonly<Record<string, string>>;
+    toolCalls?: LLMRequestLogToolCallMetadata[];
+    toolResults?: LLMRequestLogToolResultMetadata[];
+    finalOutputMeta?: LLMRequestLogValueMetadata;
+    /** Full normalized Agent result, retained only by full log modes. */
+    finalOutput?: unknown;
+    usage?: LlmUsage;
 }
 
 export interface LLMRequestLogEntry {
+    /** Missing on legacy rows and therefore read as provider_attempt. */
+    entryKind?: LLMRequestLogEntryKind;
     logId: string;
     llmTaskId: string;
     requestId: string;
@@ -276,9 +407,16 @@ export interface LLMRequestLogEntry {
     attemptId: string;
     sourcePluginId: string;
     consumer: string;
+    consumerDisplayName?: string;
     taskKey: string;
     taskDescription?: string;
     taskKind: CapabilityKind;
+    resourceId?: string;
+    resourceLabel?: string;
+    model?: string;
+    providerKind?: string;
+    workflow?: LlmWorkflowTrace;
+    agent?: LLMRequestLogAgentSnapshot;
     state: RequestState;
     attemptIndex: number;
     attemptPhase: LlmStructuredAttemptPhase;
@@ -317,6 +455,13 @@ export interface LLMRequestLogQueryOptions {
     fromTs?: number;
     toTs?: number;
     sourcePluginId?: string;
+    taskKind?: CapabilityKind;
+    resourceId?: string;
+    model?: string;
+    reasonCode?: SSHelperReasonCode;
+    entryKind?: LLMRequestLogEntryKind | 'all';
+    callScope?: 'all' | 'ordinary' | 'agent_workflow';
+    workflowId?: string;
 }
 
 /** 内部请求记录 */
@@ -325,6 +470,7 @@ export interface RequestRecord<T = unknown> {
     consumer: string;
     taskKey: string;
     taskDescription?: string;
+    consumerDisplayName?: string;
     taskKind: CapabilityKind;
     requestArgs?: unknown;
     state: RequestState;
@@ -344,6 +490,8 @@ export interface RequestRecord<T = unknown> {
     meta?: LLMRunMeta;
     debug?: RequestDebugInfo;
     requestLogSnapshot?: LLMRequestLogRequestSnapshot;
+    routeSnapshot?: LLMRequestLogRouteSnapshot;
+    workflow?: LlmWorkflowTrace;
 }
 export interface RouteResolveArgs {
     consumer: string;
@@ -377,7 +525,7 @@ export type ResourceSource = 'tavern' | 'custom';
 export type GenerationSource = 'tavern' | 'custom';
 
 /** 自定义 API 协议类型 */
-export type ApiType = 'auto' | 'openai' | 'deepseek' | 'gemini' | 'claude' | 'generic';
+export type ApiType = 'auto' | 'openai' | 'xai' | 'deepseek' | 'kimi' | 'glm' | 'gemini' | 'claude' | 'generic';
 
 /** 资源级自定义请求参数 */
 export type ResourceCustomParams = Record<string, unknown>;
@@ -392,12 +540,22 @@ export interface ResourceConfig {
     baseUrl?: string;
     model?: string;
     enabled?: boolean;
+    /** OpenAI-compatible embedding operation path, such as /embeddings. */
+    embeddingPath?: string;
+    /** Optional resource-level embedding output dimensions. */
+    embeddingDimensions?: number;
     /** 重排资源专用路径，如 /rerank */
     rerankPath?: string;
+    /** Native endpoint or generation-model JSON reranking. */
+    rerankProtocol?: 'native' | 'chat';
     /** 资源声明能力（包含基础能力与附加能力） */
     capabilities?: LLMCapability[];
     /** 透传到 Provider 请求体中的自定义参数 */
     customParams?: ResourceCustomParams;
+    /** Provider 工具续轮协议；通用接口仅在真实握手后生效。 */
+    toolDialect?: ProviderToolDialect;
+    /** 默认本地重放且 store=false；远端托管必须显式授权。 */
+    privacyPolicy?: ProviderPrivacyPolicy;
 }
 
 // ═══════════════════════════════════════════
@@ -461,6 +619,10 @@ export interface LLMHubSettings {
     enabled?: boolean;
     /** 大语言模型生成来源；不影响 embedding 与 rerank */
     generationSource?: GenerationSource;
+    /** 自定义生成资源是否使用流式传输 */
+    streamingEnabled?: boolean;
+    /** 全局 Provider 请求启动速率；0 表示不限速 */
+    maxRequestsPerMinute?: number;
     timeoutMs?: number;
     maxTokensMode?: MaxTokensMode;
     maxTokens?: number;
@@ -538,6 +700,7 @@ export interface RunTaskArgs {
     consumer: string;
     taskKey: string;
     taskDescription?: string;
+    trace?: LlmWorkflowTrace;
     taskKind: CapabilityKind;
     input: any;
     schema?: object;
@@ -552,7 +715,9 @@ export interface EmbedArgs {
     consumer: string;
     taskKey: string;
     taskDescription?: string;
+    trace?: LlmWorkflowTrace;
     texts: string[];
+    dimensions?: number;
     routeHint?: { resource?: string; model?: string };
     enqueue?: RequestEnqueueOptions;
     onLifecycle?: LLMTaskLifecycleHandler;
@@ -563,6 +728,7 @@ export interface RerankArgs {
     consumer: string;
     taskKey: string;
     taskDescription?: string;
+    trace?: LlmWorkflowTrace;
     query: string;
     docs: string[];
     topK?: number;
@@ -572,10 +738,14 @@ export interface RerankArgs {
     signal?: AbortSignal;
 }
 import type {
+    LlmUsage,
+    LlmWorkflowTrace,
     LlmStructuredAttemptPhase,
     LlmStructuredItemRejection,
     LlmStructuredRepairPolicy,
     LlmStructuredTransport,
     SSHelperFailureContext,
     SSHelperReasonCode,
+    ProviderPrivacyPolicy,
+    ProviderToolDialect,
 } from '@ss-helper/sdk';

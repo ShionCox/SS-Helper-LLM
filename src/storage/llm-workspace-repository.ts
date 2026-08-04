@@ -8,17 +8,18 @@ import type {
   WorkspaceSession,
   SSHelperFailureContext,
   SSHelperReasonCode,
+  VerifiedToolCapabilities,
 } from '@ss-helper/sdk';
-import { createSSHelperError, isSSHelperReasonCode } from '@ss-helper/sdk';
+import { createSSHelperError, isLlmToolCapabilityVerifyResponse, isSSHelperReasonCode } from '@ss-helper/sdk';
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
-import type { LLMHubSettings } from '../schema/types';
+import type { LLMHubSettings, LLMRequestLogQueryOptions } from '../schema/types';
 import { validateLlmSettings } from '../validation/settings';
 import { buildStoredLog } from '../log/log-sanitizer';
 import { startLlmPerformanceSpan } from '../runtime/logger';
 
 export const LLM_WORKSPACE_ID = 'llm:global';
 export const LLM_WORKSPACE_OWNER = 'ss-helper.llm';
-const COLLECTIONS = ['settings', 'request-logs', 'consumers', 'resource-health'] as const;
+const COLLECTIONS = ['settings', 'request-logs', 'consumers', 'resource-health', 'tool-capabilities'] as const;
 const MAX_PAGE_SIZE = 1_000;
 const MAX_TRANSACTION_OPERATIONS = 5_000;
 const MAX_ARCHIVE_BYTES = 1_024 * 1_024;
@@ -26,6 +27,7 @@ const MAX_CONSUMERS = 1_000;
 const DEFAULT_LOG_MAX_ENTRIES = 500;
 const DEFAULT_LOG_RETENTION_DAYS = 30;
 const DEFAULT_LOG_MAX_BYTES = 100 * 1024 * 1024;
+const AGENT_PIPELINE_BASELINE_RECORD_ID = 'agent-pipeline-baseline-v1';
 type PersistedSettings = LLMHubSettings & { timeoutMs?: number };
 type LogKind = 'generation' | 'embedding' | 'rerank';
 type SecretSnapshot = {
@@ -47,6 +49,11 @@ export interface ResourceHealthRecord {
   readonly checkedAt: number;
   readonly durationMs: number;
   readonly failure?: SSHelperFailureContext;
+}
+
+export interface StoredToolCapabilityRecord {
+  readonly cacheKey: string;
+  readonly capability: VerifiedToolCapabilities;
 }
 
 export interface LLMConfigArchiveV0 {
@@ -107,6 +114,14 @@ function validateResourceHealth(value: PlainData): ResourceHealthRecord {
   };
 }
 
+function validateToolCapability(cacheKey: string, value: PlainData): StoredToolCapabilityRecord {
+  if (!/^fnv1a64:[0-9a-f]{16}$/u.test(cacheKey)
+    || !isLlmToolCapabilityVerifyResponse({ capability: value })) {
+    throw repositoryError('INVALID_PAYLOAD', 'llm.tool-capability.validate');
+  }
+  return { cacheKey, capability: structuredClone(value) as unknown as VerifiedToolCapabilities };
+}
+
 async function sha256Json(value: unknown): Promise<string> {
   const bytes = new TextEncoder().encode(JSON.stringify(value));
   const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
@@ -162,6 +177,40 @@ export class LlmWorkspaceRepository {
     return structuredClone(this.settings);
   }
 
+  private async applyAgentPipelineBaseline(): Promise<void> {
+    const marker = await this.read({ collection: 'settings', id: AGENT_PIPELINE_BASELINE_RECORD_ID });
+    if (marker) return;
+    const current = await this.read({ collection: 'settings', id: 'global' });
+    const operations: WorkspaceCommitOperation[] = [];
+    if (current) {
+      const settings = validateLlmSettings(current.value);
+      const retired = new Set([
+        ['memory', 'capture'].join('_'),
+        ['memory', 'capture', 'repair'].join('_'),
+      ]);
+      const next: LLMHubSettings = {
+        ...settings,
+        taskAssignments: (settings.taskAssignments ?? []).filter(assignment => !(
+          assignment.pluginId === 'ss-helper.memory' && retired.has(assignment.taskKey)
+        )),
+        resources: (settings.resources ?? []).map(resource => ({
+          ...resource,
+          privacyPolicy: {
+            conversationStateMode: 'local_replay' as const,
+            storeProviderState: false,
+            allowRemoteRetention: false,
+          },
+        })),
+      };
+      operations.push({ action: 'put', collection: 'settings', id: 'global', value: asPlain(next), expectedRevision: current.revision });
+    }
+    operations.push({
+      action: 'put', collection: 'settings', id: AGENT_PIPELINE_BASELINE_RECORD_ID,
+      value: { version: 1, appliedAt: Date.now() }, expectedRevision: 0,
+    });
+    await this.write({ idempotencyKey: 'llm-agent-pipeline-baseline-v1', operations });
+  }
+
   private async initialize(): Promise<void> {
     const finish = startLlmPerformanceSpan('repository.initialize');
     try {
@@ -172,11 +221,13 @@ export class LlmWorkspaceRepository {
           collections: COLLECTIONS.map(name => ({
             name,
             indexes: name === 'request-logs'
-              ? ['sourcePluginId', 'state', 'resourceId', 'taskKey', 'taskKind', 'model', 'reasonCode', 'createdAt']
-              : name === 'resource-health' ? ['state', 'checkedAt'] : [],
+              ? ['sourcePluginId', 'state', 'resourceId', 'taskKey', 'taskKind', 'model', 'reasonCode', 'entryKind', 'workflowId', 'createdAt']
+              : name === 'resource-health' ? ['state', 'checkedAt']
+                : name === 'tool-capabilities' ? ['resourceId', 'model', 'status', 'expiresAt'] : [],
           })),
         },
       });
+      await this.applyAgentPipelineBaseline();
       await this.loadSettingsFromWorkspace();
       finish();
     } catch (error) {
@@ -345,12 +396,21 @@ export class LlmWorkspaceRepository {
     return this.enqueue(async () => {
       await this.ready();
       const prepared = await this.prepareRuntime(DEFAULT_LLM_SETTINGS, { emptyCredentials: true });
-      const healthRecords = await this.queryAll('resource-health');
+      const [healthRecords, toolCapabilities] = await Promise.all([
+        this.queryAll('resource-health'),
+        this.queryAll('tool-capabilities'),
+      ]);
       const operations: WorkspaceCommitOperation[] = [
         { action: 'delete', collection: 'settings', id: 'global', expectedRevision: this.settingsRevision },
         ...healthRecords.map((record) => ({
           action: 'delete' as const,
           collection: 'resource-health',
+          id: record.id,
+          expectedRevision: recordRevision(record),
+        })),
+        ...toolCapabilities.map((record) => ({
+          action: 'delete' as const,
+          collection: 'tool-capabilities',
           id: record.id,
           expectedRevision: recordRevision(record),
         })),
@@ -417,6 +477,51 @@ export class LlmWorkspaceRepository {
     });
   }
 
+  async listToolCapabilities(): Promise<readonly StoredToolCapabilityRecord[]> {
+    await this.ready();
+    return (await this.queryAll('tool-capabilities')).map((record) => validateToolCapability(record.id, record.value));
+  }
+
+  async saveToolCapability(cacheKey: string, value: VerifiedToolCapabilities): Promise<StoredToolCapabilityRecord> {
+    return this.enqueue(async () => {
+      await this.ready();
+      const stored = validateToolCapability(cacheKey, asPlain(value));
+      const previous = await this.read({ collection: 'tool-capabilities', id: cacheKey });
+      await this.write({
+        idempotencyKey: operationKey('llm-tool-capability'),
+        operations: [{
+          action: 'put',
+          collection: 'tool-capabilities',
+          id: cacheKey,
+          value: asPlain(stored.capability),
+          expectedRevision: recordRevision(previous),
+        }],
+      });
+      return structuredClone(stored);
+    });
+  }
+
+  async deleteToolCapabilitiesForResource(resourceId: string): Promise<number> {
+    return this.enqueue(async () => {
+      await this.ready();
+      const records = (await this.queryAll('tool-capabilities')).filter((record) => {
+        const value = record.value as Record<string, PlainData>;
+        return value.resourceId === resourceId;
+      });
+      if (!records.length) return 0;
+      const result = await this.write({
+        idempotencyKey: operationKey('llm-tool-capability-delete'),
+        operations: records.map((record) => ({
+          action: 'delete' as const,
+          collection: 'tool-capabilities',
+          id: record.id,
+          expectedRevision: recordRevision(record),
+        })),
+      });
+      return result.results.filter((item) => item.removed !== false).length;
+    });
+  }
+
   async setResourceSecret(resourceId: string, value: string, _metadata: PlainData = {}): Promise<WorkspaceCredentialMetadata> {
     return this.enqueue(async () => {
       await this.ready();
@@ -465,12 +570,17 @@ export class LlmWorkspaceRepository {
       const next = this.settingsFrom({ ...this.settings, resources: (this.settings.resources ?? []).filter((resource) => resource.id !== resourceId) });
       const prepared = await this.prepareRuntime(next, { credentialOverrides: { [resourceId]: null } });
       const health = await this.read({ collection: 'resource-health', id: resourceId });
+      const toolCapabilities = (await this.queryAll('tool-capabilities')).filter((record) => {
+        const value = record.value as Record<string, PlainData>;
+        return value.resourceId === resourceId;
+      });
       const secrets = this.requireSecrets();
       const secretId = credentialId(resourceId);
       const previousSecret = await secrets.get({ workspaceId: LLM_WORKSPACE_ID, secretId });
       const operations: WorkspaceCommitOperation[] = [
         { action: 'put', collection: 'settings', id: 'global', value: asPlain(next), expectedRevision: this.settingsRevision },
         ...(health === null ? [] : [{ action: 'delete' as const, collection: 'resource-health', id: resourceId, expectedRevision: recordRevision(health) }]),
+        ...toolCapabilities.map((record) => ({ action: 'delete' as const, collection: 'tool-capabilities', id: record.id, expectedRevision: recordRevision(record) })),
       ];
       let secretDeleted = false;
       try {
@@ -620,13 +730,24 @@ export class LlmWorkspaceRepository {
   async sanitizeStoredLogs(): Promise<number> {
     return this.enqueue(async () => {
       await this.ready();
-      const records = (await this.queryAll('request-logs')).filter(record =>
-        Number((record.value as Record<string, unknown>).logFormatVersion ?? 0) < 3);
+      const records = (await this.queryAll('request-logs')).filter((record) => {
+        const value = record.value as Record<string, unknown>;
+        const response = value.response && typeof value.response === 'object' && !Array.isArray(value.response)
+          ? value.response as Record<string, unknown>
+          : undefined;
+        const providerResponse = response?.providerResponse && typeof response.providerResponse === 'object' && !Array.isArray(response.providerResponse)
+          ? response.providerResponse as Record<string, unknown>
+          : undefined;
+        return Number(value.logFormatVersion ?? 0) < 3
+          || (Object.hasOwn(providerResponse ?? {}, 'debugRequest') && providerResponse?.debugRequest !== '[未记录]');
+      });
       let rewritten = 0;
       for (let index = 0; index < records.length; index += MAX_TRANSACTION_OPERATIONS) {
         const batch = records.slice(index, index + MAX_TRANSACTION_OPERATIONS);
         const operations = batch.flatMap(record => {
-          const stored = buildStoredLog(record.value as Record<string, unknown>, 'summary');
+          const value = record.value as Record<string, unknown>;
+          const mode = Number(value.logFormatVersion ?? 0) < 3 ? 'summary' : 'full';
+          const stored = buildStoredLog(value, mode);
           return stored ? [{
             action: 'put' as const,
             collection: 'request-logs',
@@ -750,7 +871,7 @@ export class LlmWorkspaceRepository {
     });
   }
 
-  async queryLogs(input: { state?: string; sourcePluginId?: string; resourceId?: string; taskKind?: string; model?: string; reasonCode?: SSHelperReasonCode; search?: string; fromTs?: number; toTs?: number; limit?: number; offset?: number } = {}): Promise<readonly PlainData[]> {
+  async queryLogs(input: LLMRequestLogQueryOptions = {}): Promise<readonly PlainData[]> {
     await this.ready();
     const filter: Record<string, PlainData> = {};
     if (input.state && input.state !== 'all') filter.state = input.state;
@@ -771,7 +892,18 @@ export class LlmWorkspaceRepository {
     const limit = Math.min(500, Math.max(0, Math.trunc(input.limit ?? 100)));
     const offset = Math.max(0, Math.trunc(input.offset ?? 0));
     return records
-      .map((record) => record.value)
+      .map((record) => {
+        const value = record.value as Record<string, PlainData>;
+        const logId = String(value.logId ?? record.id).trim() || record.id;
+        const requestId = String(value.requestId ?? logId).trim() || logId;
+        return {
+          ...value,
+          logId,
+          requestId,
+          entryKind: value.entryKind ?? 'provider_attempt',
+          createdAt: value.createdAt ?? value.finishedAt ?? value.queuedAt ?? record.updatedAt ?? Date.now(),
+        } satisfies Record<string, PlainData>;
+      })
       .filter((value) => {
         const row = value as Record<string, unknown>;
         const response = row.response && typeof row.response === 'object'
@@ -781,6 +913,14 @@ export class LlmWorkspaceRepository {
           ? response.failure as Record<string, unknown>
           : undefined;
         if (input.reasonCode && failure?.reasonCode !== input.reasonCode) return false;
+        if (input.entryKind && input.entryKind !== 'all' && String(row.entryKind ?? 'provider_attempt') !== input.entryKind) return false;
+        const workflow = row.workflow && typeof row.workflow === 'object' && !Array.isArray(row.workflow)
+          ? row.workflow as Record<string, unknown>
+          : undefined;
+        const agentWorkflow = workflow?.workflowKind === 'agent' || workflow?.workflowKind === 'agent_shadow';
+        if (input.callScope === 'agent_workflow' && !agentWorkflow) return false;
+        if (input.callScope === 'ordinary' && agentWorkflow) return false;
+        if (input.workflowId && workflow?.workflowId !== input.workflowId) return false;
         return !search || JSON.stringify(value).toLowerCase().includes(search);
       })
       .slice(offset, offset + limit);

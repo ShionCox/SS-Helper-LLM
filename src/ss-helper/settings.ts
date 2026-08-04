@@ -32,6 +32,8 @@ export const LLM_SETTINGS_SCHEMA = {
                 { kind: 'number', id: 'maxTokens', label: '手动最大长度', description: '仅在选择手动上限时使用。', defaultValue: DEFAULT_LLM_SETTINGS.maxTokens, validation: { min: 1, max: 32768 }, step: 128, unit: 'tokens', showStepper: true },
             ] },
             { kind: 'section', id: 'requestDisplay', label: '请求与展示', children: [
+                { kind: 'toggle', id: 'streamingEnabled', label: '流式响应', description: '控制自定义 API 的普通生成、结构化请求和 Agent 工具调用；酒馆当前模型沿用酒馆设置。', defaultValue: DEFAULT_LLM_SETTINGS.streamingEnabled },
+                { kind: 'number', id: 'maxRequestsPerMinute', label: '请求速率上限', description: '限制普通请求、自动重试和 Agent 模型轮次的启动频率；0 表示不限速。', defaultValue: DEFAULT_LLM_SETTINGS.maxRequestsPerMinute, validation: { min: 0, max: 60000 }, step: 1, unit: '次/分钟', showStepper: true },
                 { kind: 'number', id: 'timeoutMs', label: '请求超时', description: '超过这个时间仍未完成时停止请求。', defaultValue: DEFAULT_LLM_SETTINGS.timeoutMs, validation: { min: 1000, max: 300000 }, step: 1000, unit: '毫秒', showStepper: true },
             ] },
         ] },
@@ -45,12 +47,11 @@ export const LLM_SETTINGS_SCHEMA = {
             ] },
         ] },
         { kind: 'section', id: 'routing', label: '路由', children: [
-            { kind: 'section', id: 'routingConfiguration', label: '路由配置', children: [
-                { kind: 'action', id: 'routeManager', label: '默认与插件路由', description: '自定义 API 模式下为生成选择具体资源；向量化和重排序始终按自定义资源路由。', actionId: 'open-route-manager', placement: 'inline', buttonLabel: '配置', popup: popup('route-manager') },
+            { kind: 'section', id: 'routingConfiguration', label: '通用路由', children: [
                 { kind: 'action', id: 'routePreview', label: '路由预览', description: '查看一次请求最终会使用哪个资源和模型。', actionId: 'open-route-preview', placement: 'inline', buttonLabel: '预览', popup: popup('route-preview') },
             ] },
             { kind: 'section', id: 'routingAdvanced', label: '高级配置', children: [
-                { kind: 'action', id: 'advanced', label: '高级规则', description: '直接编辑完整配置，适合熟悉路由的用户。', actionId: 'open-advanced', placement: 'inline', buttonLabel: '编辑', popup: popup('advanced-routing') },
+                { kind: 'action', id: 'advanced', label: '高级规则', description: '编辑全局与插件级通用路由；各插件拥有的任务分配不会在这里展示或修改。', actionId: 'open-advanced', placement: 'inline', buttonLabel: '编辑', popup: popup('advanced-routing') },
             ] },
         ] },
         { kind: 'section', id: 'runtime', label: '运行', children: [
@@ -66,12 +67,12 @@ export const LLM_SETTINGS_SCHEMA = {
             ] },
             { kind: 'section', id: 'requestLogPolicy', label: '日志记录策略', children: [
                 { kind: 'toggle', id: 'requestLogging.enabled', label: '保存请求日志', description: '保存请求诊断链路；关闭后不再写入新的日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.enabled },
-                { kind: 'select', id: 'requestLogging.detailMode', label: '记录范围', description: '完整日志会包含 Prompt 和模型原始返回，请确认本机数据安全。', options: [
-                    { value: 'full', label: '全部完整记录' }, { value: 'failed-full', label: '仅失败完整记录' }, { value: 'summary', label: '仅摘要' }, { value: 'off', label: '不记录' },
+                { kind: 'select', id: 'requestLogging.detailMode', label: '记录范围', description: '完整模式会在本机保存模型返回、解析结果和最终记忆内容；不保存 Prompt、API Key 或认证头。', options: [
+                    { value: 'full', label: '完整返回与诊断' }, { value: 'failed-full', label: '仅失败保存完整返回' }, { value: 'summary', label: '仅诊断摘要' }, { value: 'off', label: '不记录' },
                 ], defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.detailMode },
                 { kind: 'number', id: 'requestLogging.maxEntries', label: '最大条数', description: '达到上限后自动删除最旧日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.maxEntries, validation: { min: 1, max: 5000 }, step: 50, unit: '条', showStepper: true },
                 { kind: 'number', id: 'requestLogging.retentionDays', label: '保留天数', description: '超过天数的日志会自动删除。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.retentionDays, validation: { min: 1, max: 3650 }, step: 1, unit: '天', showStepper: true },
-                { kind: 'number', id: 'requestLogging.maxBytesMb', label: '最大占用', description: '完整日志可能包含聊天正文；达到空间上限后自动删除最旧日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.maxBytes / (1024 * 1024), validation: { min: 1, max: 1024 }, step: 10, unit: 'MB', showStepper: true },
+                { kind: 'number', id: 'requestLogging.maxBytesMb', label: '最大占用', description: '达到空间上限后自动删除最旧诊断记录。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.maxBytes / (1024 * 1024), validation: { min: 1, max: 1024 }, step: 10, unit: 'MB', showStepper: true },
             ] },
             { kind: 'section', id: 'diagnosticsData', label: '数据管理', children: [
                 { kind: 'action', id: 'backup', label: '导入导出', description: '备份或恢复配置。密钥不会包含在备份中。', actionId: 'open-backup', placement: 'inline', buttonLabel: '管理', popup: popup('backup') },
@@ -89,6 +90,8 @@ function toSettingsValues(settings: LLMHubSettings): SettingsValues {
     return {
         enabled: settings.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
         generationSource: settings.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
+        streamingEnabled: settings.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
+        maxRequestsPerMinute: settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: settings.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
         maxTokensMode: settings.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
         maxTokens: settings.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
@@ -104,17 +107,26 @@ function toSettingsValues(settings: LLMHubSettings): SettingsValues {
 function applySettingsValues(current: LLMHubSettings, values: SettingsValues): LLMHubSettings {
     const existingLogging = current.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
     const detailMode = values['requestLogging.detailMode'];
+    const maxTokensMode = values.maxTokensMode === 'inherit' || values.maxTokensMode === 'manual' || values.maxTokensMode === 'adaptive'
+        ? values.maxTokensMode
+        : current.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode;
+    const maxTokens = typeof values.maxTokens === 'number' ? values.maxTokens : current.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens;
     return {
         ...current,
         enabled: typeof values.enabled === 'boolean' ? values.enabled : current.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
         generationSource: values.generationSource === 'custom' || values.generationSource === 'tavern'
             ? values.generationSource
             : current.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
+        streamingEnabled: typeof values.streamingEnabled === 'boolean' ? values.streamingEnabled : current.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
+        maxRequestsPerMinute: typeof values.maxRequestsPerMinute === 'number' ? values.maxRequestsPerMinute : current.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: typeof values.globalProfile === 'string' ? values.globalProfile : current.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
-        maxTokensMode: values.maxTokensMode === 'inherit' || values.maxTokensMode === 'manual' || values.maxTokensMode === 'adaptive'
-            ? values.maxTokensMode
-            : current.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
-        maxTokens: typeof values.maxTokens === 'number' ? values.maxTokens : current.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        maxTokensMode,
+        maxTokens,
+        maxTokensControl: {
+            ...(current.maxTokensControl ?? {}),
+            mode: maxTokensMode,
+            ...(maxTokensMode === 'manual' ? { manualValue: maxTokens } : {}),
+        },
         timeoutMs: typeof values.timeoutMs === 'number' ? values.timeoutMs : current.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
         requestLogging: {
             ...existingLogging,

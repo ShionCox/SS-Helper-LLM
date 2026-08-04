@@ -8,6 +8,7 @@ import type {
     ProviderModelListResult,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure, providerProtocolError } from './provider-errors';
+import { responseDiagnostics } from './provider-response-diagnostics';
 
 /**
  * 独立自定义重排 Provider
@@ -220,7 +221,7 @@ export class CustomRerankProvider implements LLMProvider {
                 const data = await response.json().catch(() => ({}));
                 const normalized = this.normalizeResponseResults(data, req);
                 if (Array.isArray(normalized.results) && normalized.results.length > 0) {
-                    return normalized;
+                    return { ...normalized, diagnostics: responseDiagnostics(response, data, { streamed: false }) };
                 }
             }
         }

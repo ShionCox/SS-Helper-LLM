@@ -1,13 +1,19 @@
-import { createSSHelperError } from '@ss-helper/sdk';
+import { createSSHelperError, type ProviderToolDialect } from '@ss-helper/sdk';
 import type {
     LLMProvider, LLMProviderCapabilities, LLMRequest, LLMResponse, EmbedRequest, EmbedResponse,
     RerankRequest, RerankResponse,
-    ProviderConnectionResult, ProviderModelListResult,
+    ProviderConnectionResult, ProviderModelListResult, ProviderFetch, ProviderResponseDiagnostics,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import type { ApiType } from '../schema/types';
 import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { validateJsonSchema, type JsonSchemaIssue } from '../schema/json-schema-validator';
+import { OpenAiChatToolAdapter, OPENAI_CHAT_DIALECT_POLICIES } from '../tools/openai-chat-tool-adapter';
+import { OpenAiResponsesToolAdapter } from '../tools/openai-responses-tool-adapter';
+import type { ProviderToolAdapter } from '../tools/tool-adapter';
+import { OpenAiToolStreamAssembler } from '../tools/tool-stream-assembler';
+import { parseSseJson } from './sse';
+import { responseDiagnostics } from './provider-response-diagnostics';
 
 const RERANK_RESPONSE_SCHEMA = {
     type: 'object',
@@ -44,8 +50,14 @@ export class OpenAIProvider implements LLMProvider {
     private model: string;
     public readonly apiType: ApiType;
     private customParams: Record<string, unknown>;
-    private fetchImpl: typeof fetch;
+    private fetchImpl: ProviderFetch;
     private structuredOutputIdentity: StructuredOutputIdentity;
+    private readonly toolDialect?: ProviderToolDialect;
+    private readonly requireReasoningContent: boolean;
+    private readonly enableToolStream: boolean;
+    private readonly streamingEnabled: boolean;
+    private readonly embeddingPath: string;
+    private readonly embeddingDimensions?: number;
 
     constructor(config: {
         id: string;
@@ -55,15 +67,21 @@ export class OpenAIProvider implements LLMProvider {
         apiType?: ApiType;
         enableRerank?: boolean;
         customParams?: Record<string, unknown>;
-        fetchImpl?: typeof fetch;
+        fetchImpl?: ProviderFetch;
         structuredOutputIdentity?: StructuredOutputIdentity;
+        toolDialect?: ProviderToolDialect;
+        requireReasoningContent?: boolean;
+        enableToolStream?: boolean;
+        streamingEnabled?: boolean;
+        embeddingPath?: string;
+        embeddingDimensions?: number;
     }) {
         this.id = config.id;
         this.apiKey = config.apiKey;
-        this.baseUrl = (config.baseUrl || 'https://api.openai.com/v1').replace(/\/+$/, '');
+        this.baseUrl = (config.baseUrl || (config.apiType === 'xai' ? 'https://api.x.ai/v1' : 'https://api.openai.com/v1')).replace(/\/+$/, '');
         this.model = config.model || 'gpt-4o-mini';
-        this.apiType = config.apiType === 'deepseek'
-            ? 'deepseek'
+        this.apiType = config.apiType === 'xai' || config.apiType === 'deepseek' || config.apiType === 'kimi' || config.apiType === 'glm'
+            ? config.apiType
             : config.apiType === 'gemini'
                 ? 'gemini'
                 : config.apiType === 'claude'
@@ -79,7 +97,7 @@ export class OpenAIProvider implements LLMProvider {
             rerank: config.enableRerank === true,
             structuredOutput: this.apiType === 'deepseek'
                 ? { transports: ['json_object', 'prompt_only'], preferred: 'json_object' }
-                : this.apiType === 'generic'
+                : this.apiType === 'generic' || this.apiType === 'xai'
                     ? { transports: ['prompt_only'], preferred: 'prompt_only' }
                     : { transports: ['json_schema', 'json_object', 'prompt_only'], preferred: 'json_schema' },
         };
@@ -93,6 +111,27 @@ export class OpenAIProvider implements LLMProvider {
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
+        this.toolDialect = config.toolDialect;
+        this.requireReasoningContent = config.requireReasoningContent === true;
+        this.enableToolStream = config.enableToolStream === true;
+        this.streamingEnabled = config.streamingEnabled !== false;
+        this.embeddingPath = this.normalizeOperationPath(config.embeddingPath ?? '/embeddings');
+        this.embeddingDimensions = config.embeddingDimensions;
+    }
+
+    private normalizeOperationPath(path: string): string {
+        const value = String(path || '').trim() || '/embeddings';
+        return value.startsWith('/') ? value : `/${value}`;
+    }
+
+    private operationUrl(path: string): string {
+        try {
+            const base = new URL(this.baseUrl);
+            const basePath = base.pathname.replace(/\/+$/u, '');
+            if (basePath.toLocaleLowerCase() === path.toLocaleLowerCase()) return base.toString().replace(/\/+$/u, '');
+            if (basePath && path.toLocaleLowerCase().startsWith(`${basePath.toLocaleLowerCase()}/`)) return `${base.origin}${path}`;
+        } catch { /* validated resource URLs use the normal branch */ }
+        return this.baseUrl.toLocaleLowerCase().endsWith(path.toLocaleLowerCase()) ? this.baseUrl : `${this.baseUrl}${path}`;
     }
 
     private buildHeaders(): Record<string, string> {
@@ -194,20 +233,121 @@ export class OpenAIProvider implements LLMProvider {
             : this.structuredOutputIdentity;
     }
 
-    private async sendChatCompletion(body: Record<string, any>, signal?: AbortSignal): Promise<any> {
+    private async sendChatCompletion(body: Record<string, any>, signal?: AbortSignal, timeoutMs = 600_000): Promise<{ data: any; diagnostics: ProviderResponseDiagnostics }> {
         const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(body),
             signal,
+            timeoutMs,
+            idleTimeoutMs: 120_000,
         });
 
         if (!response.ok) throw await providerHttpErrorFromResponse('OpenAI', response);
 
-        return response.json();
+        const data = await response.json();
+        return { data, diagnostics: responseDiagnostics(response, data, { streamed: false }) };
+    }
+
+    private async sendChatCompletionStream(body: Record<string, any>, signal?: AbortSignal, timeoutMs = 180_000): Promise<{ chunks: readonly Record<string, unknown>[]; diagnostics: ProviderResponseDiagnostics }> {
+        const response = await this.fetchImpl(`${this.baseUrl}/chat/completions`, {
+            method: 'POST', headers: this.buildHeaders(), body: JSON.stringify({ ...body, stream: true }), signal,
+            timeoutMs, idleTimeoutMs: 30_000,
+        });
+        if (!response.ok) throw await providerHttpErrorFromResponse('OpenAI-compatible stream', response);
+        const text = await response.text();
+        if (text.length > 8 * 1024 * 1024) throw createSSHelperError('HTTP_RESPONSE_TOO_LARGE', { stage: 'llm.provider.tool_stream', resourceId: this.id });
+        const chunks = parseSseJson(text, 'llm.provider.openai_stream.parse', this.id);
+        return { chunks, diagnostics: responseDiagnostics(response, text, { streamed: true, streamEventCount: chunks.length }) };
+    }
+
+    private assembleChatCompletionStream(chunks: readonly Record<string, unknown>[]): Record<string, unknown> {
+        const complete = chunks.find((chunk) => Array.isArray(chunk.choices)
+            && (chunk.choices as Array<Record<string, unknown>>).some((choice) => choice.message !== undefined));
+        if (complete) return complete;
+        const assembler = new OpenAiToolStreamAssembler();
+        let content = '';
+        let reasoningContent = '';
+        let usage: unknown;
+        let finishReason: unknown;
+        for (const chunk of chunks) {
+            if (chunk.usage !== undefined) usage = chunk.usage;
+            const choices = Array.isArray(chunk.choices) ? chunk.choices as Array<Record<string, unknown>> : [];
+            const choice = choices[0];
+            if (choice?.finish_reason !== undefined) finishReason = choice.finish_reason;
+            const delta = choice?.delta;
+            if (!delta || typeof delta !== 'object' || Array.isArray(delta)) continue;
+            const record = delta as Record<string, unknown>;
+            if (typeof record.content === 'string') content += record.content;
+            if (typeof record.reasoning_content === 'string') reasoningContent += record.reasoning_content;
+            if (!Array.isArray(record.tool_calls)) continue;
+            for (const raw of record.tool_calls as Array<Record<string, unknown>>) {
+                const fn = raw.function && typeof raw.function === 'object' && !Array.isArray(raw.function) ? raw.function as Record<string, unknown> : {};
+                assembler.push({ index: Number(raw.index), ...(typeof raw.id === 'string' ? { id: raw.id } : {}), ...(typeof fn.name === 'string' ? { name: fn.name } : {}), ...(typeof fn.arguments === 'string' ? { arguments: fn.arguments } : {}) });
+            }
+        }
+        const calls = assembler.finishRaw();
+        return {
+            choices: [{ finish_reason: finishReason, message: { role: 'assistant', content, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}), ...(calls.length ? { tool_calls: calls.map(call => ({ id: call.callId, type: 'function', function: { name: call.name, arguments: call.argumentsText } })) } : {}) } }],
+            ...(usage === undefined ? {} : { usage }),
+        };
+    }
+
+    createToolAdapter(): ProviderToolAdapter {
+        const configuredDialect = this.toolDialect ?? (this.apiType === 'openai'
+            ? 'openai_responses'
+            : this.apiType === 'deepseek'
+                ? 'deepseek_chat'
+                : this.apiType === 'kimi'
+                    ? 'kimi_chat'
+                    : this.apiType === 'glm'
+                        ? 'glm_chat'
+                        : 'openai_chat_compatible');
+        if (configuredDialect === 'openai_responses') {
+            return new OpenAiResponsesToolAdapter({
+                resourceId: this.id,
+                defaultModel: this.model,
+                send: async (body, signal) => {
+                    const response = await this.fetchImpl(`${this.baseUrl}/responses`, {
+                        method: 'POST',
+                        headers: this.buildHeaders(),
+                        body: JSON.stringify(this.withCustomParams(body)),
+                        signal,
+                    });
+                    if (!response.ok) throw await providerHttpErrorFromResponse('OpenAI Responses', response);
+                    return await response.json() as Record<string, unknown>;
+                },
+                ...(this.streamingEnabled ? { sendStream: async (body: Record<string, unknown>, signal?: AbortSignal) => {
+                    const response = await this.fetchImpl(`${this.baseUrl}/responses`, {
+                        method: 'POST', headers: this.buildHeaders(),
+                        body: JSON.stringify(this.withCustomParams({ ...body, stream: true })),
+                        signal, timeoutMs: 180_000, idleTimeoutMs: 30_000,
+                    });
+                    if (!response.ok) throw await providerHttpErrorFromResponse('OpenAI Responses stream', response);
+                    return parseSseJson(await response.text(), 'llm.provider.responses_stream.parse', this.id);
+                } } : {}),
+            });
+        }
+        const dialect = configuredDialect === 'deepseek_chat' ? 'deepseek'
+            : configuredDialect === 'kimi_chat' ? 'kimi'
+                : configuredDialect === 'glm_chat' ? 'glm'
+                    : configuredDialect === 'openai_chat_compatible' ? 'standard' : undefined;
+        if (!dialect) throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
+            stage: 'llm.tools.adapter.resolve', resourceId: this.id,
+        });
+        return new OpenAiChatToolAdapter({
+            resourceId: this.id,
+            defaultModel: this.model,
+            send: async (body, signal) => (await this.sendChatCompletion(this.withCustomParams(body), signal)).data as Record<string, unknown>,
+            ...(this.streamingEnabled ? { sendStream: async (body: Record<string, unknown>, signal?: AbortSignal) => (await this.sendChatCompletionStream(this.withCustomParams(body), signal)).chunks } : {}),
+        }, OPENAI_CHAT_DIALECT_POLICIES[dialect], { requireReasoningContent: this.requireReasoningContent, enableToolStream: this.enableToolStream });
     }
 
     async request(req: LLMRequest): Promise<LLMResponse> {
+        // Structured responses can be large enough that token-by-token SSE
+        // framing exceeds the Bridge response limit even though the final JSON
+        // body is small. Request one complete JSON response for these calls.
+        const useStreaming = this.streamingEnabled && req.structuredOutput === undefined;
         const baseBody: Record<string, any> = {
             model: req.model || this.model,
             messages: req.messages,
@@ -216,7 +356,7 @@ export class OpenAIProvider implements LLMProvider {
             // Some OpenAI-compatible gateways default to SSE unless callers
             // explicitly opt out. The provider consumes one complete JSON
             // response, so make that wire contract deterministic.
-            stream: false,
+            stream: useStreaming,
         };
         const responseFormat = this.buildResponseFormat(req);
         const body: Record<string, any> = this.withCustomParams({
@@ -224,7 +364,10 @@ export class OpenAIProvider implements LLMProvider {
             ...(responseFormat ? { response_format: responseFormat } : {}),
         });
 
-        const data: any = await this.sendChatCompletion(body, req.signal);
+        const transport = useStreaming
+            ? await this.sendChatCompletionStream(body, req.signal, req.timeoutMs)
+            : await this.sendChatCompletion(body, req.signal, req.timeoutMs);
+        const data: any = 'chunks' in transport ? this.assembleChatCompletionStream(transport.chunks) : transport.data;
         const choice = data.choices?.[0];
 
         return {
@@ -235,6 +378,7 @@ export class OpenAIProvider implements LLMProvider {
                 totalTokens: data.usage.total_tokens,
             } : undefined,
             finishReason: choice?.finish_reason,
+            diagnostics: transport.diagnostics,
             ...(req.structuredOutput === undefined ? {} : {
                 structuredOutput: {
                     plannedTransport: req.structuredOutput.transport,
@@ -252,12 +396,14 @@ export class OpenAIProvider implements LLMProvider {
     }
 
     async embed(req: EmbedRequest): Promise<EmbedResponse> {
-        const response = await this.fetchImpl(`${this.baseUrl}/embeddings`, {
+        const dimensions = req.dimensions ?? this.embeddingDimensions;
+        const response = await this.fetchImpl(this.operationUrl(this.embeddingPath), {
             method: 'POST',
             headers: this.buildHeaders(),
             body: JSON.stringify(this.withCustomParams({
-                model: req.model || 'text-embedding-ada-002',
+                model: req.model || this.model,
                 input: req.texts,
+                ...(dimensions === undefined ? {} : { dimensions }),
             })),
             signal: req.signal,
         });
@@ -265,11 +411,26 @@ export class OpenAIProvider implements LLMProvider {
         if (!response.ok) {
             throw await providerHttpErrorFromResponse('Embedding', response);
         }
-
         const data = await response.json();
-        return {
-            embeddings: data.data.map((d: any) => d.embedding),
-        };
+        const rows = Array.isArray(data?.data) ? [...data.data] : [];
+        rows.sort((left: any, right: any) => Number(left?.index ?? 0) - Number(right?.index ?? 0));
+        const embeddings = rows.map((row: any) => row?.embedding);
+        const invalidIndex = embeddings.findIndex((vector: unknown) => !Array.isArray(vector)
+            || vector.length === 0
+            || vector.some((item) => typeof item !== 'number' || !Number.isFinite(item))
+            || (dimensions !== undefined && vector.length !== dimensions));
+        if (embeddings.length !== req.texts.length || invalidIndex >= 0) {
+            throw createSSHelperError('PROVIDER_RESPONSE_INVALID', {
+                stage: 'llm.provider.embedding.validate',
+                providerKind: this.kind,
+                resourceId: this.id,
+                path: invalidIndex >= 0 ? `$.data[${invalidIndex}].embedding` : '$.data',
+                expected: dimensions === undefined
+                    ? `${req.texts.length} finite non-empty embedding vectors`
+                    : `${req.texts.length} finite embedding vectors with ${dimensions} dimensions`,
+            });
+        }
+        return { embeddings: embeddings as number[][], diagnostics: responseDiagnostics(response, data, { streamed: false }) };
     }
 
     async rerank(req: RerankRequest): Promise<RerankResponse> {
@@ -316,7 +477,7 @@ export class OpenAIProvider implements LLMProvider {
         const data = await response.json();
         const choice = data.choices?.[0];
         const content = this.extractMessageContent(choice);
-        return this.parseRerankResponse(content, req);
+        return { ...this.parseRerankResponse(content, req), diagnostics: responseDiagnostics(response, data, { streamed: false }) };
     }
 
     async testConnection(signal?: AbortSignal): Promise<ProviderConnectionResult> {

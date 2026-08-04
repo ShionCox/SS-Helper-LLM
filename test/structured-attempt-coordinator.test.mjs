@@ -46,6 +46,7 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
     registrationVersion: 1,
     tasks: [{
       taskKey: 'memory_capture',
+      description: '提取单阶段结构化记忆',
       taskKind: 'generation',
       requiredCapabilities: ['chat', 'json'],
       structuredPolicy,
@@ -53,12 +54,15 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
     }],
   });
   const logs = new RequestLogService();
-  const sdk = new LLMSDKImpl(router, new BudgetManager(), new RequestOrchestrator(), registry, logs);
-  return { sdk, calls, logs, provider };
+  const rateSlots = [];
+  const sdk = new LLMSDKImpl(router, new BudgetManager(), new RequestOrchestrator(), registry, logs, {
+    async acquire(_signal, requestId) { rateSlots.push(requestId); },
+  });
+  return { sdk, calls, logs, provider, rateSlots };
 }
 
 test('Schema failure performs one same-provider repair and logs both attempts under one root request', async () => {
-  const { sdk, calls, logs } = fixture();
+  const { sdk, calls, logs, rateSlots } = fixture();
   const result = await sdk.runTask({
     consumer: 'ss-helper.memory',
     taskKey: 'memory_capture',
@@ -78,6 +82,7 @@ test('Schema failure performs one same-provider repair and logs both attempts un
   assert.equal(result.meta.attemptCount, 2);
   assert.equal(result.meta.repairCount, 1);
   assert.equal(calls.length, 2);
+  assert.deepEqual(rateSlots, ['root-capture-1', 'root-capture-1']);
   assert.match(calls[1].messages.at(-1).content, /安全校验问题/u);
   assert.doesNotMatch(calls[1].messages.at(-1).content, /\{"value":1\}/u);
 
@@ -87,6 +92,9 @@ test('Schema failure performs one same-provider repair and logs both attempts un
     ['root-capture-1', 'initial', 'failed'],
     ['root-capture-1', 'schema_repair', 'completed'],
   ]);
+  assert.equal(rows[0].taskDescription, '提取单阶段结构化记忆');
+  assert.equal(rows[0].consumerDisplayName, 'Memory');
+  assert.deepEqual([rows[0].resourceId, rows[0].model, rows[0].providerKind], ['fixture-provider', 'fixture-model', 'custom']);
 });
 
 test('empty and truncated structured results do not consume the repair attempt', async () => {
