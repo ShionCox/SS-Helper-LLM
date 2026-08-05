@@ -1,7 +1,8 @@
-import { createSSHelperError, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
+import { createSSHelperError, type LlmReasoningPolicy, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
 import type { JsonHttpTransport, ProviderToolAdapter, ProviderToolStartInput, ProviderToolStep } from './tool-adapter';
 import { providerStoresState } from './provider-privacy-policy';
 import { canonicalToolName, createProviderToolNameAliases, estimateJsonBytes, parseArguments, parseFinalOutput, providerToolName, usageFromOpenAi, validateCalls, type ProviderToolNameAliases } from './tool-adapter-utils';
+import { compileReasoningFields } from '../providers/reasoning-policy';
 
 interface OpenAiResponsesState {
     readonly model: string;
@@ -14,6 +15,7 @@ interface OpenAiResponsesState {
     readonly providerManaged: boolean;
     readonly previousResponseId?: string;
     readonly pendingCalls: readonly { readonly callId: string; readonly name: string }[];
+    readonly reasoning?: LlmReasoningPolicy;
 }
 
 export class OpenAiResponsesToolAdapter implements ProviderToolAdapter<OpenAiResponsesState> {
@@ -46,6 +48,7 @@ export class OpenAiResponsesToolAdapter implements ProviderToolAdapter<OpenAiRes
             maxTokens: input.maxTokens,
             providerManaged,
             pendingCalls: [],
+            ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
         };
         return this.send(state, [], true, input.outputSchema, input.signal, input.toolChoice ?? 'auto');
     }
@@ -82,6 +85,7 @@ export class OpenAiResponsesToolAdapter implements ProviderToolAdapter<OpenAiRes
             input: state.providerManaged ? appended.length > 0 ? appended : state.initialInput : localInput,
             store: state.providerManaged,
             max_output_tokens: state.maxTokens,
+            ...compileReasoningFields({ provider: 'openai', dialect: this.dialect, policy: state.reasoning, execution: 'tool_turn', transport: 'openai_responses' }),
             parallel_tool_calls: true,
             ...(state.providerManaged && state.previousResponseId ? { previous_response_id: state.previousResponseId } : {}),
             ...(allowTools ? { tools: state.tools, tool_choice: toolChoice } : {}),

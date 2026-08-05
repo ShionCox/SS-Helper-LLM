@@ -11,8 +11,9 @@ import type {
     ProviderModelListResult, ProviderFetch, ProviderResponseDiagnostics,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
-import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import type { StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { AnthropicMessagesToolAdapter } from '../tools/anthropic-messages-tool-adapter';
+import { compileReasoningFields } from './reasoning-policy';
 import type { ProviderToolAdapter } from '../tools/tool-adapter';
 import { createSSHelperError } from '@ss-helper/sdk';
 import { parseSseJson } from './sse';
@@ -46,7 +47,8 @@ export class ClaudeProvider implements LLMProvider {
         this.id = config.id;
         this.apiKey = config.apiKey;
         this.baseUrl = (config.baseUrl || 'https://api.anthropic.com/v1').replace(/\/+$/, '');
-        this.model = config.model || 'claude-sonnet-4-5';
+        if (!config.model?.trim()) throw createSSHelperError('MODEL_NOT_FOUND', { stage: 'llm.provider.configure.model', resourceId: config.id });
+        this.model = config.model.trim();
         this.anthropicVersion = config.anthropicVersion || '2023-06-01';
         this.capabilities = {
             chat: true,
@@ -57,7 +59,7 @@ export class ClaudeProvider implements LLMProvider {
             structuredOutput: { transports: ['json_schema', 'prompt_only'], preferred: 'json_schema' },
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
-        this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'claude', baseUrl: this.baseUrl, model: this.model });
+        this.structuredOutputIdentity = { vendor: 'claude', evidence: 'manual', confidence: 'high', model: this.model };
         this.streamingEnabled = config.streamingEnabled !== false;
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
@@ -186,21 +188,25 @@ export class ClaudeProvider implements LLMProvider {
 
     async request(req: LLMRequest): Promise<LLMResponse> {
         const split = this.splitMessages(req.messages);
+        const reasoningFields = compileReasoningFields({ provider: 'claude', dialect: 'anthropic_messages', policy: req.reasoning, execution: req.structuredOutput === undefined ? 'completion' : 'structured' });
+        const reasoningOutputConfig = reasoningFields.output_config && typeof reasoningFields.output_config === 'object' && !Array.isArray(reasoningFields.output_config)
+            ? reasoningFields.output_config as Record<string, unknown> : {};
+        const schemaOutputConfig = req.structuredOutput?.transport === 'json_schema'
+            ? {
+                format: {
+                    type: 'json_schema',
+                    schema: req.structuredOutput.spec.schema,
+                },
+            } : {};
         const body: Record<string, any> = this.withCustomParams({
             model: req.model || this.model,
             max_tokens: req.maxTokens ?? 2048,
             messages: split.messages,
             ...(split.system ? { system: split.system } : {}),
             ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
-            ...(req.structuredOutput?.transport === 'json_schema'
-                ? {
-                    output_config: {
-                        format: {
-                            type: 'json_schema',
-                            schema: req.structuredOutput.spec.schema,
-                        },
-                    },
-                }
+            ...reasoningFields,
+            ...(Object.keys({ ...reasoningOutputConfig, ...schemaOutputConfig }).length > 0
+                ? { output_config: { ...reasoningOutputConfig, ...schemaOutputConfig } }
                 : {}),
             stream: this.streamingEnabled,
         });

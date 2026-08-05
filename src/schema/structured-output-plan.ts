@@ -3,7 +3,7 @@ import { isStrictJsonSchemaCompatible } from './strict-json-schema';
 
 export type StructuredOutputVendor = 'openai' | 'deepseek' | 'gemini' | 'claude' | 'unknown';
 export type StructuredOutputTransport = 'json_schema' | 'json_object' | 'tavern_json_schema' | 'prompt_only';
-export type StructuredOutputDetectionEvidence = 'manual' | 'tavern_source' | 'api_url' | 'model_name' | 'unknown';
+export type StructuredOutputDetectionEvidence = 'manual' | 'tavern_source' | 'unknown';
 
 export interface StructuredOutputIdentity {
     readonly vendor: StructuredOutputVendor;
@@ -26,30 +26,18 @@ export interface StructuredOutputPlan {
     readonly strictSchemaCompatible: boolean;
 }
 
-const modelVendor = (value?: string): StructuredOutputVendor | undefined => {
-    const normalized = String(value || '').trim().toLowerCase();
-    if (!normalized) return undefined;
-    if (/(?:^|[/:_-])deepseek(?:[/:_-]|$)/u.test(normalized) || normalized.startsWith('deepseek')) return 'deepseek';
-    if (/(?:^|[/:_-])(?:gpt|o[1-9]|chatgpt)(?:[/:_-]|$)/u.test(normalized) || normalized.startsWith('gpt-')) return 'openai';
-    if (/(?:^|[/:_-])gemini(?:[/:_-]|$)/u.test(normalized) || normalized.startsWith('gemini')) return 'gemini';
-    if (/(?:^|[/:_-])claude(?:[/:_-]|$)/u.test(normalized) || normalized.startsWith('claude')) return 'claude';
-    return undefined;
-};
-
 const sourceVendor = (value?: string): StructuredOutputVendor | undefined => {
     const normalized = String(value || '').trim().toLowerCase();
-    if (!normalized) return undefined;
-    if (normalized.includes('deepseek')) return 'deepseek';
-    if (normalized === 'openai' || normalized.includes('openrouter') || normalized.includes('openai')) return 'openai';
-    if (normalized.includes('gemini') || normalized.includes('makersuite') || normalized.includes('google')) return 'gemini';
-    if (normalized.includes('claude') || normalized.includes('anthropic')) return 'claude';
-    return undefined;
+    const sourceMap: Readonly<Record<string, StructuredOutputVendor>> = {
+        openai: 'openai', deepseek: 'deepseek', gemini: 'gemini', google: 'gemini',
+        claude: 'claude', anthropic: 'claude',
+    };
+    return sourceMap[normalized];
 };
 
-export function detectStructuredOutputIdentity(input: {
+export function structuredOutputIdentityFromSource(input: {
     readonly manualVendor?: Exclude<StructuredOutputVendor, 'unknown'> | 'auto';
     readonly provider?: string;
-    readonly baseUrl?: string;
     readonly model?: string;
 }): StructuredOutputIdentity {
     const manual = input.manualVendor;
@@ -57,15 +45,7 @@ export function detectStructuredOutputIdentity(input: {
         return { vendor: manual, evidence: 'manual', confidence: 'high', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
     }
     const fromSource = sourceVendor(input.provider);
-    const providerIsAggregator = /openrouter|router|proxy|gateway|custom|generic/u.test(String(input.provider || '').toLowerCase());
-    if (fromSource && !providerIsAggregator) return { vendor: fromSource, evidence: 'tavern_source', confidence: 'high', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
-    const fromUrl = sourceVendor(input.baseUrl);
-    const urlIsAggregator = /openrouter|router|proxy|gateway|custom|generic/u.test(String(input.baseUrl || '').toLowerCase());
-    if (fromUrl && !urlIsAggregator) return { vendor: fromUrl, evidence: 'api_url', confidence: 'high', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
-    const fromModel = modelVendor(input.model);
-    if (fromModel) return { vendor: fromModel, evidence: 'model_name', confidence: 'medium', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
-    if (fromSource) return { vendor: fromSource, evidence: 'tavern_source', confidence: 'medium', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
-    if (fromUrl) return { vendor: fromUrl, evidence: 'api_url', confidence: 'medium', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
+    if (fromSource) return { vendor: fromSource, evidence: 'tavern_source', confidence: 'high', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
     return { vendor: 'unknown', evidence: 'unknown', confidence: 'low', ...(input.provider ? { provider: input.provider } : {}), ...(input.model ? { model: input.model } : {}) };
 }
 

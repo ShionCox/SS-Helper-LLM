@@ -111,7 +111,6 @@ test('preserves a provider failure context instead of rebuilding a generic reque
     requestId: 'attempt-context',
     result: {
       ok: false,
-      error: 'provider failed',
       reasonCode: 'PROVIDER_HTTP_ERROR',
       failure: {
         reasonCode: 'PROVIDER_HTTP_ERROR',
@@ -155,7 +154,10 @@ test('failed results without a recognized reason can never produce successful di
   await service.recordAttempt({
     record: record(),
     requestId: 'attempt-unknown-failure',
-    result: { ok: false, error: 'unclassified provider failure', reasonCode: 'NON_STANDARD_FAILURE' },
+    result: {
+      ok: false,
+      reasonCode: 'NON_STANDARD_FAILURE',
+    },
     attemptTag: '初次请求',
     attemptOutcome: '失败',
     attemptPhase: 'initial',
@@ -259,7 +261,6 @@ test('persists failures that happen before any provider attempt with Chinese pur
   request.activeAttemptRequestId = undefined;
   await service.recordUnattemptedRequest(request, {
     ok: false,
-    error: '路由不可用',
     reasonCode: 'LLM_CAPABILITY_UNAVAILABLE',
     failure: { reasonCode: 'LLM_CAPABILITY_UNAVAILABLE', stage: 'llm.route.resolve', requestId: 'root-1' },
   });
@@ -409,17 +410,15 @@ test('Agent protocol failure retains the sanitized incomplete response under the
   assert.equal(row.response.rawResponseText, 'Provider 已返回流式响应，但没有可展示的 assistant content；内部推理与协议字段未记录。');
 });
 
-test('callScope returns complete Agent and Agent Shadow workflows while ordinary excludes them', async () => {
+test('callScope returns Agent workflows while ordinary excludes them', async () => {
   const service = new RequestLogService();
   await service.clearLogs();
   const ordinary = record(); ordinary.workflow = undefined; ordinary.activeAttemptRequestId = 'ordinary-1';
   await service.recordAttempt({ record: ordinary, requestId: 'ordinary-1', result: { ok: true, data: {}, meta: { requestId: 'ordinary-1', resourceId: 'resource-a', capabilityKind: 'generation', queuedAt: 10 } }, attemptTag: '初次请求', attemptOutcome: '成功', isFinalAttempt: true });
-  for (const [workflowId, workflowKind] of [['agent-1', 'agent'], ['shadow-1', 'agent_shadow']]) {
-    const traced = record(); traced.workflow = { workflowId, workflowLabel: workflowKind, workflowKind }; traced.activeAttemptRequestId = `${workflowId}-provider`;
-    await service.recordAttempt({ record: traced, requestId: traced.activeAttemptRequestId, result: { ok: true, data: {}, meta: { requestId: traced.activeAttemptRequestId, resourceId: 'resource-a', capabilityKind: 'generation', queuedAt: 10 } }, attemptTag: '初次请求', attemptOutcome: '成功', isFinalAttempt: true });
-  }
+  const traced = record(); traced.workflow = { workflowId: 'agent-1', workflowLabel: 'agent', workflowKind: 'agent' }; traced.activeAttemptRequestId = 'agent-1-provider';
+  await service.recordAttempt({ record: traced, requestId: traced.activeAttemptRequestId, result: { ok: true, data: {}, meta: { requestId: traced.activeAttemptRequestId, resourceId: 'resource-a', capabilityKind: 'generation', queuedAt: 10 } }, attemptTag: '初次请求', attemptOutcome: '成功', isFinalAttempt: true });
   assert.deepEqual((await service.listLogs({ callScope: 'ordinary' })).map(row => row.logId), ['ordinary-1']);
-  assert.deepEqual(new Set((await service.listLogs({ callScope: 'agent_workflow' })).map(row => row.workflow.workflowKind)), new Set(['agent', 'agent_shadow']));
+  assert.deepEqual(new Set((await service.listLogs({ callScope: 'agent_workflow' })).map(row => row.workflow.workflowKind)), new Set(['agent']));
 });
 
 test('records an aborted third Agent turn with its real round and cancellation state', async () => {
@@ -427,7 +426,7 @@ test('records an aborted third Agent turn with its real round and cancellation s
   await service.clearLogs();
   await service.recordAgentTurn({
     request: {
-      task: 'memory_extract_inventory', pipelineRunId: 'pipeline-abort', chatKey: 'chat-1',
+      task: 'memory_extract_content', pipelineRunId: 'pipeline-abort', chatKey: 'chat-1',
       toolSessionId: 'session-1', toolResults: [{ callId: 'call-2', name: 'inventory.resolve_context', ok: true, content: {} }],
     },
     failure: { reasonCode: 'REQUEST_ABORTED', stage: 'llm.tools.turn', requestId: 'turn-3' },

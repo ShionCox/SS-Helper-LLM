@@ -12,6 +12,8 @@ export type LLMCapability = 'chat' | 'json' | 'tools' | 'embeddings' | 'rerank' 
 
 /** 能力大类 */
 export type CapabilityKind = 'generation' | 'embedding' | 'rerank';
+/** 唯一执行分流契约，禁止根据 URL/model 猜测执行类型。 */
+export type LLMExecution = 'completion' | 'structured' | 'tool_turn' | 'embedding' | 'rerank';
 
 // ═══════════════════════════════════════════
 //  结果返回结构
@@ -27,9 +29,14 @@ export interface LLMRunMeta {
     startedAt?: number;
     finishedAt?: number;
     latencyMs?: number;
-    fallbackUsed?: boolean;
     attemptCount?: number;
     repairCount?: number;
+    execution?: LLMExecution;
+    resolvedBy?: 'task_assignment' | 'execution_default';
+    provider?: string;
+    source?: 'tavern' | 'custom';
+    capabilityDigest?: string;
+    reasoning?: LlmReasoningPolicy;
     transport?: LlmStructuredTransport;
     validationOutcome?: 'complete' | 'partial';
     itemRejections?: LlmStructuredItemRejection[];
@@ -40,16 +47,17 @@ export interface LLMRunMeta {
 /** 统一结果形态 */
 export type LLMRunResult<T> =
     | { ok: true; data: T; meta: LLMRunMeta }
-    | { ok: false; error: string; retryable?: boolean; fallbackUsed?: boolean; reasonCode?: SSHelperReasonCode; meta?: LLMRunMeta; failure?: SSHelperFailureContext };
+    | { ok: false; retryable?: boolean; reasonCode?: SSHelperReasonCode; meta?: LLMRunMeta; failure: SSHelperFailureContext };
 
 export type LLMTaskLifecycleStage =
     | 'queued'
     | 'running'
     | 'route_resolved'
     | 'provider_requesting'
-    | 'fallback_started'
     | 'completed'
-    | 'failed';
+    | 'failed'
+    | 'aborted'
+    | 'cancelled';
 
 export interface LLMTaskLifecycleEvent {
     requestId: string;
@@ -62,10 +70,9 @@ export interface LLMTaskLifecycleEvent {
     message?: string;
     resourceId?: string;
     model?: string;
-    fallbackUsed?: boolean;
     progress?: number;
-    error?: string;
     reasonCode?: SSHelperReasonCode;
+    failure?: SSHelperFailureContext;
 }
 
 export type LLMTaskLifecycleHandler = (event: LLMTaskLifecycleEvent) => void;
@@ -83,9 +90,14 @@ export type LLMTaskLifecycleHandler = (event: LLMTaskLifecycleEvent) => void;
 export interface TaskDescriptor {
     taskKey: string;
     taskKind: CapabilityKind;
+    execution?: LLMExecution;
+    requirements?: {
+        nativeStructured?: 'preferred' | 'required';
+        strictToolSchema?: 'preferred' | 'required';
+        streamingToolCalls?: 'preferred' | 'required';
+    };
     requiredCapabilities: LLMCapability[];
     maxTokens?: number;
-    recommendedRoute?: { resourceId?: string; profileId?: string };
     description?: string;
     backgroundEligible?: boolean;
     structuredPolicy?: LlmStructuredRepairPolicy;
@@ -95,9 +107,6 @@ export interface TaskDescriptor {
 export interface RouteBinding {
     taskKey: string;
     resourceId: string;
-    model?: string;
-    profileId?: string;
-    fallbackResourceId?: string;
 }
 
 /** 消费方注册包 */
@@ -121,21 +130,6 @@ export interface ConsumerPersistentSnapshot {
     tasks: TaskDescriptor[];
     routeBindings: RouteBinding[];
     staleReason?: string;
-    /** 用户覆盖来源快照 */
-    userOverrides?: Record<string, {
-        taskKey: string;
-        resourceId?: string;
-        model?: string;
-        profileId?: string;
-        source: 'user_task_override' | 'user_plugin_default' | 'user_global_default';
-    }>;
-    /** 推荐值快照 */
-    recommendedSnapshots?: Record<string, {
-        taskKey: string;
-        resourceId?: string;
-        model?: string;
-        profileId?: string;
-    }>;
 }
 
 /** 会话字段 —— 不跨重启 */
@@ -243,6 +237,9 @@ export interface LLMProviderRequestMetadata {
     topK?: number;
     payloadBytes?: number;
     customParameterNames?: string[];
+    reasoningMode?: import('@ss-helper/sdk').LlmReasoningMode;
+    reasoningEffort?: import('@ss-helper/sdk').LlmReasoningEffort;
+    reasoningCapabilityDigest?: string;
 }
 
 export interface LLMProviderResponseMetadata {
@@ -275,7 +272,6 @@ export interface LLMParseMetadata {
 export interface LLMRequestLogRequestSnapshot {
     taskKind: CapabilityKind;
     taskDescription?: string;
-    routeHint?: unknown;
     budget?: unknown;
     enqueue?: unknown;
     schemaSummary?: string;
@@ -496,19 +492,17 @@ export interface RequestRecord<T = unknown> {
 export interface RouteResolveArgs {
     consumer: string;
     taskKind: CapabilityKind;
+    execution?: LLMExecution;
     taskKey?: string;
     requiredCapabilities?: LLMCapability[];
-    routeHint?: { resourceId?: string; model?: string; profileId?: string };
 }
 
 /** 路由解析结果 */
 export interface RouteResolveResult {
     resourceId: string;
     model?: string;
-    profileId?: string;
-    fallbackResourceId?: string;
     /** 实际生效来源 */
-    resolvedBy: 'route_hint' | 'user_task_override' | 'plugin_task_recommend' | 'user_plugin_default' | 'user_global_default' | 'builtin_tavern_fallback' | 'fallback';
+    resolvedBy: 'task_assignment' | 'execution_default';
 }
 
 // ═══════════════════════════════════════════
@@ -521,11 +515,8 @@ export type ResourceType = 'generation' | 'embedding' | 'rerank';
 /** 资源来源 */
 export type ResourceSource = 'tavern' | 'custom';
 
-/** 大语言模型生成来源策略 */
-export type GenerationSource = 'tavern' | 'custom';
-
 /** 自定义 API 协议类型 */
-export type ApiType = 'auto' | 'openai' | 'xai' | 'deepseek' | 'kimi' | 'glm' | 'gemini' | 'claude' | 'generic';
+export type ApiType = 'openai' | 'xai' | 'deepseek' | 'kimi' | 'glm' | 'gemini' | 'claude' | 'generic';
 
 /** 资源级自定义请求参数 */
 export type ResourceCustomParams = Record<string, unknown>;
@@ -538,7 +529,7 @@ export interface ResourceConfig {
     apiType: ApiType;
     label: string;
     baseUrl?: string;
-    model?: string;
+    model: string;
     enabled?: boolean;
     /** OpenAI-compatible embedding operation path, such as /embeddings. */
     embeddingPath?: string;
@@ -565,7 +556,6 @@ export interface ResourceConfig {
 /** 单条分配项 —— 只保存 resourceId */
 export interface AssignmentEntry {
     resourceId: string;
-    model?: string;
 }
 
 /** 全局 max_tokens 控制模式 */
@@ -595,20 +585,12 @@ export interface GlobalAssignments {
 }
 
 /** 插件分配 */
-export interface PluginAssignment {
-    pluginId: string;
-    generation?: AssignmentEntry;
-    embedding?: AssignmentEntry;
-    rerank?: AssignmentEntry;
-}
-
 /** 任务分配 */
 export interface TaskAssignment {
     pluginId: string;
     taskKey: string;
     taskKind: CapabilityKind;
     resourceId?: string;
-    model?: string;
     maxTokens?: number;
     isStale: boolean;
     staleReason?: string;
@@ -618,7 +600,6 @@ export interface TaskAssignment {
 export interface LLMHubSettings {
     enabled?: boolean;
     /** 大语言模型生成来源；不影响 embedding 与 rerank */
-    generationSource?: GenerationSource;
     /** 自定义生成资源是否使用流式传输 */
     streamingEnabled?: boolean;
     /** 全局 Provider 请求启动速率；0 表示不限速 */
@@ -632,10 +613,10 @@ export interface LLMHubSettings {
     maxTokensControl?: GlobalMaxTokensControl;
     /** 用户创建的资源列表 */
     resources?: ResourceConfig[];
+    /** 每个生成资源的思考策略；tavern:active 也使用同一张表。 */
+    resourcePolicies?: Record<string, import('@ss-helper/sdk').LlmReasoningPolicy>;
     /** 全局分配 */
     globalAssignments?: GlobalAssignments;
-    /** 插件分配 */
-    pluginAssignments?: PluginAssignment[];
     /** 任务分配 */
     taskAssignments?: TaskAssignment[];
     /** 预算配置 */
@@ -658,6 +639,8 @@ export interface ResourceStatusSnapshot {
     model?: string;
     credentialConfigured: boolean;
     builtin: boolean;
+    reasoningPolicy?: import('@ss-helper/sdk').LlmReasoningPolicy;
+    reasoningCapabilities?: import('@ss-helper/sdk').VerifiedReasoningCapabilities;
 }
 
 /** 路由预览结果 */
@@ -673,7 +656,8 @@ export interface RoutePreviewSnapshot {
     source?: ResourceSource;
     model?: string;
     resolvedBy?: RouteResolveResult['resolvedBy'];
-    blockedReason?: string;
+    failure?: SSHelperFailureContext;
+    reasoningPolicy?: import('@ss-helper/sdk').LlmReasoningPolicy;
 }
 
 /** 当前资源池与分配的只读状态快照 */
@@ -681,7 +665,6 @@ export interface LLMHubStatusSnapshot {
     resources: ResourceStatusSnapshot[];
     globalProfile?: string;
     globalAssignments: GlobalAssignments;
-    pluginAssignments: PluginAssignment[];
     taskAssignments: TaskAssignment[];
     readiness: Record<CapabilityKind, boolean>;
 }
@@ -702,9 +685,10 @@ export interface RunTaskArgs {
     taskDescription?: string;
     trace?: LlmWorkflowTrace;
     taskKind: CapabilityKind;
+    /** 显式执行类型；未提供时由 SDK 根据 schema/taskKind 确定。 */
+    execution?: Extract<LLMExecution, 'completion' | 'structured' | 'tool_turn'>;
     input: any;
     schema?: object;
-    routeHint?: { resource?: string; profile?: string; model?: string };
     budget?: { maxTokens?: number; maxLatencyMs?: number };
     enqueue?: RequestEnqueueOptions;
     onLifecycle?: LLMTaskLifecycleHandler;
@@ -717,8 +701,8 @@ export interface EmbedArgs {
     taskDescription?: string;
     trace?: LlmWorkflowTrace;
     texts: string[];
+    execution?: 'embedding';
     dimensions?: number;
-    routeHint?: { resource?: string; model?: string };
     enqueue?: RequestEnqueueOptions;
     onLifecycle?: LLMTaskLifecycleHandler;
     signal?: AbortSignal;
@@ -730,9 +714,9 @@ export interface RerankArgs {
     taskDescription?: string;
     trace?: LlmWorkflowTrace;
     query: string;
+    execution?: 'rerank';
     docs: string[];
     topK?: number;
-    routeHint?: { resource?: string; model?: string };
     enqueue?: RequestEnqueueOptions;
     onLifecycle?: LLMTaskLifecycleHandler;
     signal?: AbortSignal;
@@ -748,4 +732,6 @@ import type {
     SSHelperReasonCode,
     ProviderPrivacyPolicy,
     ProviderToolDialect,
+    LlmReasoningPolicy,
+    VerifiedReasoningCapabilities,
 } from '@ss-helper/sdk';

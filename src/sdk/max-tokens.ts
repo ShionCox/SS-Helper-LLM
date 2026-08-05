@@ -58,7 +58,14 @@ function collectMessageChars(input: unknown): { messageChars: number; messageCou
 
 function estimateAdaptiveMaxTokens(args: RunTaskArgs, config?: AdaptiveMaxTokensConfig): ResolvedMaxTokensResult {
     const min = toPositiveInt(config?.min) ?? 800;
-    const max = toPositiveInt(config?.max) ?? 4096;
+    // Memory extraction returns a bounded but potentially large JSON envelope. Thinking
+    // tool turns can spend several thousand tokens before the first call; the old 4K/8K
+    // estimates regularly consumed the whole budget and returned an empty body with
+    // finish_reason=length. V4 Flash currently advertises a 384K maximum, so reserve a
+    // deterministic 32K working budget for memory while keeping ordinary tasks at 4K.
+    // An explicit user max still wins.
+    const defaultMax = args.taskKey.startsWith('memory_extract_') ? 32768 : 4096;
+    const max = toPositiveInt(config?.max) ?? defaultMax;
     const charDivisor = toPositiveInt(config?.charDivisor) ?? 6;
     const schemaCharDivisor = toPositiveInt(config?.schemaCharDivisor) ?? 12;
     const messageBonus = toPositiveInt(config?.messageBonus) ?? 48;
@@ -80,7 +87,16 @@ function estimateAdaptiveMaxTokens(args: RunTaskArgs, config?: AdaptiveMaxTokens
         + (messageCount * messageBonus)
         + Math.ceil(messageChars / Math.max(4, charDivisor * 2));
 
-    const value = Math.min(max, Math.max(min, estimate));
+    // Memory extraction has two independent output consumers: thinking/tool
+    // turns and the final schema envelope.  Letting the adaptive estimate
+    // choose a value below the provider's supported working ceiling leaves too
+    // little room for a thinking model to emit its first tool call (or the
+    // baseline JSON), which surfaces as STRUCTURED_OUTPUT_TRUNCATED with an
+    // empty body.  Keep the estimate for ordinary tasks, but reserve the full
+    // verified memory working budget unless the user explicitly configured a lower
+    // adaptive max.
+    const memoryFloor = args.taskKey.startsWith('memory_extract_') ? Math.min(max, 32768) : min;
+    const value = Math.min(max, Math.max(min, memoryFloor, estimate));
     return {
         value,
         source: 'adaptive',
@@ -88,6 +104,7 @@ function estimateAdaptiveMaxTokens(args: RunTaskArgs, config?: AdaptiveMaxTokens
             mode: 'adaptive',
             min,
             max,
+            defaultMax,
             base,
             inputChars,
             schemaChars,

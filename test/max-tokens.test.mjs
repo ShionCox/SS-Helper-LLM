@@ -35,3 +35,41 @@ test('inherit mode keeps an explicit consumer request budget without a stage con
     source: 'request_budget',
   });
 });
+
+test('adaptive memory extraction reserves a 32K thinking/tool budget by default', () => {
+  const result = resolveMaxTokens({
+    ...args,
+    budget: {},
+    input: { messages: [{ role: 'user', content: 'x'.repeat(100000) }] },
+  }, {
+    globalControl: { mode: 'adaptive' },
+  });
+  assert.equal(result.value, 32768);
+  assert.equal(result.source, 'adaptive');
+  assert.equal(result.detail.defaultMax, 32768);
+});
+
+test('adaptive memory extraction does not lower the output budget for shorter tool or baseline batches', () => {
+  const result = resolveMaxTokens({
+    ...args,
+    budget: {},
+    input: { messages: [{ role: 'user', content: 'short batch' }] },
+  }, {
+    globalControl: { mode: 'adaptive' },
+  });
+  assert.equal(result.value, 32768);
+  assert.equal(result.source, 'adaptive');
+});
+
+test('adaptive ordinary tasks keep the conservative 4K output ceiling', () => {
+  const result = resolveMaxTokens({
+    ...args,
+    taskKey: 'memory_cast_plan',
+    budget: {},
+    input: { messages: [{ role: 'user', content: 'x'.repeat(100000) }] },
+  }, {
+    globalControl: { mode: 'adaptive' },
+  });
+  assert.equal(result.value, 4096);
+  assert.equal(result.detail.defaultMax, 4096);
+});

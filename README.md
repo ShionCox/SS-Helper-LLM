@@ -26,7 +26,8 @@ pnpm build
 - `LLM_EMBEDDING_V0`
 - `LLM_RERANK_V0`
 - `LLM_ROUTE_DIAGNOSTICS_V0`
-- `LLM_ROUTE_CHANGED_V0`
+- `LLM_TASK_STATUS_V0` / `LLM_TASK_STATUS_CHANGED_V0`
+- `LLM_TASK_ROUTE_SET_V0`
 
 普通设置由 `LLM_SETTINGS_SCHEMA` 经 Core Settings Host 注册，设置中心包含“开始、资源、路由、运行、诊断”五页；资源向导、日志、备份和高级路由编辑器通过 Core popup 打开。完整消费者示例见 [docs/integration-manual.md](docs/integration-manual.md)。
 

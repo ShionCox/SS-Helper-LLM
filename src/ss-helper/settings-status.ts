@@ -1,13 +1,15 @@
 import {
   CORE_DISCOVERY_SYMBOL,
-  LLM_CAPABILITY_STATUS_CHANGED_V0,
+  LLM_TASK_STATUS_CHANGED_V0,
   type CoreDiscoverySnapshot,
-  type LlmCapabilityStatusResponse,
+  type LlmTaskStatusSnapshot,
   type PluginSession,
   type SettingsStatusSnapshot,
 } from '@ss-helper/sdk';
 import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type { LlmServiceHandlers } from './services';
+import type { LLMHubSettings } from '../schema/types';
+import { BUILTIN_TAVERN_RESOURCE_ID } from '../router/router';
 
 export type LlmSettingsStatusMap = Readonly<Record<string, SettingsStatusSnapshot>>;
 
@@ -37,41 +39,59 @@ function releaseVersion(version: string | undefined): string {
   return /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/u.test(normalized) ? `v${normalized}` : '未知';
 }
 
-function generationSnapshot(response: LlmCapabilityStatusResponse | undefined): SettingsStatusSnapshot {
+function generationSnapshot(response: LlmTaskStatusSnapshot | undefined): SettingsStatusSnapshot {
   if (!response) return warning('状态不可用', 'LLM 实时状态暂不可用，请稍后重试。');
-  const entries = new Map(response.checks.map((entry) => [entry.id, entry]));
-  const generation = entries.get('generation');
-  if (generation?.reason === 'llm_disabled') return neutral('已停用', 'LLM 已停用；其他插件不会发起 AI 请求。');
-  if (!generation?.available) {
-    const descriptions = {
-      no_resource: '自定义 API 模式尚未配置可用的生成资源。',
-      resource_disabled: '自定义生成资源已停用。',
-      credential_missing: '自定义生成资源缺少密钥。',
-      route_unavailable: '当前来源内没有满足请求能力的生成路由。',
-      tavern_unavailable: '酒馆当前没有可用的来源和模型。',
-      status_unavailable: '暂时无法读取所选生成来源的状态。',
-    } as const;
-    const source = generation?.source === 'tavern' ? '酒馆' : generation?.source === 'custom' ? '自定义 API' : undefined;
-    return error(['生成不可用', source].filter(Boolean).join(' · '), descriptions[generation?.reason as keyof typeof descriptions] ?? '当前来源内没有可用的生成模型。');
+  const generationId = response.defaults.tool_turn ?? response.defaults.structured ?? response.defaults.completion;
+  const resource = generationId === undefined ? undefined : response.resources.find((item) => item.resourceId === generationId);
+  const task = response.tasks.find((entry) => entry.execution === 'completion' || entry.execution === 'structured' || entry.execution === 'tool_turn');
+  if (resource !== undefined) {
+    if (!resource.available) return error('生成不可用', `默认生成资源当前不可用；不会自动切换来源。`);
+    return success('可用', `${resource.apiType} · ${resource.defaultModel ?? '默认模型'} 当前可用。`);
   }
-  return success('可用', '当前生成路由可用。');
+  if (!task?.available) {
+    return error('生成不可用', task?.failure?.reasonCode ? `当前生成任务不可用（${task.failure.reasonCode}）。` : '当前没有可用的生成任务。');
+  }
+  return success('可用', `${task.route?.provider ?? '生成资源'} 当前可用。`);
+}
+
+function generationSourceSnapshot(
+  settings: LLMHubSettings | undefined,
+  tavernStatus: SettingsStatusSnapshot,
+  capabilities: LlmTaskStatusSnapshot | undefined,
+): SettingsStatusSnapshot {
+  const resourceId = settings?.globalAssignments?.generation?.resourceId ?? BUILTIN_TAVERN_RESOURCE_ID;
+  if (resourceId === BUILTIN_TAVERN_RESOURCE_ID) {
+    return Object.freeze({ ...tavernStatus, description: '默认生成来源是酒馆当前连接。' });
+  }
+  const resource = settings?.resources?.find((item) => item.id === resourceId && item.type === 'generation');
+  if (!resource) return error('自定义资源缺失', '默认生成来源指向的自定义生成资源已删除；不会自动切换到其他来源。');
+  if (resource.enabled === false) return error('自定义资源已停用', `默认生成来源“${resource.label}”已停用；不会自动切换到其他来源。`);
+  const safeResource = capabilities?.resources.find((candidate) => candidate.resourceId === resourceId);
+  const details = `Provider ${safeResource?.apiType ?? resource.apiType} · 模型 ${safeResource?.defaultModel ?? resource.model ?? '未指定'}。`;
+  if (safeResource && !safeResource.available) {
+    return error(`自定义 · ${resource.label}不可用`, `${details}当前连接不可用；不会自动切换到其他来源。`);
+  }
+  return success(`自定义 · ${resource.label}`, details);
 }
 
 function optionalCapabilitySnapshot(
-  response: LlmCapabilityStatusResponse | undefined,
+  response: LlmTaskStatusSnapshot | undefined,
   id: 'embedding' | 'rerank',
   label: '向量' | '重排',
 ): SettingsStatusSnapshot {
   if (!response) return warning('状态不可用', `暂时无法读取${label}服务状态。`);
-  const capability = response.checks.find((entry) => entry.id === id);
-  if (capability?.available) return success('可用', `${label}服务可用。`);
-  switch (capability?.reason) {
-    case 'no_resource': return neutral('未配置', `尚未配置${label}资源。`);
-    case 'resource_disabled': return neutral('已停用', `${label}资源已停用。`);
-    case 'credential_missing': return error('缺少密钥', `${label}资源缺少密钥。`);
-    case 'status_unavailable': return warning('状态未知', `暂时无法读取${label}服务状态。`);
-    default: return error('不可用', `当前没有可用的${label}路由。`);
+  const resourceId = response.defaults[id];
+  const resource = resourceId === undefined ? undefined : response.resources.find((item) => item.resourceId === resourceId);
+  const capability = response.tasks.find((entry) => entry.execution === id);
+  if (resource !== undefined) {
+    if (resource.available) return success('可用', `${label} · ${resource.defaultModel ?? '默认模型'} 服务可用。`);
+    return error('不可用', `${label}默认资源当前不可用；不会自动切换来源。`);
   }
+  if (!capability) return neutral('未配置', `尚未配置${label}资源。`);
+  if (capability.available) return success('可用', `${label}服务可用。`);
+  if (capability.failure?.reasonCode === 'LLM_TASK_ROUTE_UNAVAILABLE') return neutral('未配置', `尚未配置${label}资源。`);
+  if (capability.failure?.reasonCode === 'AUTH_FAILED') return error('缺少密钥', `${label}资源缺少密钥。`);
+  return error('不可用', capability.failure?.reasonCode ? `${label}任务不可用（${capability.failure.reasonCode}）。` : `当前没有可用的${label}路由。`);
 }
 
 /** Event-driven settings status bridge. It never exposes credentials or provider response bodies. */
@@ -94,6 +114,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
   ) {
     this.status = Object.freeze({
       tavernStatus: neutral('正在连接', '正在读取酒馆当前使用的来源和模型。'),
+      generationSourceStatus: neutral('正在同步', '正在同步默认生成来源。'),
       generationStatus: neutral('正在同步', '正在同步生成路由状态。'),
       embeddingStatus: neutral('正在同步', '正在同步向量服务状态。'),
       rerankStatus: neutral('正在同步', '正在同步重排服务状态。'),
@@ -109,7 +130,7 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
       this.unsubscribeHost = undefined;
     }
     try {
-      this.unsubscribeCapability = this.session.bus.subscribe(LLM_CAPABILITY_STATUS_CHANGED_V0, () => this.scheduleRefresh());
+      this.unsubscribeCapability = this.session.bus.subscribe(LLM_TASK_STATUS_CHANGED_V0, () => this.scheduleRefresh());
     } catch {
       this.unsubscribeCapability = undefined;
     }
@@ -131,29 +152,29 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
     const controller = new AbortController();
     this.controller = controller;
 
-    const tavernPromise = Promise.all([
-      this.session.host.generation.available(),
-      this.session.host.generation.current(),
-    ]).then(([available, current]) => {
-      if (!available) return warning('未连接', '酒馆当前没有可用的生成连接。');
+    const generationPort = this.session.host.generation as typeof this.session.host.generation & {
+      readonly inspect?: () => Promise<{ readonly available?: boolean; readonly provider?: string; readonly model?: string }>;
+    };
+    const tavernPromise = (typeof generationPort.inspect === 'function'
+      ? generationPort.inspect()
+      : Promise.all([generationPort.available(), generationPort.current()]).then(([available, current]) => ({ ...current, available }))).then((current) => {
+      if (current.available === false) return warning('未连接', '酒馆当前没有可用的生成连接。');
       const model = current.model?.trim();
       const provider = current.provider?.trim();
       if (!model && !provider) return warning('未选择模型', '酒馆连接可用，但尚未报告来源或模型。');
       return success(['酒馆', model ?? provider].join(' · '), '用于文本整理。');
     }).catch(() => warning('状态不可用', '无法读取酒馆当前连接状态。'));
 
-    const capabilityPromise = this.handlers.capabilityStatus
-      ? this.handlers.capabilityStatus({ checks: [
-        { id: 'generation', taskKey: 'settings_generation', taskKind: 'generation', requiredCapabilities: ['chat', 'json'] },
-        { id: 'embedding', taskKey: 'settings_embedding', taskKind: 'embedding', requiredCapabilities: ['embeddings'] },
-        { id: 'rerank', taskKey: 'settings_rerank', taskKind: 'rerank', requiredCapabilities: ['rerank'] },
-      ] }, controller.signal, this.session.descriptor.id).catch(() => undefined)
+    const capabilityPromise = this.handlers.taskStatus
+      ? this.handlers.taskStatus({}, this.session.descriptor.id).catch(() => undefined)
       : Promise.resolve(undefined);
+    const settingsPromise = this.repository.loadSettings().catch(() => undefined);
 
-    const [tavernStatus, capabilities] = await Promise.all([tavernPromise, capabilityPromise]);
+    const [tavernStatus, capabilities, settings] = await Promise.all([tavernPromise, capabilityPromise, settingsPromise]);
     if (this.disposed || controller.signal.aborted || generation !== this.refreshGeneration) return;
     this.status = Object.freeze({
       tavernStatus,
+      generationSourceStatus: generationSourceSnapshot(settings, tavernStatus, capabilities),
       generationStatus: generationSnapshot(capabilities),
       embeddingStatus: optionalCapabilitySnapshot(capabilities, 'embedding', '向量'),
       rerankStatus: optionalCapabilitySnapshot(capabilities, 'rerank', '重排'),

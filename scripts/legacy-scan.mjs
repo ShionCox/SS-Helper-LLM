@@ -20,6 +20,7 @@ const forbidden = [
   /legacyGenerate/,
   /Generate\('quiet'/,
   /tavernSource\s*===\s*['"]custom['"]\s*&&/,
+  /(?:\b(?:agentWriteMode|AgentWriteMode|shadowOnly|agent_shadow|shadowBaseline|shadowRunId|recordShadowExtractionAudit|MEMORY_SHADOW_WRITE_BLOCKED)\b|影子模式|影子审计|影子对照|Shadow（不写入）)/u,
 ];
 const shippedGuideForbidden = [
   /window\.STX/,

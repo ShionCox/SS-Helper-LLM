@@ -6,6 +6,7 @@ import type {
     PlainData,
     ProviderPrivacyPolicy,
     ProviderToolDialect,
+    LlmReasoningPolicy,
 } from '@ss-helper/sdk';
 
 export interface ProviderToolStartInput {
@@ -15,6 +16,7 @@ export interface ProviderToolStartInput {
     readonly tools: readonly LlmToolDefinition[];
     readonly outputSchema: PlainData;
     readonly privacyPolicy: ProviderPrivacyPolicy;
+    readonly reasoning?: LlmReasoningPolicy;
     readonly maxTokens: number;
     /** Initial provider turn only; normal Agent calls default to auto. */
     readonly toolChoice?: 'auto' | 'required';
@@ -40,6 +42,10 @@ export type ProviderToolStep<TState = unknown> =
 export interface ProviderToolAdapter<TState = unknown> {
     readonly dialect: ProviderToolDialect;
     readonly version: number;
+    /** Static adapter capability; the probe still confirms whether streaming was actually used. */
+    readonly toolStreamCapability?: 'incremental' | 'unsupported';
+    /** Provider endpoint candidate; Beta/native support is still verified with a real request. */
+    readonly strictToolSchemaCapability?: 'native' | 'beta' | 'unsupported';
     start(input: ProviderToolStartInput): Promise<ProviderToolStep<TState>>;
     continue(
         state: TState,

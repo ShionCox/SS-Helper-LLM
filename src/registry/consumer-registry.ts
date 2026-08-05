@@ -41,12 +41,17 @@ export class ConsumerRegistry {
     private resourceCapabilityQuery: ((resourceId: string) => LLMCapability[]) | null = null;
     /** 只读变更监听器 */
     private listeners: Set<ConsumerRegistryListener> = new Set();
+    /** 本次会话中明确注销的插件，防止旧持久快照把它重新带回。 */
+    private readonly released = new Set<string>();
 
     // ─── 初始化与恢复 ───
 
     /** 从持久存储恢复（仅恢复持久字段，不恢复会话态） */
     restoreFromStorage(snapshots: Record<string, ConsumerPersistentSnapshot>): void {
         for (const [pluginId, snapshot] of Object.entries(snapshots)) {
+            if (this.released.has(pluginId)) continue;
+            const live = this.sessions.get(pluginId);
+            if (live?.online === true) continue;
             this.persistent.set(pluginId, { ...snapshot });
             // 会话字段初始化为离线
             this.sessions.set(pluginId, this.createOfflineSession());
@@ -87,6 +92,7 @@ export class ConsumerRegistry {
      */
     registerConsumer(registration: ConsumerRegistration): void {
         const { pluginId, displayName, registrationVersion, tasks, routeBindings } = registration;
+        this.released.delete(pluginId);
 
         const existing = this.persistent.get(pluginId);
         const staleEntries: StaleBindingSnapshot[] = [];
@@ -105,8 +111,6 @@ export class ConsumerRegistry {
             tasks: [...tasks],
             routeBindings: routeBindings ? [...routeBindings] : [],
             staleReason: undefined,
-            userOverrides: existing?.userOverrides,
-            recommendedSnapshots: this.buildRecommendedSnapshots(tasks),
         };
 
         this.persistent.set(pluginId, snapshot);
@@ -136,6 +140,7 @@ export class ConsumerRegistry {
      * 同步返回，内部异步落盘。
      */
     unregisterConsumer(pluginId: string, opts?: { keepPersistent?: boolean }): void {
+        this.released.add(pluginId);
         if (!opts?.keepPersistent) {
             this.persistent.delete(pluginId);
             this.staleBindings.delete(pluginId);
@@ -346,22 +351,6 @@ export class ConsumerRegistry {
         const sorted1 = [...oldCaps].sort();
         const sorted2 = [...newCaps].sort();
         return sorted1.some((c, i) => c !== sorted2[i]);
-    }
-
-    private buildRecommendedSnapshots(
-        tasks: TaskDescriptor[],
-    ): Record<string, { taskKey: string; resourceId?: string; model?: string; profileId?: string }> {
-        const result: Record<string, { taskKey: string; resourceId?: string; model?: string; profileId?: string }> = {};
-        for (const task of tasks) {
-            if (task.recommendedRoute) {
-                result[task.taskKey] = {
-                    taskKey: task.taskKey,
-                    resourceId: task.recommendedRoute.resourceId,
-                    profileId: task.recommendedRoute.profileId,
-                };
-            }
-        }
-        return result;
     }
 
     private persistTimer: ReturnType<typeof setTimeout> | null = null;

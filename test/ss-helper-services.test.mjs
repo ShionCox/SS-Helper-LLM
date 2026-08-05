@@ -71,3 +71,34 @@ test('embedding and rerank preserve consumer task keys for task-specific routing
   assert.deepEqual(embedded.embeddings, [[0.1, 0.2]]);
   assert.deepEqual(reranked.results, [{ id: '1', index: 1, score: 0.9 }]);
 });
+
+test('structured-task preserves the upstream failure context across the service boundary', async () => {
+  const handlers = createLlmSdkServiceHandlers({
+    async runTask() {
+      return {
+        ok: false,
+        reasonCode: 'STRUCTURED_OUTPUT_TRUNCATED',
+        failure: {
+          reasonCode: 'STRUCTURED_OUTPUT_TRUNCATED',
+          stage: 'llm.provider.response',
+          requestId: 'provider-request-1',
+          resourceId: 'resource-deepseek',
+          model: 'deepseek-v4-flash',
+        },
+        meta: { requestId: 'service-request-1', usage: { promptTokens: 100, completionTokens: 4096, totalTokens: 4196 } },
+      };
+    },
+    async embed() { throw new Error('not used'); },
+    async rerank() { throw new Error('not used'); },
+    registerConsumer() {},
+    unregisterConsumer() {},
+  });
+
+  await assert.rejects(
+    handlers.runTask({ task: 'memory_extract_single', input: {}, outputSchema: { type: 'object' } }, new AbortController().signal, 'ss-helper.memory', 'service-request-1'),
+    (error) => error?.details?.reasonCode === 'STRUCTURED_OUTPUT_TRUNCATED'
+      && error?.details?.stage === 'llm.provider.response'
+      && error?.details?.requestId === 'provider-request-1'
+      && error?.details?.resourceId === 'resource-deepseek',
+  );
+});

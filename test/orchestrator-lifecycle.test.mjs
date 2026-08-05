@@ -100,7 +100,12 @@ test('a cancellation before a non-successful result remains cancelled', async ()
   const orchestrator = new RequestOrchestrator();
   orchestrator.setExecuteCallback(async (record) => {
     orchestrator.cancel(record.requestId, 'active cancellation');
-    return { ok: false, error: '操作已取消', reasonCode: 'CANCELLED', retryable: false };
+    return {
+      ok: false,
+      reasonCode: 'CANCELLED',
+      retryable: false,
+      failure: { reasonCode: 'CANCELLED', stage: 'llm.orchestrator.cancel', requestId: record.requestId },
+    };
   });
 
   const request = orchestrator.enqueue('fixture.consumer', 'active-cancel', 'generation');

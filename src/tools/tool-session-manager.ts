@@ -1,4 +1,4 @@
-import { createSSHelperError, readSSHelperFailure, type NormalizedToolResult, type PlainData, type ProviderPrivacyPolicy, type VerifiedToolCapabilities } from '@ss-helper/sdk';
+import { createSSHelperError, readSSHelperFailure, type LlmReasoningPolicy, type NormalizedToolResult, type PlainData, type ProviderPrivacyPolicy, type VerifiedToolCapabilities } from '@ss-helper/sdk';
 import type { ProviderToolAdapter, ProviderToolStartInput, ProviderToolStep } from './tool-adapter';
 import { attachProviderResponseDebug } from '../providers/provider-response-diagnostics';
 
@@ -55,6 +55,9 @@ export interface ToolSessionStartInput extends ToolSessionScope {
     readonly outputSchema: PlainData;
     readonly privacyPolicy: ProviderPrivacyPolicy;
     readonly maxTokens: number;
+    readonly reasoning?: LlmReasoningPolicy;
+    readonly validationMode?: 'strict' | 'itemized_partial';
+    readonly validationCollections?: readonly string[];
     readonly signal: AbortSignal;
 }
 
@@ -72,6 +75,9 @@ interface ToolSessionRecord extends ToolSessionScope {
     stateBytes: number;
     pendingCalls: readonly { readonly callId: string; readonly name: string }[];
     readonly outputSchema: PlainData;
+    readonly reasoningPolicy?: LlmReasoningPolicy;
+    readonly validationMode?: 'strict' | 'itemized_partial';
+    readonly validationCollections?: readonly string[];
 }
 
 export interface ManagedToolStep {
@@ -81,6 +87,9 @@ export interface ManagedToolStep {
     readonly totalCalls: number;
     readonly capabilitySnapshotId: string;
     readonly outputSchema: PlainData;
+    readonly reasoningPolicy?: LlmReasoningPolicy;
+    readonly validationMode?: 'strict' | 'itemized_partial';
+    readonly validationCollections?: readonly string[];
 }
 
 let sessionSequence = 0;
@@ -100,12 +109,13 @@ export class ToolSessionManager {
             outputSchema: input.outputSchema,
             privacyPolicy: input.privacyPolicy,
             maxTokens: input.maxTokens,
+            ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
             signal: input.signal,
         });
         const capabilitySnapshotId = input.capability.capabilityDigest ?? `${input.resourceId}:${input.model}:${input.capability.probeVersion}`;
         if (step.state === 'final') {
             input.adapter.dispose(step.adapterState);
-            return { step, round: 1, totalCalls: 0, capabilitySnapshotId, outputSchema: input.outputSchema };
+            return { step, round: 1, totalCalls: 0, capabilitySnapshotId, outputSchema: input.outputSchema, ...(input.reasoning === undefined ? {} : { reasoningPolicy: input.reasoning }), ...(input.validationMode === undefined ? {} : { validationMode: input.validationMode }), ...(input.validationCollections === undefined ? {} : { validationCollections: [...input.validationCollections] }) };
         }
         let stateBytes: number;
         try {
@@ -137,9 +147,12 @@ export class ToolSessionManager {
             stateBytes,
             pendingCalls: step.calls.map((call) => ({ callId: call.callId, name: call.name })),
             outputSchema: input.outputSchema,
+            ...(input.reasoning === undefined ? {} : { reasoningPolicy: input.reasoning }),
+            ...(input.validationMode === undefined ? {} : { validationMode: input.validationMode }),
+            ...(input.validationCollections === undefined ? {} : { validationCollections: [...input.validationCollections] }),
         };
         this.sessions.set(id, record);
-        return { toolSessionId: id, step, round: record.round, totalCalls: record.totalCalls, capabilitySnapshotId, outputSchema: record.outputSchema };
+        return { toolSessionId: id, step, round: record.round, totalCalls: record.totalCalls, capabilitySnapshotId, outputSchema: record.outputSchema, ...(record.reasoningPolicy === undefined ? {} : { reasoningPolicy: record.reasoningPolicy }), ...(record.validationMode === undefined ? {} : { validationMode: record.validationMode }), ...(record.validationCollections === undefined ? {} : { validationCollections: [...record.validationCollections] }) };
     }
 
     async continue(
@@ -173,7 +186,7 @@ export class ToolSessionManager {
             record.expiresAt = now + TOOL_SESSION_LIMITS.ttlMs;
             record.pendingCalls = step.state === 'tool_calls' ? step.calls.map((call) => ({ callId: call.callId, name: call.name })) : [];
             if (step.state === 'final') this.release(record.id);
-            return { ...(step.state === 'tool_calls' ? { toolSessionId: record.id } : {}), step, round: record.round, totalCalls: record.totalCalls, capabilitySnapshotId: record.capabilitySnapshotId, outputSchema: record.outputSchema };
+            return { ...(step.state === 'tool_calls' ? { toolSessionId: record.id } : {}), step, round: record.round, totalCalls: record.totalCalls, capabilitySnapshotId: record.capabilitySnapshotId, outputSchema: record.outputSchema, ...(record.reasoningPolicy === undefined ? {} : { reasoningPolicy: record.reasoningPolicy }), ...(record.validationMode === undefined ? {} : { validationMode: record.validationMode }), ...(record.validationCollections === undefined ? {} : { validationCollections: [...record.validationCollections] }) };
         } catch (error) {
             this.release(record.id);
             throw step === undefined ? error : rejectedToolStepError(error, step);
@@ -198,6 +211,11 @@ export class ToolSessionManager {
     cancel(toolSessionId: string): boolean { return this.release(toolSessionId); }
     cancelByChat(callerPluginId: string, chatKey: string): number {
         const ids = [...this.sessions.values()].filter((record) => record.callerPluginId === callerPluginId && record.chatKey === chatKey).map((record) => record.id);
+        ids.forEach((id) => this.release(id));
+        return ids.length;
+    }
+    cancelByResource(resourceId: string): number {
+        const ids = [...this.sessions.values()].filter((record) => record.resourceId === resourceId).map((record) => record.id);
         ids.forEach((id) => this.release(id));
         return ids.length;
     }

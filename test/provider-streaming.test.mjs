@@ -85,7 +85,7 @@ test('Gemini generation uses streamGenerateContent and joins response chunks', a
 });
 
 test('a structured stream parameter rejection maps without exposing the response body', async () => {
-  const provider = new OpenAIProvider({ id: 'relay', apiKey: 'secret', apiType: 'generic', fetchImpl: async () => new Response(JSON.stringify({ error: { code: 'unsupported_stream', param: 'stream', message: 'private detail' } }), { status: 400 }) });
+  const provider = new OpenAIProvider({ id: 'relay', apiKey: 'secret', apiType: 'generic', model: 'relay-model', fetchImpl: async () => new Response(JSON.stringify({ error: { code: 'unsupported_stream', param: 'stream', message: 'private detail' } }), { status: 400 }) });
   await assert.rejects(
     provider.request({ messages: [{ role: 'user', content: 'hello' }] }),
     (error) => error?.details?.reasonCode === 'PROVIDER_STREAM_UNSUPPORTED'

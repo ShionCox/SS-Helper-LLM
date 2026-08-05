@@ -96,12 +96,90 @@ test('tool capability probe reserves enough output budget for two complete think
     dispose() {},
   };
   const capability = await new ToolCapabilityProbe().verify({
-    resourceId: 'resource:probe', model: 'thinking-model', adapter,
+    resourceId: 'resource:probe', model: 'thinking-model', requestId: 'request:probe', adapter,
     privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
   });
   assert.equal(capability.status, 'verified');
   assert.equal(probeMaxTokens, 512);
   assert.equal(probeToolChoice, 'required');
+});
+
+test('tool capability probe preserves safe provider failure context', async () => {
+  const adapter = {
+    dialect: 'deepseek_chat', version: 7,
+    async start() {
+      throw createSSHelperError('PROVIDER_SERVICE_UNAVAILABLE', { stage: 'llm.provider.http', httpStatus: 503 });
+    },
+    dispose() {},
+  };
+  const capability = await new ToolCapabilityProbe().verify({
+    resourceId: 'resource:deepseek', model: 'deepseek-v4-flash', requestId: 'request:deepseek-probe', adapter,
+    privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
+  });
+  assert.equal(capability.status, 'failed');
+  assert.deepEqual(capability.failure, {
+    reasonCode: 'PROVIDER_SERVICE_UNAVAILABLE', stage: 'llm.provider.http', requestId: 'request:deepseek-probe',
+    httpStatus: 503, providerKind: 'deepseek_chat', resourceId: 'resource:deepseek', model: 'deepseek-v4-flash',
+  });
+});
+
+test('DeepSeek basic tool call remains usable when optional continuation probe fails', async () => {
+  const adapter = {
+    dialect: 'deepseek_chat', version: 1, toolStreamCapability: 'unsupported',
+    async start() {
+      return { state: 'tool_calls', calls: [{ callId: 'probe-1', name: 'ss_helper_tool_probe', arguments: { value: 'probe-a' } }], adapterState: { round: 1 }, transport: 'non_stream' };
+    },
+    async continue() { throw createSSHelperError('RESPONSE_FORMAT_UNSUPPORTED', { stage: 'llm.provider.deepseek.optional' }); },
+    async finalize() { throw new Error('unused'); }, estimateStateBytes: () => 1, dispose() {},
+  };
+  const capability = await new ToolCapabilityProbe().verify({
+    resourceId: 'resource:deepseek-basic', model: 'deepseek-chat', requestId: 'request:deepseek-basic', adapter,
+    privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
+  });
+  assert.equal(capability.status, 'verified');
+  assert.equal(capability.parallelToolCalls, false);
+  assert.equal(capability.strictToolSchema, 'unsupported');
+  assert.equal(capability.streamingToolCalls, 'unsupported');
+  assert.equal(capability.optionalFailures?.[0]?.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
+});
+
+test('DeepSeek Beta strict Schema is probed independently from the basic tool call', async () => {
+  const observedStrict = [];
+  const adapter = {
+    dialect: 'deepseek_chat', version: 1, toolStreamCapability: 'unsupported', strictToolSchemaCapability: 'beta',
+    async start(input) {
+      observedStrict.push(input.tools[0].strict);
+      return { state: 'tool_calls', calls: [{ callId: `probe-${observedStrict.length}`, name: 'ss_helper_tool_probe', arguments: { value: 'probe-a' } }], adapterState: { round: observedStrict.length }, transport: 'non_stream' };
+    },
+    async continue() { return { state: 'final', output: { ok: true }, adapterState: { round: 2 }, transport: 'non_stream' }; },
+    async finalize() { throw new Error('unused'); }, estimateStateBytes: () => 1, dispose() {},
+  };
+  const capability = await new ToolCapabilityProbe().verify({
+    resourceId: 'resource:deepseek-beta', model: 'deepseek-chat', requestId: 'request:deepseek-beta', adapter,
+    privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
+  });
+  assert.equal(capability.status, 'verified');
+  assert.equal(capability.strictToolSchema, 'beta');
+  assert.deepEqual(observedStrict, [false, true]);
+});
+
+test('DeepSeek Beta strict probe failure does not invalidate verified basic tools', async () => {
+  const adapter = {
+    dialect: 'deepseek_chat', version: 1, toolStreamCapability: 'unsupported', strictToolSchemaCapability: 'beta',
+    async start(input) {
+      if (input.tools[0].strict) throw createSSHelperError('RESPONSE_FORMAT_UNSUPPORTED', { stage: 'llm.provider.deepseek.beta_strict' });
+      return { state: 'tool_calls', calls: [{ callId: 'probe-basic', name: 'ss_helper_tool_probe', arguments: { value: 'probe-a' } }], adapterState: { round: 1 }, transport: 'non_stream' };
+    },
+    async continue() { return { state: 'final', output: { ok: true }, adapterState: { round: 2 }, transport: 'non_stream' }; },
+    async finalize() { throw new Error('unused'); }, estimateStateBytes: () => 1, dispose() {},
+  };
+  const capability = await new ToolCapabilityProbe().verify({
+    resourceId: 'resource:deepseek-beta-failure', model: 'deepseek-chat', requestId: 'request:deepseek-beta-failure', adapter,
+    privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
+  });
+  assert.equal(capability.status, 'verified');
+  assert.equal(capability.strictToolSchema, 'unknown');
+  assert.equal(capability.optionalFailures?.[0]?.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
 });
 
 test('tool capability verification persists and hydrates across service instances', async () => {
@@ -129,7 +207,7 @@ test('tool capability verification persists and hydrates across service instance
     return new LlmToolTurnService(router, { getResource: (resourceId) => resourceId === resource.id ? resource : undefined }, fixedTestMaxTokens, store);
   };
   const first = createService();
-  const verified = await first.verify(resource.id, resource.model, true, new AbortController().signal);
+  const verified = await first.verify(resource.id, resource.model, true, 'verify-hydrate', new AbortController().signal);
   assert.equal(verified.capability.status, 'verified');
   assert.equal(records.size, 1);
   first.dispose();
@@ -162,7 +240,7 @@ test('aborted tool capability verification is neither cached nor persisted as a 
   const service = new LlmToolTurnService(router, { getResource: () => resource }, fixedTestMaxTokens, store);
   const controller = new AbortController();
   controller.abort();
-  await assert.rejects(service.verify(resource.id, resource.model, true, controller.signal),
+  await assert.rejects(service.verify(resource.id, resource.model, true, 'verify-aborted', controller.signal),
     (error) => error?.details?.reasonCode === 'REQUEST_ABORTED');
   assert.equal(saves, 0);
   assert.equal(await service.getCapability(resource.id, resource.model), undefined);
@@ -190,7 +268,7 @@ test('Agent turns log the provider kind and preserve cancellation on the real th
   const resource = { id: provider.id, type: 'generation', source: 'custom', apiType: 'xai', label: 'Grok', baseUrl: 'https://api.x.ai/v1', model: 'grok-test', enabled: true };
   const router = new TaskRouter();
   router.registerProvider(provider, 'generation', ['chat', 'json', 'tools'], resource.model);
-  router.applyGenerationSource('custom');
+  router.applyExecutionDefaults({ tool_turn: resource.id });
   const requestLogs = { async recordAgentTurn(input) { logged.push(input); } };
   const rateSlots = [];
   const requestRateLimiter = { async acquire(_signal, requestId) { rateSlots.push(requestId); } };
@@ -199,8 +277,8 @@ test('Agent turns log the provider kind and preserve cancellation on the real th
   const originalStart = adapter.start;
   adapter.start = async (input) => { startedMaxTokens = input.maxTokens; return originalStart(input); };
   const service = new LlmToolTurnService(router, { getResource: () => resource }, resolveAgentMaxTokens, undefined, requestLogs, () => ({ taskDescription: '提取物品与库存变化' }), requestRateLimiter);
-  assert.equal((await service.verify(resource.id, resource.model, true, new AbortController().signal)).capability.status, 'verified');
-  const base = { task: 'memory_extract_inventory', pipelineRunId: 'pipeline-1', chatKey: 'chat-1', route: resource.id };
+  assert.equal((await service.verify(resource.id, resource.model, true, 'verify-agent-turn', new AbortController().signal)).capability.status, 'verified');
+  const base = { task: 'memory_extract_content', pipelineRunId: 'pipeline-1', chatKey: 'chat-1', route: resource.id };
   const first = await service.turn({ ...base, input: { messages: startInput().messages }, outputSchema: startInput().outputSchema, tools: [tool] }, 'ss-helper.memory', 'turn-1', new AbortController().signal);
   const second = await service.turn({ ...base, toolSessionId: first.toolSessionId, toolResults: [{ callId: 'call-1', name: tool.name, ok: true, content: { ref: 'O07' } }] }, 'ss-helper.memory', 'turn-2', new AbortController().signal);
   const controller = new AbortController();
@@ -239,13 +317,13 @@ test('Agent schema failures log the parsed output and every safe validation issu
   const resource = { id: provider.id, type: 'generation', source: 'custom', apiType: 'generic', label: 'Schema log', baseUrl: 'https://example.invalid/v1', model: 'model:schema', enabled: true };
   const router = new TaskRouter();
   router.registerProvider(provider, 'generation', ['chat', 'json', 'tools'], resource.model);
-  router.applyGenerationSource('custom');
+  router.applyExecutionDefaults({ tool_turn: resource.id });
   const requestLogs = { async recordAgentTurn(input) { logged.push(input); } };
   const service = new LlmToolTurnService(router, { getResource: () => resource }, fixedTestMaxTokens, undefined, requestLogs);
-  assert.equal((await service.verify(resource.id, resource.model, true, new AbortController().signal)).capability.status, 'verified');
+  assert.equal((await service.verify(resource.id, resource.model, true, 'verify-schema-failure', new AbortController().signal)).capability.status, 'verified');
 
   await assert.rejects(service.turn({
-    task: 'memory_extract_inventory', pipelineRunId: 'pipeline-schema', chatKey: 'chat-schema', route: resource.id,
+    task: 'memory_extract_content', pipelineRunId: 'pipeline-schema', chatKey: 'chat-schema', route: resource.id,
     input: { messages: startInput().messages }, outputSchema: startInput().outputSchema, tools: [tool],
   }, 'ss-helper.memory', 'turn-schema', new AbortController().signal),
   (error) => error?.details?.reasonCode === 'SCHEMA_VALIDATION_FAILED'
@@ -291,10 +369,10 @@ test('Agent protocol failures forward private response evidence to the request l
   const resource = { id: provider.id, type: 'generation', source: 'custom', apiType: 'generic', label: 'Protocol log', baseUrl: 'https://example.invalid/v1', model: 'model:protocol', enabled: true };
   const router = new TaskRouter();
   router.registerProvider(provider, 'generation', ['chat', 'json', 'tools'], resource.model);
-  router.applyGenerationSource('custom');
+  router.applyExecutionDefaults({ tool_turn: resource.id });
   const requestLogs = { async recordAgentTurn(input) { logged.push(input); } };
   const service = new LlmToolTurnService(router, { getResource: () => resource }, fixedTestMaxTokens, undefined, requestLogs);
-  assert.equal((await service.verify(resource.id, resource.model, true, new AbortController().signal)).capability.status, 'verified');
+  assert.equal((await service.verify(resource.id, resource.model, true, 'verify-provider-failure', new AbortController().signal)).capability.status, 'verified');
 
   await assert.rejects(service.turn({
     task: 'memory_extract_single', pipelineRunId: 'pipeline-protocol', chatKey: 'chat-protocol', route: resource.id,
@@ -336,9 +414,9 @@ test('tool capability persistence failure clears an older verified result and de
   const router = new TaskRouter();
   router.registerProvider(provider, 'generation', ['chat', 'json', 'tools'], resource.model);
   const service = new LlmToolTurnService(router, { getResource: (resourceId) => resourceId === resource.id ? resource : undefined }, fixedTestMaxTokens, store);
-  assert.equal((await service.verify(resource.id, resource.model, true, new AbortController().signal)).capability.status, 'verified');
+  assert.equal((await service.verify(resource.id, resource.model, true, 'verify-persist', new AbortController().signal)).capability.status, 'verified');
   failSave = true;
-  await assert.rejects(service.verify(resource.id, resource.model, true, new AbortController().signal), /workspace unavailable/u);
+  await assert.rejects(service.verify(resource.id, resource.model, true, 'verify-persist-failure', new AbortController().signal), /workspace unavailable/u);
   assert.equal(await service.getCapability(resource.id, resource.model), undefined);
   assert.equal(records.size, 0);
   service.dispose();
@@ -348,7 +426,7 @@ test('tool capability hydration retries after a transient workspace failure', as
   let attempts = 0;
   const capability = {
     status: 'verified', resourceId: 'resource:hydrate-retry', model: 'model:retry', dialect: 'openai_chat_compatible',
-    parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'none', reasoningReplay: 'none',
+    parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'unsupported', reasoningReplay: 'none',
     verifiedAt: Date.now(), expiresAt: Date.now() + 60_000, probeVersion: 2,
   };
   const adapter = { dialect: 'openai_chat_compatible', version: 1, dispose() {} };
@@ -426,12 +504,17 @@ test('Chat dialects preserve assistant messages, enforce thinking replay integri
   const deepSeekBodies = [];
   const ordinaryDeepSeek = new OpenAiChatToolAdapter(transport([
     { choices: [{ message: { role: 'assistant', tool_calls: [{ id: 'd-1', function: { name: providerToolName, arguments: '{"mentions":["急救包"]}' } }] } }] },
+    { choices: [{ message: { role: 'assistant', content: '{"itemRef":"O07"}' } }] },
   ], deepSeekBodies), OPENAI_CHAT_DIALECT_POLICIES.deepseek);
-  assert.equal((await ordinaryDeepSeek.start({ ...startInput(), toolChoice: 'required' })).state, 'tool_calls');
-  assert.equal(deepSeekBodies[0].tool_choice, 'auto');
-  assert.deepEqual(deepSeekBodies[0].response_format, { type: 'json_object' });
-  assert.equal(deepSeekBodies[0].tools[0].function.strict, true);
+  const ordinaryDeepSeekFirst = await ordinaryDeepSeek.start({ ...startInput(), toolChoice: 'required' });
+  assert.equal(ordinaryDeepSeekFirst.state, 'tool_calls');
+  assert.equal('tool_choice' in deepSeekBodies[0], false);
+  assert.equal('response_format' in deepSeekBodies[0], false);
+  assert.equal('strict' in deepSeekBodies[0].tools[0].function, false);
   assert.equal(deepSeekBodies[0].tools[0].function.name, providerToolName);
+  await ordinaryDeepSeek.finalize(ordinaryDeepSeekFirst.adapterState, 'Return final JSON.', startInput().outputSchema, startInput().signal);
+  assert.deepEqual(deepSeekBodies[1].response_format, { type: 'json_object' });
+  assert.equal('tools' in deepSeekBodies[1], false);
 
   const nonStreamingBodies = [];
   const nonStreamingDeepSeek = new OpenAiChatToolAdapter({
@@ -442,6 +525,7 @@ test('Chat dialects preserve assistant messages, enforce thinking replay integri
     },
     async sendStream() { throw new Error('DeepSeek tool turns must not stream'); },
   }, OPENAI_CHAT_DIALECT_POLICIES.deepseek, { enableToolStream: true });
+  assert.equal(nonStreamingDeepSeek.toolStreamCapability, 'unsupported');
   assert.equal((await nonStreamingDeepSeek.start(startInput())).state, 'final');
   assert.equal(nonStreamingBodies[0].stream, false);
 
@@ -493,6 +577,50 @@ test('generic resources honor the configured native tool dialect instead of gues
     enabled: true, capabilities: ['chat', 'json', 'tools'], toolDialect: 'glm_chat',
   }, 'secret', async () => { throw new Error('network must not be used while selecting an adapter'); });
   assert.equal(provider.createToolAdapter().dialect, 'glm_chat');
+});
+
+test('DeepSeek V4 defaults to thinking tool turns without tool_choice and replays required assistant fields', async () => {
+  const bodies = [];
+  const responses = [
+    { choices: [{ message: { role: 'assistant', content: null, reasoning_content: 'probe reasoning', tool_calls: [{ id: 'd-v4-1', function: { name: providerToolName, arguments: '{"mentions":["急救包"]}' } }] } }] },
+    { choices: [{ message: { role: 'assistant', content: '{"itemRef":"O07"}' } }] },
+  ];
+  const provider = createProviderFromResource({
+    id: 'resource:deepseek-v4', type: 'generation', source: 'custom', apiType: 'deepseek',
+    label: 'DeepSeek V4', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash',
+    enabled: true, capabilities: ['chat', 'json', 'tools'], toolDialect: 'deepseek_chat', customParams: { thinking: true },
+  }, 'secret', async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify(responses.shift()), { status: 200, headers: { 'content-type': 'application/json' } });
+  }, false);
+  const adapter = provider.createToolAdapter();
+  const first = await adapter.start({ ...startInput(), model: 'deepseek-v4-flash', toolChoice: 'required' });
+  assert.equal(first.state, 'tool_calls');
+  assert.equal('tool_choice' in bodies[0], false);
+  assert.deepEqual(bodies[0].thinking, { type: 'enabled' });
+  assert.equal(bodies[0].reasoning_effort, 'high');
+  await adapter.continue(first.adapterState, [{ callId: 'd-v4-1', name: tool.name, ok: true, content: { ref: 'O07' } }], startInput().signal);
+  const replayedAssistant = bodies[1].messages.find((message) => message.role === 'assistant');
+  assert.equal(replayedAssistant.content, '');
+  assert.equal(replayedAssistant.reasoning_content, 'probe reasoning');
+});
+
+test('DeepSeek Beta endpoint enables strict tool Schema without changing the DeepSeek dialect', async () => {
+  const bodies = [];
+  const provider = createProviderFromResource({
+    id: 'resource:deepseek-beta-adapter', type: 'generation', source: 'custom', apiType: 'deepseek',
+    label: 'DeepSeek Beta', baseUrl: 'https://api.deepseek.com/beta', model: 'deepseek-chat',
+    enabled: true, capabilities: ['chat', 'json', 'tools'], toolDialect: 'deepseek_chat',
+  }, 'secret', async (_url, init) => {
+    bodies.push(JSON.parse(String(init?.body)));
+    return new Response(JSON.stringify({ choices: [{ message: { role: 'assistant', content: '{}' } }] }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }, false);
+  const adapter = provider.createToolAdapter();
+  assert.equal(adapter.dialect, 'deepseek_chat');
+  assert.equal(adapter.strictToolSchemaCapability, 'beta');
+  await adapter.start(startInput());
+  assert.equal(bodies[0].tools[0].function.strict, true);
+  assert.equal('tool_choice' in bodies[0], false);
 });
 
 test('streamed OpenAI-compatible arguments assemble by index only after completion', () => {
@@ -554,7 +682,7 @@ test('ToolSessionManager enforces scope, exact result pairing and bounded active
     async finalize() { throw new Error('unused'); }, estimateStateBytes: (state) => JSON.stringify(state).length, dispose() {},
   };
   const scope = { callerPluginId: 'memory', taskKey: 'inventory', pipelineRunId: 'p1', chatKey: 'c1', resourceId: 'r1', model: 'm1' };
-  const started = await manager.start({ ...scope, adapter: fakeAdapter, capability: { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'none', reasoningReplay: 'none', probeVersion: 1 }, messages: startInput().messages, tools: [tool], outputSchema: startInput().outputSchema, privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, maxTokens: 128, signal: startInput().signal });
+  const started = await manager.start({ ...scope, adapter: fakeAdapter, capability: { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'unsupported', reasoningReplay: 'none', probeVersion: 1 }, messages: startInput().messages, tools: [tool], outputSchema: startInput().outputSchema, privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, maxTokens: 128, signal: startInput().signal });
   await assert.rejects(manager.continue(started.toolSessionId, { ...scope, chatKey: 'other' }, [{ callId: 'call-1', name: tool.name, ok: true, content: { ref: 'O07' } }], startInput().signal),
     (error) => error?.details?.reasonCode === 'LLM_TOOL_SESSION_SCOPE_MISMATCH');
   const completed = await manager.continue(started.toolSessionId, scope, [{ callId: 'call-1', name: tool.name, ok: true, content: { ref: 'O07' } }], startInput().signal);
@@ -572,7 +700,7 @@ test('ToolSessionManager admits six calls in one round and records a rejected se
     async continue() { throw new Error('unused'); }, async finalize() { throw new Error('unused'); },
     estimateStateBytes: () => 1, dispose() { disposed += 1; },
   };
-  const base = { callerPluginId: 'memory', taskKey: 'inventory', pipelineRunId: 'p1', chatKey: 'c1', resourceId: 'r1', model: 'm1', adapter: fakeAdapter, capability: { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'none', reasoningReplay: 'none', probeVersion: 1 }, messages: startInput().messages, tools: [tool], outputSchema: startInput().outputSchema, privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, maxTokens: 128, signal: startInput().signal };
+  const base = { callerPluginId: 'memory', taskKey: 'inventory', pipelineRunId: 'p1', chatKey: 'c1', resourceId: 'r1', model: 'm1', adapter: fakeAdapter, capability: { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'openai_chat_compatible', parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'unsupported', reasoningReplay: 'none', probeVersion: 1 }, messages: startInput().messages, tools: [tool], outputSchema: startInput().outputSchema, privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, maxTokens: 128, signal: startInput().signal };
   const admitted = await manager.start(base);
   assert.equal(admitted.step.state, 'tool_calls');
   assert.equal(admitted.step.calls.length, 6);
@@ -598,7 +726,7 @@ test('ToolSessionManager admits large bounded local replay state and rejects sta
     async continue() { return { state: 'final', output: { itemRef: 'O07' }, adapterState: { done: true } }; },
     async finalize() { throw new Error('unused'); }, estimateStateBytes: () => stateBytes, dispose() { disposed += 1; },
   };
-  const capability = { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'deepseek_chat', parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'beta', reasoningReplay: 'required', probeVersion: 1 };
+  const capability = { status: 'verified', resourceId: 'r1', model: 'm1', dialect: 'deepseek_chat', parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'beta', reasoningReplay: 'required', probeVersion: 1 };
   const base = { callerPluginId: 'memory', taskKey: 'narrative', pipelineRunId: 'p1', chatKey: 'c1', resourceId: 'r1', model: 'm1', adapter: fakeAdapter, capability, messages: startInput().messages, tools: [tool], outputSchema: startInput().outputSchema, privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, maxTokens: 128, signal: startInput().signal };
 
   const admitted = await manager.start(base);

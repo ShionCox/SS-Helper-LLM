@@ -7,6 +7,7 @@ import {
   createProductionLlmServices,
   createProviderFromResource,
   createWorkspaceLlmSettingsAdapter,
+  GenerationSourceController,
 } from '../dist/index.js';
 
 function flattenSettingsFields(fields) {
@@ -92,7 +93,7 @@ test('settings adapter exposes only schema fields and preserves popup-managed co
   const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
   await repository.saveSettings({
     ...(await repository.loadSettings()),
-    resources: [{ id: 'embed-main', type: 'embedding', source: 'custom', apiType: 'openai', label: 'Embedding', enabled: true }],
+    resources: [{ id: 'embed-main', type: 'embedding', source: 'custom', apiType: 'openai', label: 'Embedding', model: 'text-embedding-3-small', enabled: true }],
     globalAssignments: { embedding: { resourceId: 'embed-main' } },
   });
   const statusSource = {
@@ -125,6 +126,24 @@ test('settings adapter exposes only schema fields and preserves popup-managed co
   unsubscribe();
 });
 
+test('atomic settings mutations merge independent callers and reject a stale same-revision write', async () => {
+  const repository = new LlmWorkspaceRepository(new MemoryWorkspace(), new MemorySecrets());
+  await repository.ready();
+  await Promise.all([
+    repository.updateSettings((current) => ({ ...current, globalProfile: 'economy' })),
+    repository.updateSettings((current) => ({ ...current, timeoutMs: 12_345 })),
+  ]);
+  const merged = await repository.loadSettings();
+  assert.equal(merged.globalProfile, 'economy');
+  assert.equal(merged.timeoutMs, 12_345);
+  const expectedRevision = 2;
+  const first = repository.updateSettings((current) => ({ ...current, maxTokens: 4_096 }), { expectedRevision });
+  const second = repository.updateSettings((current) => ({ ...current, maxTokens: 8_192 }), { expectedRevision });
+  await first;
+  await assert.rejects(second, (error) => error?.code === 'CONFLICT' || error?.details?.reasonCode === 'WORKSPACE_CONFLICT');
+  assert.equal((await repository.loadSettings()).maxTokens, 4_096);
+});
+
 class MemorySecrets {
   constructor() { this.records = new Map(); this.failRead = false; this.failNextDelete = false; this.returnFalseNextDelete = false; this.failNextSet = false; }
   async set({ secretId, value, metadata }) { if (this.failNextSet) { this.failNextSet = false; const error = new Error('secret write failed'); error.code = 'WORKSPACE_FAILURE'; throw error; } const record = { secretId, value, metadata, maskedValue: `••••${value.slice(-2)}`, updatedAt: Date.now(), keyVersion: 0 }; this.records.set(secretId, record); return { ...record, value: undefined }; }
@@ -141,7 +160,7 @@ test('settings schema exposes five progressive pages and generic popup actions',
   });
   assert.equal(new Set(allFields.map((field) => field.id)).size, allFields.length, 'settings field IDs must be globally unique');
   assert.deepEqual(Object.fromEntries(sections.map((section) => [section.id, section.children.map((field) => field.label)])), {
-    start: ['服务状态', '生成偏好', '请求与展示'],
+    start: ['服务状态', '生成偏好', '请求与展示', '模型来源'],
     resources: ['资源管理', '能力测试'],
     routing: ['通用路由', '高级配置'],
     runtime: ['额度与任务'],
@@ -149,11 +168,7 @@ test('settings schema exposes five progressive pages and generic popup actions',
   });
   assert.ok(allFields.some((field) => field.id === 'globalProfile'));
   assert.equal(allFields.find((field) => field.id === 'tavernStatus')?.label, '大语言模型');
-  const generationSource = allFields.find((field) => field.id === 'generationSource');
-  assert.deepEqual(
-    [generationSource?.kind, generationSource?.defaultValue, generationSource?.options?.map((option) => option.value)],
-    ['select', 'tavern', ['tavern', 'custom']],
-  );
+  assert.equal(allFields.some((field) => field.id === 'generationSource'), false);
   assert.deepEqual(
     [allFields.find((field) => field.id === 'streamingEnabled')?.kind, allFields.find((field) => field.id === 'streamingEnabled')?.defaultValue],
     ['toggle', true],
@@ -179,13 +194,56 @@ test('settings schema exposes five progressive pages and generic popup actions',
     queueManager: ['runtime', 'open-queue-manager', 'queue-manager', '查看'],
     serviceDiagnostics: ['diagnostics', 'open-diagnostics', 'diagnostics', '运行检查'],
     requestLogs: ['diagnostics', 'open-request-logs', 'request-logs', '查看'],
+    generationSourceConfig: ['start', 'open-generation-source', 'generation-source', '设置'],
     backup: ['diagnostics', 'open-backup', 'backup', '管理'],
     reset: ['diagnostics', 'reset-llm', 'reset-confirm', '重置'],
   };
-  assert.equal(actions.length, 11);
+  assert.equal(actions.length, 12);
   assert.deepEqual(Object.fromEntries(actions.map((field) => [field.id, [field.tabId, field.actionId, field.popup?.name, field.buttonLabel]])), expectedActions);
   assert.ok(actions.every((field) => field.placement === 'inline'));
   assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
+});
+
+test('generation source popup lists enabled custom resources without secrets and persists the selected default', async () => {
+  let settings = {
+    enabled: true,
+    globalAssignments: { generation: { resourceId: 'tavern:active' } },
+    resources: [
+      { id: 'custom-main', type: 'generation', source: 'custom', apiType: 'openai', label: '自定义主模型', model: 'gpt-test', baseUrl: 'https://secret.example/v1', enabled: true },
+      { id: 'disabled', type: 'generation', source: 'custom', apiType: 'generic', label: '停用资源', model: 'disabled', enabled: false },
+      { id: 'embed', type: 'embedding', source: 'custom', apiType: 'openai', label: '向量', model: 'embed', enabled: true },
+    ],
+  };
+  let closed = false;
+  const repository = {
+    async loadSettings() { return structuredClone(settings); },
+    async updateSettings(mutator) { settings = structuredClone(mutator(structuredClone(settings))); return structuredClone(settings); },
+    async saveSettings(next) { settings = structuredClone(next); return structuredClone(settings); },
+  };
+  const controller = await GenerationSourceController.create(repository, { close() { closed = true; } });
+  const options = controller.snapshot().fieldOptions.resourceId;
+  assert.deepEqual(options, [{ value: 'custom-main', label: '自定义主模型 · openai · gpt-test' }]);
+  assert.equal(options[0].label.includes('https://'), false);
+  controller.change('sourceKind', 'custom');
+  controller.change('resourceId', 'custom-main');
+  await controller.submit();
+  assert.equal(settings.globalAssignments.generation.resourceId, 'custom-main');
+  assert.equal(closed, true);
+});
+
+test('generation source popup refuses custom mode when no enabled generation resource exists', async () => {
+  let settings = { enabled: true, globalAssignments: { generation: { resourceId: 'tavern:active' } }, resources: [] };
+  const repository = {
+    async loadSettings() { return structuredClone(settings); },
+    async updateSettings(mutator) { settings = structuredClone(mutator(structuredClone(settings))); return structuredClone(settings); },
+    async saveSettings(next) { settings = structuredClone(next); return structuredClone(settings); },
+  };
+  const controller = await GenerationSourceController.create(repository, { close() {} });
+  controller.change('sourceKind', 'custom');
+  assert.equal(controller.snapshot().submitDisabled, true);
+  await controller.submit();
+  assert.equal(settings.globalAssignments.generation.resourceId, 'tavern:active');
+  assert.equal(controller.snapshot().status?.tone, 'error');
 });
 
 test('LLM browser repository summary policy keeps semantic metadata and excludes prompts, responses and credentials', async () => {
@@ -193,12 +251,13 @@ test('LLM browser repository summary policy keeps semantic metadata and excludes
   const secrets = new MemorySecrets();
   const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.ready();
-  const expectedDefaults = { enabled: true, generationSource: 'tavern', streamingEnabled: true, maxRequestsPerMinute: 0, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
+  const expectedDefaults = { enabled: true, streamingEnabled: true, maxRequestsPerMinute: 0, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
   const initialSettings = await repository.loadSettings();
   assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
   assert.equal(Object.hasOwn(initialSettings, 'resources'), false);
-  await repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', apiType: 'auto', label: 'Plain', enabled: false }] });
+  await assert.rejects(repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', apiType: 'auto', label: 'Plain', model: 'plain-model', enabled: false }] }), { code: 'INVALID_PAYLOAD' });
+  await repository.saveSettings({ ...initialSettings, resources: [{ id: 'plain-resource', type: 'generation', source: 'custom', apiType: 'generic', label: 'Plain', model: 'plain-model', enabled: false }] });
   assert.equal(Object.hasOwn((await repository.loadSettings()).resources[0], 'customParams'), false);
   await repository.saveSettings({ enabled: true, globalProfile: 'economy', maxTokensMode: 'manual', maxTokens: 4096 });
   assert.equal((await repository.loadSettings()).globalProfile, 'economy');
@@ -226,15 +285,14 @@ test('LLM browser repository summary policy keeps semantic metadata and excludes
       && error?.details?.reasonCode === 'INVALID_PAYLOAD'
       && error?.details?.stage === 'llm.settings.validate',
   );
-  await repository.saveSettings({ resources: [{ id: 'http', type: 'generation', source: 'custom', apiType: 'openai', label: 'HTTP', baseUrl: 'http://provider.example', enabled: false }] });
-  await assert.rejects(repository.saveSettings({ resources: [{ id: 'unsafe-url', type: 'generation', source: 'custom', apiType: 'openai', label: 'Unsafe', baseUrl: 'https://user:pass@provider.example/v1?token=secret', enabled: false }] }), { code: 'INVALID_PAYLOAD' });
+  await repository.saveSettings({ resources: [{ id: 'http', type: 'generation', source: 'custom', apiType: 'openai', label: 'HTTP', baseUrl: 'http://provider.example', model: 'http-model', enabled: false }] });
+  await assert.rejects(repository.saveSettings({ resources: [{ id: 'unsafe-url', type: 'generation', source: 'custom', apiType: 'openai', label: 'Unsafe', baseUrl: 'https://user:pass@provider.example/v1?token=secret', model: 'unsafe-model', enabled: false }] }), { code: 'INVALID_PAYLOAD' });
   assert.equal((await repository.listSecrets()).length, 1);
-  await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom' });
   const exported = await repository.exportConfig();
-  assert.equal(exported.archive.settings.generationSource, 'custom');
+  assert.equal(Object.hasOwn(exported.archive.settings, 'generationSource'), false);
   assert.equal(JSON.stringify(exported).includes('secret-value'), false);
   await repository.importConfig(exported.archive, exported.sha256);
-  assert.equal((await repository.loadSettings()).generationSource, 'custom');
+  assert.equal(Object.hasOwn(await repository.loadSettings(), 'generationSource'), false);
   assert.equal(await repository.hasResourceSecret('resource-test'), false);
   await repository.clearAll();
   assert.equal(await repository.hasResourceSecret('resource-test'), false);
@@ -303,11 +361,19 @@ test('tool capability snapshots are strictly persisted without provider payloads
   assert.ok(workspace.collections.includes('tool-capabilities'));
   const capability = {
     status: 'failed', resourceId: 'tool-resource', model: 'tool-model', dialect: 'openai_chat_compatible',
-    parallelToolCalls: false, streamingToolCalls: false, strictToolSchema: 'none', reasoningReplay: 'none',
-    verifiedAt: 1_700_000_000_000, expiresAt: 1_700_000_600_000, probeVersion: 2, failureCode: 'LLM_MODEL_PROBE_FAILED',
+    parallelToolCalls: false, streamingToolCalls: 'whole_call', strictToolSchema: 'unsupported', reasoningReplay: 'none',
+    verifiedAt: 1_700_000_000_000, expiresAt: 1_700_000_600_000, probeVersion: 2,
+    failure: { reasonCode: 'LLM_MODEL_PROBE_FAILED', stage: 'llm.tools.capability_probe', requestId: 'request:probe', resourceId: 'tool-resource', model: 'tool-model' },
   };
   await repository.saveToolCapability('fnv1a64:0123456789abcdef', capability);
+  workspace.records.set('tool-capabilities:fnv1a64:fedcba9876543210', {
+    id: 'fnv1a64:fedcba9876543210',
+    value: { ...capability, failure: undefined, failureCode: 'PROVIDER_UNAVAILABLE' },
+    revision: 1,
+    updatedAt: Date.now(),
+  });
   assert.deepEqual(await repository.listToolCapabilities(), [{ cacheKey: 'fnv1a64:0123456789abcdef', capability }]);
+  assert.equal(workspace.records.has('tool-capabilities:fnv1a64:fedcba9876543210'), false, 'invalid cache rows must be removed without blocking valid snapshots');
   assert.doesNotMatch(JSON.stringify(workspace.records.get('tool-capabilities:fnv1a64:0123456789abcdef')?.value), /api[_-]?key|authorization|provider response/iu);
   await assert.rejects(repository.saveToolCapability('unsafe-key', capability), { code: 'INVALID_PAYLOAD' });
 
@@ -503,7 +569,7 @@ test('config import is atomic and resource deletion removes its credential in on
   const workspace = new MemoryWorkspace();
   const secrets = new MemorySecrets();
   const repository = new LlmWorkspaceRepository(workspace, secrets);
-  await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', apiType: 'auto', label: 'A', enabled: false }] });
+  await repository.saveSettings({ enabled: true, globalProfile: 'economy', resources: [{ id: 'resource-a', type: 'generation', source: 'custom', apiType: 'generic', label: 'A', model: 'model-a', enabled: false }] });
   await repository.setResourceSecret('resource-a', 'secret-value');
   await repository.saveResourceHealth({
     resourceId: 'resource-a',
@@ -549,7 +615,7 @@ test('resource deletion restores the credential when the Workspace commit fails 
   const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.saveSettings({
     enabled: true,
-    resources: [{ id: 'resource-compensated', type: 'generation', source: 'custom', apiType: 'openai', label: 'Compensated', enabled: false }],
+    resources: [{ id: 'resource-compensated', type: 'generation', source: 'custom', apiType: 'openai', label: 'Compensated', model: 'compensated-model', enabled: false }],
   });
   await repository.setResourceSecret('resource-compensated', 'secret-value', { label: 'Compensated' });
   workspace.failNextTransaction = true;
@@ -611,7 +677,7 @@ test('runtime preparation failure leaves persisted settings and the active runti
   handlers.dispose?.();
 });
 
-test('generation source hot-switches Tavern to custom and back without crossing the source gate', async () => {
+test('execution defaults switch between the dynamic Tavern resource and an explicit custom resource', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
   globalThis.fetch = async (input) => {
@@ -642,23 +708,25 @@ test('generation source hot-switches Tavern to custom and back without crossing 
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'one' }] }, signal)).text, 'tavern-ok');
     tavernCurrent = { provider: 'novel' };
-    const providerOnly = await handlers.capabilityStatus({ checks: [{ id: 'generation', taskKey: 'completion', taskKind: 'generation' }] }, signal);
-    assert.deepEqual(providerOnly.checks[0], { id: 'generation', source: 'tavern', configured: true, available: true });
+    const providerOnly = await handlers.taskStatus({}, 'ss-helper.memory');
+    assert.equal(providerOnly.resources.find((item) => item.resourceId === 'tavern:active')?.available, true);
 
     const resource = { id: 'custom-generation', type: 'generation', source: 'custom', apiType: 'openai', label: 'Custom', baseUrl: 'https://provider.example/v1', model: 'custom-model', enabled: true, capabilities: ['chat', 'json'] };
-    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom', resources: [resource], globalAssignments: { generation: { resourceId: resource.id } } });
+    const currentSettings = await repository.loadSettings();
+    await repository.saveSettings({ ...currentSettings, resources: [resource], globalAssignments: { ...(currentSettings.globalAssignments ?? {}), generation: { resourceId: resource.id } } });
     await assert.rejects(handlers.completion({ messages: [{ role: 'user', content: 'missing key' }] }, signal));
-    const unavailable = await handlers.capabilityStatus({ checks: [{ id: 'generation', taskKey: 'completion', taskKind: 'generation' }] }, signal);
-    assert.deepEqual(unavailable.checks[0], { id: 'generation', source: 'custom', configured: false, available: false, reason: 'credential_missing' });
+    const unavailable = await handlers.taskStatus({}, 'ss-helper.memory');
+    assert.equal(unavailable.resources.find((item) => item.resourceId === resource.id)?.available, false);
     await repository.setResourceSecret(resource.id, 'runtime-secret');
     assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'two' }] }, signal)).text, 'custom-ok');
-    const routing = await handlers.getTaskRouting({ taskKeys: [] }, 'ss-helper.memory');
+    const routing = await handlers.taskStatus({}, 'ss-helper.memory');
     assert.equal(routing.resources.find((item) => item.resourceId === resource.id)?.capabilities.includes('tools'), true);
 
-    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'tavern' });
-    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'three' }], route: resource.id }, signal)).text, 'tavern-ok');
+    const customSettings = await repository.loadSettings();
+    await repository.saveSettings({ ...customSettings, globalAssignments: { ...(customSettings.globalAssignments ?? {}), generation: { resourceId: 'tavern:active' } } });
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'three' }] }, signal)).text, 'tavern-ok');
     assert.deepEqual(calls.map((call) => call.kind), ['tavern', 'custom', 'tavern']);
-    assert.equal((await repository.loadSettings()).globalAssignments.generation.resourceId, resource.id, 'custom assignment remains stored');
+    assert.equal((await repository.loadSettings()).globalAssignments.generation.resourceId, 'tavern:active');
   } finally {
     handlers.dispose?.();
     globalThis.fetch = originalFetch;
@@ -690,10 +758,10 @@ test('event listener failures cannot turn an applied generation source change in
   try {
     await repository.ready();
     await new Promise((resolve) => setTimeout(resolve, 20));
-    await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'custom' });
-    const saved = await repository.saveSettings({ ...(await repository.loadSettings()), generationSource: 'tavern' });
-    assert.equal(saved.generationSource, 'tavern');
-    assert.equal((await repository.loadSettings()).generationSource, 'tavern');
+    await repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'economy' });
+    const saved = await repository.saveSettings({ ...(await repository.loadSettings()), globalProfile: 'precise' });
+    assert.equal(saved.globalProfile, 'precise');
+    assert.equal((await repository.loadSettings()).globalProfile, 'precise');
     assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'still applied' }] }, signal)).text, 'tavern-ok');
   } finally {
     handlers.dispose?.();
@@ -755,7 +823,7 @@ test('Provider HTTP failures expose a safe code without returning response bodie
     await assert.rejects(
       provider.request({ messages: [{ role: 'user', content: 'hello' }] }),
       (error) => error?.code === 'CORE_UNAVAILABLE'
-        && error?.details?.reasonCode === 'PROVIDER_UNAVAILABLE'
+        && error?.details?.reasonCode === 'PROVIDER_SERVICE_UNAVAILABLE'
         && !String(error).includes('provider-secret-error-body'),
     );
     provider.dispose?.();

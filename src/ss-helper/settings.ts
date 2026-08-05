@@ -12,6 +12,7 @@ const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', nam
 export const LLM_REQUEST_LOGS_POPUP = popup('request-logs');
 export const LLM_RESOURCE_WIZARD_POPUP = popup('resource-wizard');
 export const LLM_RESOURCE_MANAGER_POPUP = popup('resource-manager');
+export const LLM_GENERATION_SOURCE_POPUP = popup('generation-source');
 
 export const LLM_SETTINGS_SCHEMA = {
     id: 'ss-helper.llm',
@@ -21,12 +22,12 @@ export const LLM_SETTINGS_SCHEMA = {
             { kind: 'section', id: 'startStatus', label: '服务状态', children: [
                 { kind: 'toggle', id: 'enabled', label: '启用 LLM', description: '开启AI服务。', defaultValue: DEFAULT_LLM_SETTINGS.enabled },
                 { kind: 'status', id: 'tavernStatus', label: '大语言模型', description: '显示酒馆正在使用的来源和模型，不需要额外配置。', value: '正在连接', tone: 'neutral' },
+                { kind: 'status', id: 'generationSourceStatus', label: '默认生成来源', description: '普通生成、结构化和 Agent 的自动路由使用此来源；任务级显式分配仍优先。', value: '正在同步', tone: 'neutral' },
                 { kind: 'status', id: 'generationStatus', label: '生成服务', description: '当前生成路由状态。', value: '正在同步', tone: 'neutral' },
                 { kind: 'status', id: 'embeddingStatus', label: '向量服务', description: '当前向量资源状态。', value: '正在同步', tone: 'neutral' },
                 { kind: 'status', id: 'rerankStatus', label: '重排服务', description: '当前重排资源状态。', value: '正在同步', tone: 'neutral' },
             ] },
             { kind: 'section', id: 'generationPreferences', label: '生成偏好', children: [
-                { kind: 'select', id: 'generationSource', label: '模型来源', description: '仅影响大语言模型生成；向量化和重排序始终使用自定义 API。', options: [{ value: 'tavern', label: '酒馆当前模型' }, { value: 'custom', label: '自定义 API' }], defaultValue: DEFAULT_LLM_SETTINGS.generationSource },
                 { kind: 'select', id: 'globalProfile', label: '回答风格', description: '选择回答偏好。均衡适合大多数情况。', options: [{ value: 'balanced', label: '均衡' }, { value: 'precise', label: '精确' }, { value: 'creative', label: '创意' }, { value: 'economy', label: '省用' }], defaultValue: DEFAULT_LLM_SETTINGS.globalProfile },
                 { kind: 'select', id: 'maxTokensMode', label: '输出长度', description: '自动按内容决定长度；手动可以设置最大值。', options: [{ value: 'inherit', label: '跟随模型' }, { value: 'adaptive', label: '自动估算' }, { value: 'manual', label: '手动上限' }], defaultValue: DEFAULT_LLM_SETTINGS.maxTokensMode },
                 { kind: 'number', id: 'maxTokens', label: '手动最大长度', description: '仅在选择手动上限时使用。', defaultValue: DEFAULT_LLM_SETTINGS.maxTokens, validation: { min: 1, max: 32768 }, step: 128, unit: 'tokens', showStepper: true },
@@ -35,6 +36,9 @@ export const LLM_SETTINGS_SCHEMA = {
                 { kind: 'toggle', id: 'streamingEnabled', label: '流式响应', description: '控制自定义 API 的普通生成、结构化请求和 Agent 工具调用；酒馆当前模型沿用酒馆设置。', defaultValue: DEFAULT_LLM_SETTINGS.streamingEnabled },
                 { kind: 'number', id: 'maxRequestsPerMinute', label: '请求速率上限', description: '限制普通请求、自动重试和 Agent 模型轮次的启动频率；0 表示不限速。', defaultValue: DEFAULT_LLM_SETTINGS.maxRequestsPerMinute, validation: { min: 0, max: 60000 }, step: 1, unit: '次/分钟', showStepper: true },
                 { kind: 'number', id: 'timeoutMs', label: '请求超时', description: '超过这个时间仍未完成时停止请求。', defaultValue: DEFAULT_LLM_SETTINGS.timeoutMs, validation: { min: 1000, max: 300000 }, step: 1000, unit: '毫秒', showStepper: true },
+            ] },
+            { kind: 'section', id: 'sourceConfiguration', label: '模型来源', children: [
+                { kind: 'action', id: 'generationSourceConfig', label: '默认生成来源', description: '选择酒馆当前连接或已添加的自定义生成 API。', actionId: 'open-generation-source', placement: 'inline', buttonLabel: '设置', popup: LLM_GENERATION_SOURCE_POPUP },
             ] },
         ] },
         { kind: 'section', id: 'resources', label: '资源', children: [
@@ -89,7 +93,6 @@ function toSettingsValues(settings: LLMHubSettings): SettingsValues {
     const logging = settings.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
     return {
         enabled: settings.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
-        generationSource: settings.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
         streamingEnabled: settings.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
         maxRequestsPerMinute: settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: settings.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
@@ -114,9 +117,6 @@ function applySettingsValues(current: LLMHubSettings, values: SettingsValues): L
     return {
         ...current,
         enabled: typeof values.enabled === 'boolean' ? values.enabled : current.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
-        generationSource: values.generationSource === 'custom' || values.generationSource === 'tavern'
-            ? values.generationSource
-            : current.generationSource ?? DEFAULT_LLM_SETTINGS.generationSource,
         streamingEnabled: typeof values.streamingEnabled === 'boolean' ? values.streamingEnabled : current.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
         maxRequestsPerMinute: typeof values.maxRequestsPerMinute === 'number' ? values.maxRequestsPerMinute : current.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: typeof values.globalProfile === 'string' ? values.globalProfile : current.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
@@ -144,16 +144,6 @@ function applySettingsValues(current: LLMHubSettings, values: SettingsValues): L
 }
 
 export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceRepository, statusSource: LlmSettingsStatusSource, notify?: (notification: ToastNotification) => void): SettingsAdapter {
-    let generationSource: 'tavern' | 'custom' | undefined;
-    const sourceOf = (values: SettingsValues): 'tavern' | 'custom' => values.generationSource === 'custom' ? 'custom' : 'tavern';
-    const warnIfSelectedSourceUnavailable = async (): Promise<void> => {
-        try {
-            await statusSource.refreshNow();
-            const status = await statusSource.loadStatus();
-            if (status.generationStatus?.tone !== 'error') return;
-            notify?.({ level: 'warning', title: '模型来源不可用', message: '所选大语言模型来源当前不可用，请检查酒馆连接或自定义资源配置。', code: 'LLM_GENERATION_SOURCE_UNAVAILABLE', durationMs: 4200 });
-        } catch { /* Status and toast are best effort after the setting has committed. */ }
-    };
     const reportSaveFailure = (failure: unknown): void => {
         const code = failure && typeof failure === 'object' && 'code' in failure && typeof failure.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(failure.code)
             ? failure.code
@@ -161,20 +151,16 @@ export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceReposi
         try { notify?.({ level: 'error', title: '设置保存失败', message: `模型来源设置未能保存（${code}），请检查运行状态。`, code, durationMs: 5200 }); } catch { /* Keep the original save failure authoritative. */ }
     };
     return {
-        async load(): Promise<SettingsValues> { const loaded = toSettingsValues(await repository.loadSettings()); generationSource = sourceOf(loaded); return loaded; },
+        async load(): Promise<SettingsValues> { return toSettingsValues(await repository.loadSettings()); },
         async save(values): Promise<void> {
-            const nextSource = sourceOf(values);
-            const sourceChanged = generationSource !== undefined && generationSource !== nextSource;
             let saved: SettingsValues;
             try {
-                const current = await repository.loadSettings();
-                saved = toSettingsValues(await repository.saveSettings(applySettingsValues(current, values) as LLMHubSettings & Record<string, unknown>));
+                saved = toSettingsValues(await repository.updateSettings((current) => applySettingsValues(current, values) as LLMHubSettings & Record<string, unknown>));
             }
             catch (failure) { reportSaveFailure(failure); throw failure; }
-            generationSource = sourceOf(saved);
-            if (sourceChanged) void warnIfSelectedSourceUnavailable();
+            void saved;
         },
-        async reset(): Promise<SettingsValues> { const reset = toSettingsValues(await repository.reset()); generationSource = sourceOf(reset); return reset; },
+        async reset(): Promise<SettingsValues> { return toSettingsValues(await repository.reset()); },
         subscribe: (listener) => repository.subscribeSettings((settings) => listener(toSettingsValues(settings))),
         loadStatus: () => statusSource.loadStatus(),
         subscribeStatus: (listener) => statusSource.subscribeStatus(listener),

@@ -29,23 +29,23 @@ export function validateZodSchema<T>(data: any, schema: ZodType<T>): ValidationR
 }
 
 /** Strictly parses one JSON root object without cleaning, stitching, or fence extraction. */
-export function parseJsonOutput(raw: string | object): { ok: boolean; data: any; error?: string } {
+export function parseJsonOutput(raw: string | object): { ok: boolean; data: any } {
     if (raw && typeof raw === 'object') {
         return Array.isArray(raw)
-            ? { ok: false, data: null, error: '结构化输出必须是唯一根对象，不能是根数组' }
+            ? { ok: false, data: null }
             : { ok: true, data: raw };
     }
     if (!raw || typeof raw !== 'string') {
-        return { ok: false, data: null, error: '返回内容为空或格式非字符串' };
+        return { ok: false, data: null };
     }
 
     try {
         const parsed = JSON.parse(raw.trim());
         return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
             ? { ok: true, data: parsed }
-            : { ok: false, data: null, error: '结构化输出必须是唯一根对象' };
-    } catch (error) {
-        return { ok: false, data: null, error: (error as Error).message };
+            : { ok: false, data: null };
+    } catch {
+        return { ok: false, data: null };
     }
 }
 

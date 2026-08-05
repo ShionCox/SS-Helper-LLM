@@ -1,15 +1,15 @@
 import {
-    LLM_COMPLETION_V0, LLM_EMBEDDING_V0, LLM_RERANK_V0, LLM_ROUTE_CHANGED_V0, LLM_CAPABILITY_STATUS_V0,
-    LLM_TOOL_TURN_V0, LLM_TOOL_SESSION_CANCEL_V0, LLM_TASK_ROUTING_GET_V0, LLM_TASK_ROUTING_SET_V0, LLM_TOOL_CAPABILITY_VERIFY_V0,
+    LLM_COMPLETION_V0, LLM_EMBEDDING_V0, LLM_RERANK_V0,
+    LLM_TOOL_TURN_V0, LLM_TOOL_SESSION_CANCEL_V0,
     LLM_CONSUMER_DECLARE_V0, LLM_CONSUMER_RELEASE_V0,
-    LLM_STRUCTURED_TASK_V0, createSSHelperError, isSSHelperReasonCode,
+    LLM_STRUCTURED_TASK_V0, LLM_TASK_STATUS_V0, LLM_TASK_ROUTE_SET_V0, LLM_RESOURCE_CAPABILITY_VERIFY_V0, createSSHelperError, isSSHelperReasonCode, readSSHelperFailure,
     type LlmCompletionRequest, type LlmCompletionResponse, type LlmEmbeddingRequest,
     type LlmEmbeddingResponse, type LlmRerankRequest, type LlmRerankResponse,
     type LlmRouteDiagnostic, type LlmRouteDiagnosticsResponse, type LlmRouteMetadata,
-    type LlmStructuredTaskRequest, type LlmStructuredTaskResponse, type LlmCapabilityStatusRequest, type LlmCapabilityStatusResponse,
+    type LlmStructuredTaskRequest, type LlmStructuredTaskResponse,
     type LlmConsumerRegistration, type PlainData, type PluginSession, type SSHelperReasonCode,
-    type LlmToolTurnRequest, type LlmToolTurnResponse, type LlmTaskRoutingGetRequest, type LlmTaskRoutingSetRequest,
-    type LlmTaskRoutingSnapshot, type LlmToolCapabilityVerifyRequest, type LlmToolCapabilityVerifyResponse,
+    type LlmToolTurnRequest, type LlmToolTurnResponse,
+    type LlmTaskStatusRequest, type LlmTaskStatusSnapshot, type LlmTaskRouteSetRequest, type LlmResourceCapabilityVerifyRequest, type LlmResourceCapabilityVerifyResponse,
 } from '@ss-helper/sdk';
 import type { EmbedArgs, LLMRunResult, RerankArgs, RunTaskArgs } from '../schema/types';
 
@@ -22,12 +22,11 @@ export interface LlmServiceHandlers {
     readonly registerConsumer?: (request: LlmConsumerRegistration, callerPluginId: string) => void;
     readonly unregisterConsumer?: (request: { keepPersistent?: boolean }, callerPluginId: string) => void;
     readonly diagnostics: () => Promise<LlmRouteDiagnosticsResponse> | LlmRouteDiagnosticsResponse;
-    readonly capabilityStatus?: (request: LlmCapabilityStatusRequest, signal: AbortSignal, callerPluginId?: string) => Promise<LlmCapabilityStatusResponse>;
     readonly toolTurn?: (request: LlmToolTurnRequest, signal: AbortSignal, callerPluginId: string, requestId: string) => Promise<LlmToolTurnResponse>;
     readonly cancelToolSession?: (toolSessionId: string, callerPluginId: string) => boolean;
-    readonly getTaskRouting?: (request: LlmTaskRoutingGetRequest, callerPluginId: string) => Promise<LlmTaskRoutingSnapshot>;
-    readonly setTaskRouting?: (request: LlmTaskRoutingSetRequest, callerPluginId: string) => Promise<LlmTaskRoutingSnapshot>;
-    readonly verifyToolCapability?: (request: LlmToolCapabilityVerifyRequest, signal: AbortSignal, callerPluginId: string) => Promise<LlmToolCapabilityVerifyResponse>;
+    readonly taskStatus?: (request: LlmTaskStatusRequest, callerPluginId: string) => Promise<LlmTaskStatusSnapshot>;
+    readonly taskRouteSet?: (request: LlmTaskRouteSetRequest, callerPluginId: string) => Promise<LlmTaskStatusSnapshot>;
+    readonly verifyResourceCapability?: (request: LlmResourceCapabilityVerifyRequest, signal: AbortSignal, callerPluginId: string, requestId: string) => Promise<LlmResourceCapabilityVerifyResponse>;
     readonly describeTask?: (consumer: string, taskKey: string, taskKind?: 'generation' | 'embedding' | 'rerank') => { readonly consumerDisplayName?: string; readonly taskDescription: string };
     readonly dispose?: () => void;
 }
@@ -40,19 +39,34 @@ export interface LlmSdkServicePort {
 }
 
 const record = (value: unknown): Record<string, unknown> => typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-const routeFrom = (value: unknown): LlmRouteMetadata => { const meta = record(record(value).meta); return { route: String(meta.resourceId || 'default'), ...(typeof meta.resourceId === 'string' ? { provider: meta.resourceId } : {}), ...(typeof meta.model === 'string' ? { model: meta.model } : {}), ...(meta.fallbackUsed === true ? { fallback: true } : {}) }; };
+const routeFrom = (value: unknown, execution?: 'completion' | 'structured' | 'tool_turn' | 'embedding' | 'rerank'): LlmRouteMetadata => {
+    const meta = record(record(value).meta);
+    return {
+        resourceId: typeof meta.resourceId === 'string' ? meta.resourceId : 'unknown',
+        source: meta.source === 'tavern' || meta.source === 'custom' ? meta.source : 'custom',
+        provider: typeof meta.provider === 'string' ? meta.provider : 'unknown',
+        model: typeof meta.model === 'string' ? meta.model : 'unknown',
+        execution: execution ?? (meta.execution as LlmRouteMetadata['execution'] | undefined) ?? 'structured',
+        transport: typeof meta.transport === 'string' ? meta.transport : 'unknown',
+        ...(meta.resolvedBy === 'task_assignment' || meta.resolvedBy === 'execution_default' ? { resolvedBy: meta.resolvedBy } : {}),
+        ...(typeof meta.capabilityDigest === 'string' ? { capabilityDigest: meta.capabilityDigest } : {}),
+        ...(meta.reasoning && typeof meta.reasoning === 'object' ? { reasoning: meta.reasoning as LlmRouteMetadata['reasoning'] } : {}),
+    };
+};
 const requireSuccess = <T>(value: unknown): T => {
     const result = record(value);
     if (result.ok !== true) {
         const reasonCode = isSSHelperReasonCode(result.reasonCode) ? result.reasonCode : 'INTERNAL_ERROR';
+        const upstreamFailure = readSSHelperFailure(result.failure);
         const meta = record(result.meta);
         const usage = record(meta.usage);
         const inputTokens = typeof usage.promptTokens === 'number' && Number.isFinite(usage.promptTokens) && usage.promptTokens >= 0 ? usage.promptTokens : undefined;
         const outputTokens = typeof usage.completionTokens === 'number' && Number.isFinite(usage.completionTokens) && usage.completionTokens >= 0 ? usage.completionTokens : undefined;
         const totalTokens = typeof usage.totalTokens === 'number' && Number.isFinite(usage.totalTokens) && usage.totalTokens >= 0 ? usage.totalTokens : undefined;
         throw createSSHelperError(reasonCode, {
-            stage: 'llm.service.response',
-            ...(typeof meta.requestId === 'string' ? { requestId: meta.requestId } : {}),
+            ...(upstreamFailure ?? {}),
+            stage: upstreamFailure?.stage ?? 'llm.service.response',
+            ...(upstreamFailure?.requestId || typeof meta.requestId !== 'string' ? {} : { requestId: meta.requestId }),
             ...(inputTokens === undefined ? {} : { inputTokens }),
             ...(outputTokens === undefined ? {} : { outputTokens }),
             ...(totalTokens === undefined ? {} : { totalTokens }),
@@ -91,7 +105,7 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort): LlmServiceH
         diagnostics.push({
             requestId: event.requestId,
             state,
-            ...(event.resourceId === undefined ? {} : { route: { route: event.resourceId, provider: event.resourceId, ...(event.model === undefined ? {} : { model: event.model }) } }),
+            ...(event.resourceId === undefined ? {} : { route: { resourceId: event.resourceId, source: 'custom', provider: 'unknown', model: event.model ?? 'unknown', execution: 'structured', transport: 'unknown' } }),
             ...(event.reasonCode === undefined ? {} : {
                 failure: {
                     reasonCode: event.reasonCode,
@@ -119,19 +133,16 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort): LlmServiceH
     };
     const run = <T>(args: RunTaskArgs, signal: AbortSignal): Promise<LLMRunResult<T>> => invoke(signal, (onLifecycle) => sdk.runTask<T>({ ...args, signal, onLifecycle }));
     return {
-        completion: async (request, signal, callerPluginId, requestId) => { const result = requireSuccess<Extract<LLMRunResult<unknown>, { ok: true }>>(await run({ consumer: callerPluginId || 'ss-helper.llm.contract', taskKey: 'completion', taskKind: 'generation', input: { messages: request.messages }, trace: request.trace, routeHint: request.route === undefined ? undefined : { resource: request.route }, budget: { maxTokens: request.maxTokens }, enqueue: { requestId } }, signal)); const data = record(result.data); return { requestId: String(requestId), text: typeof result.data === 'string' ? result.data : String(data.text ?? data.content ?? ''), route: String(result.meta.resourceId), model: String(result.meta.model ?? result.meta.resourceId), provider: result.meta.resourceId, ...(result.meta.fallbackUsed === undefined ? {} : { finishReason: result.meta.fallbackUsed ? 'fallback' : 'stop' }) }; },
+        completion: async (request, signal, callerPluginId, requestId) => { const result = requireSuccess<Extract<LLMRunResult<unknown>, { ok: true }>>(await run({ consumer: callerPluginId || 'ss-helper.llm.contract', taskKey: 'completion', taskKind: 'generation', execution: 'completion', input: { messages: request.messages }, trace: request.trace, budget: { maxTokens: request.maxTokens }, enqueue: { requestId } }, signal)); const data = record(result.data); return { requestId: String(requestId ?? result.meta.requestId), text: typeof result.data === 'string' ? result.data : String(data.text ?? data.content ?? ''), route: routeFrom(result, 'completion'), finishReason: 'stop' }; },
         runTask: async (request, signal, callerPluginId, requestId) => {
             const result = requireSuccess<Extract<LLMRunResult<PlainData>, { ok: true }>>(await run({
                 consumer: callerPluginId || 'ss-helper.llm.contract',
                 taskKey: request.task,
                 taskKind: 'generation',
+                execution: 'structured',
                 trace: request.trace,
                 input: request.input,
                 schema: request.outputSchema,
-                routeHint: request.route === undefined && request.model === undefined ? undefined : {
-                    ...(request.route === undefined ? {} : { resource: request.route }),
-                    ...(request.model === undefined ? {} : { model: request.model }),
-                },
                 budget: request.timeoutMs === undefined ? undefined : { maxLatencyMs: request.timeoutMs },
                 enqueue: {
                     requestId,
@@ -142,7 +153,7 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort): LlmServiceH
             return {
                 requestId: String(requestId),
                 output: result.data,
-                route: routeFrom(result),
+                route: routeFrom(result, 'structured'),
                 diagnostics: {
                     transport: result.meta.transport ?? 'prompt_only',
                     attemptCount: result.meta.attemptCount ?? 1,
@@ -165,12 +176,11 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort): LlmServiceH
                 trace: request.trace,
                 texts: typeof request.input === 'string' ? [request.input] : [...request.input],
                 ...(request.dimensions === undefined ? {} : { dimensions: request.dimensions }),
-                routeHint: { ...(request.route === undefined ? {} : { resource: request.route }), ...(request.model === undefined ? {} : { model: request.model }) },
                 enqueue: { requestId }, signal, onLifecycle,
             })));
             const vectors = raw.vectors;
             if (!Array.isArray(vectors)) throw createSSHelperError('PROVIDER_RESPONSE_INVALID', { stage: 'llm.service.embedding', requestId });
-            return { requestId: String(requestId), embeddings: vectors as readonly (readonly number[])[], route: routeFrom(raw) };
+            return { requestId: String(requestId), embeddings: vectors as readonly (readonly number[])[], route: routeFrom(raw, 'embedding') };
         },
         rerank: async (request, signal, callerPluginId, requestId) => {
             const raw = requireSuccess<Record<string, unknown>>(await invoke(signal, (onLifecycle) => sdk.rerank({
@@ -180,10 +190,9 @@ export function createLlmSdkServiceHandlers(sdk: LlmSdkServicePort): LlmServiceH
                 query: request.query,
                 docs: request.documents.map((item) => item.text),
                 topK: request.topN,
-                routeHint: { ...(request.route === undefined ? {} : { resource: request.route }), ...(request.model === undefined ? {} : { model: request.model }) },
                 enqueue: { requestId }, signal, onLifecycle,
             })));
-            const route = routeFrom(raw);
+            const route = routeFrom(raw, 'rerank');
             const results = Array.isArray(raw.results) ? raw.results : [];
             return {
                 requestId: String(requestId),
@@ -215,15 +224,14 @@ export function exposeLlmServices(session: PluginSession, handlers: LlmServiceHa
             handlers.unregisterConsumer?.(request, context.callerPluginId);
             return { ok: true as const };
         }),
-        ...(handlers.capabilityStatus === undefined ? [] : [session.bus.handle(LLM_CAPABILITY_STATUS_V0, (request, context) => handlers.capabilityStatus!(request, context.signal, context.callerPluginId))]),
         ...(handlers.toolTurn === undefined ? [] : [session.bus.handle(LLM_TOOL_TURN_V0, (request, context) => handlers.toolTurn!(request, context.signal, context.callerPluginId, context.requestId))]),
         ...(handlers.cancelToolSession === undefined ? [] : [session.bus.handle(LLM_TOOL_SESSION_CANCEL_V0, (request, context) => {
             handlers.cancelToolSession!(request.toolSessionId, context.callerPluginId);
             return { ok: true as const };
         })]),
-        ...(handlers.getTaskRouting === undefined ? [] : [session.bus.handle(LLM_TASK_ROUTING_GET_V0, (request, context) => handlers.getTaskRouting!(request, context.callerPluginId))]),
-        ...(handlers.setTaskRouting === undefined ? [] : [session.bus.handle(LLM_TASK_ROUTING_SET_V0, (request, context) => handlers.setTaskRouting!(request, context.callerPluginId))]),
-        ...(handlers.verifyToolCapability === undefined ? [] : [session.bus.handle(LLM_TOOL_CAPABILITY_VERIFY_V0, (request, context) => handlers.verifyToolCapability!(request, context.signal, context.callerPluginId))]),
+        ...(handlers.taskStatus === undefined ? [] : [session.bus.handle(LLM_TASK_STATUS_V0, (request, context) => handlers.taskStatus!(request, context.callerPluginId))]),
+        ...(handlers.taskRouteSet === undefined ? [] : [session.bus.handle(LLM_TASK_ROUTE_SET_V0, (request, context) => handlers.taskRouteSet!(request, context.callerPluginId))]),
+        ...(handlers.verifyResourceCapability === undefined ? [] : [session.bus.handle(LLM_RESOURCE_CAPABILITY_VERIFY_V0, (request, context) => handlers.verifyResourceCapability!(request, context.signal, context.callerPluginId, context.requestId))]),
     ];
     let disposed = false;
     return () => {
@@ -232,8 +240,4 @@ export function exposeLlmServices(session: PluginSession, handlers: LlmServiceHa
         cleanups.reverse().forEach((cleanup) => cleanup());
         handlers.dispose?.();
     };
-}
-
-export function publishRouteChanged(session: PluginSession, previousRoute: string | undefined, route: string, reason: 'configured' | 'fallback' | 'availability'): void {
-    session.bus.publish(LLM_ROUTE_CHANGED_V0, { previousRoute, route, reason });
 }

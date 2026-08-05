@@ -34,8 +34,6 @@ const ATTEMPT_PHASE_LABEL: Record<string, string> = {
     initial: '首次请求',
     schema_repair: 'Schema 修复',
     transient_retry: '瞬态重试',
-    route_fallback: '备用路由',
-    transport_fallback: '传输降级',
 };
 
 export function asRecord(value: PlainData | unknown): LogRow {

@@ -38,8 +38,8 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
   const registry = new ConsumerRegistry();
   const router = new TaskRouter();
   router.setRegistry(registry);
-  router.applyGenerationSource('custom');
   router.registerProvider(provider, 'generation', ['chat', 'json'], 'fixture-model');
+  router.applyExecutionDefaults({ structured: provider.id });
   registry.registerConsumer({
     pluginId: 'ss-helper.memory',
     displayName: 'Memory',
@@ -50,7 +50,6 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
       taskKind: 'generation',
       requiredCapabilities: ['chat', 'json'],
       structuredPolicy,
-      recommendedRoute: { resourceId: provider.id },
     }],
   });
   const logs = new RequestLogService();
@@ -254,7 +253,7 @@ for (const scenario of [
     preferred: 'json_object',
   },
 ]) {
-  test(`${scenario.name} falls back to prompt-only and caches the unsupported transport`, async () => {
+  test(`${scenario.name} fails without transport fallback`, async () => {
     const { sdk, calls, provider } = fixture();
     provider.capabilities.structuredOutput = {
       transports: scenario.transports,
@@ -291,14 +290,15 @@ for (const scenario of [
       enqueue: { requestId },
     });
 
-    const first = await run(`fallback-${scenario.preferred}-1`);
-    assert.equal(first.ok, true, JSON.stringify(first));
-    assert.deepEqual(calls.map(call => call.structuredOutput.transport), [scenario.preferred, 'prompt_only']);
-    assert.equal(first.meta.transport, 'prompt_only');
+    const first = await run(`no-fallback-${scenario.preferred}-1`);
+    assert.equal(first.ok, false, JSON.stringify(first));
+    assert.equal(first.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
+    assert.deepEqual(calls.map(call => call.structuredOutput.transport), [scenario.preferred]);
 
     calls.length = 0;
-    const second = await run(`fallback-${scenario.preferred}-2`);
-    assert.equal(second.ok, true, JSON.stringify(second));
-    assert.deepEqual(calls.map(call => call.structuredOutput.transport), ['prompt_only']);
+    const second = await run(`no-fallback-${scenario.preferred}-2`);
+    assert.equal(second.ok, false, JSON.stringify(second));
+    assert.equal(second.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
+    assert.deepEqual(calls.map(call => call.structuredOutput.transport), [scenario.preferred]);
   });
 }

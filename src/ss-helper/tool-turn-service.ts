@@ -2,9 +2,11 @@ import {
     createSSHelperError,
     readSSHelperFailure,
     type LlmMessage,
-    type LlmToolCapabilityVerifyResponse,
     type LlmToolTurnRequest,
     type LlmToolTurnResponse,
+    type LlmStructuredItemRejection,
+    type LlmStructuredValidationIssue,
+    type LlmReasoningPolicy,
     type PlainData,
     type ProviderPrivacyPolicy,
     type VerifiedToolCapabilities,
@@ -17,14 +19,19 @@ import { ToolCapabilityProbe, TOOL_CAPABILITY_PROBE_VERSION } from '../tools/too
 import { ToolCapabilityCache, capabilityCacheKey, endpointDigest } from '../tools/tool-capability-cache';
 import { ToolSchemaCompiler } from '../tools/tool-schema-compiler';
 import { ToolSessionManager, type ManagedToolStep, type ToolSessionScope } from '../tools/tool-session-manager';
-import { validateJsonSchema } from '../schema/json-schema-validator';
+import { validateJsonSchema, validateJsonSchemaItemized } from '../schema/json-schema-validator';
 import { buildStructuredOutputSystemInstruction } from '../schema/structured-output';
 import { RequestLogService } from '../log/requestLogService';
 import { RequestRateLimiter } from '../runtime/request-rate-limiter';
+import { DEFAULT_REASONING_POLICY } from '../providers/reasoning-policy';
+
+interface ToolCapabilityVerification { readonly capability: VerifiedToolCapabilities; }
 
 export interface ToolTurnResourceResolver {
     getResource(resourceId: string): ResourceConfig | undefined;
     getStreamingEnabled?(): boolean;
+    getReasoningPolicy?(resourceId: string): LlmReasoningPolicy | undefined;
+    getReasoningCapabilityDigest?(resourceId: string, model?: string): string | undefined;
 }
 
 export interface ToolCapabilityStore {
@@ -46,7 +53,7 @@ export class LlmToolTurnService {
     private readonly sessions = new ToolSessionManager();
     private hydration: Promise<void> | undefined;
     private hydrated = false;
-    private readonly verificationInFlight = new Map<string, Promise<LlmToolCapabilityVerifyResponse>>();
+    private readonly resourceEpochs = new Map<string, number>();
 
     constructor(
         private readonly router: TaskRouter,
@@ -60,48 +67,54 @@ export class LlmToolTurnService {
         void this.ensureHydrated();
     }
 
-    async verify(resourceId: string, model: string | undefined, force: boolean, signal: AbortSignal): Promise<LlmToolCapabilityVerifyResponse> {
+    async verify(resourceId: string, model: string | undefined, force: boolean, requestId: string, signal: AbortSignal, reasoning?: LlmReasoningPolicy): Promise<ToolCapabilityVerification> {
         await this.ensureHydrated();
         const resolved = this.resolveProvider(resourceId, model);
-        const key = this.cacheKey(resolved.resource, resolved.model, resolved.adapter.version);
+        const activeReasoning = reasoning ?? this.resources.getReasoningPolicy?.(resourceId) ?? DEFAULT_REASONING_POLICY;
+        const key = this.cacheKey(resolved.resource, resolved.model, resolved.adapter.version, activeReasoning);
         const cached = force ? undefined : this.cache.get(key);
         if (cached) return { capability: cached };
-        const active = this.verificationInFlight.get(key);
-        if (active) return active;
-        const operation = (async (): Promise<LlmToolCapabilityVerifyResponse> => {
-            const capability = await this.probe.verify({
-                resourceId,
-                model: resolved.model,
-                adapter: resolved.adapter,
-                privacyPolicy: resolved.privacyPolicy,
-                signal,
-                beforeRequest: () => this.requestRateLimiter.acquire(signal),
-            });
-            if (this.store !== undefined) {
-                try {
-                    await this.store.saveToolCapability(key, capability);
-                } catch (error) {
-                    this.cache.invalidateResource(resourceId);
-                    await this.store.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
-                    throw error;
-                }
+        const epoch = this.resourceEpochs.get(resourceId) ?? 0;
+        const capability = await this.probe.verify({
+            resourceId,
+            model: resolved.model,
+            requestId,
+            adapter: resolved.adapter,
+            privacyPolicy: resolved.privacyPolicy,
+            signal,
+            beforeRequest: () => this.requestRateLimiter.acquire(signal),
+            reasoning: activeReasoning,
+        });
+        if (epoch !== (this.resourceEpochs.get(resourceId) ?? 0)) {
+            await this.store?.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
+            throw createSSHelperError('LLM_TOOL_CAPABILITY_UNVERIFIED', { stage: 'llm.tools.capability_probe.stale', requestId, resourceId, model: resolved.model });
+        }
+        if (this.store !== undefined) {
+            try {
+                await this.store.saveToolCapability(key, capability);
+            } catch (error) {
+                this.cache.invalidateResource(resourceId);
+                await this.store.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
+                throw error;
             }
-            return { capability: this.cache.set(key, capability) };
-        })();
-        this.verificationInFlight.set(key, operation);
-        try { return await operation; }
-        finally { if (this.verificationInFlight.get(key) === operation) this.verificationInFlight.delete(key); }
+        }
+        if (epoch !== (this.resourceEpochs.get(resourceId) ?? 0)) {
+            await this.store?.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
+            throw createSSHelperError('LLM_TOOL_CAPABILITY_UNVERIFIED', { stage: 'llm.tools.capability_probe.stale', requestId, resourceId, model: resolved.model });
+        }
+        return { capability: this.cache.set(key, capability) };
     }
 
     async getCapability(resourceId: string, model?: string, includeExpired = false): Promise<VerifiedToolCapabilities | undefined> {
         await this.ensureHydrated();
         const provider = this.router.getProvider(resourceId);
         if (!provider || !isToolCapableProvider(provider)) return undefined;
-        const adapter = provider.createToolAdapter();
+        let adapter;
+        try { adapter = provider.createToolAdapter(); } catch { return undefined; }
         const resource = this.resources.getResource(resourceId);
         const resolvedModel = model ?? resource?.model ?? this.router.getDefaultModel(resourceId);
         if (!resource || !resolvedModel) return undefined;
-        const key = this.cacheKey(resource, resolvedModel, adapter.version);
+        const key = this.cacheKey(resource, resolvedModel, adapter.version, this.resources.getReasoningPolicy?.(resourceId) ?? DEFAULT_REASONING_POLICY);
         return includeExpired ? this.cache.peek(key) : this.cache.get(key);
     }
 
@@ -123,17 +136,19 @@ export class LlmToolTurnService {
             if (response.state === 'final') {
                 parsedResponse = response.output;
                 validationIssues = prepared.validationIssues;
-                if (validationIssues?.length) {
+                const partialValidation = request.validationMode === 'itemized_partial' || response.itemRejections !== undefined;
+                if (validationIssues?.length && !partialValidation) {
                     const issue = validationIssues[0];
                     throw createSSHelperError('SCHEMA_VALIDATION_FAILED', {
                         stage: 'llm.tools.turn.final_validate', requestId,
-                        resourceId: response.route.route,
+                        resourceId: response.route.resourceId,
                         model: response.route.model,
                         path: issue.path, keyword: issue.keyword, expected: issue.expected,
                     });
                 }
             }
-            const resource = this.resources.getResource(response.route.route);
+            const resourceId = response.route.resourceId;
+            const resource = resourceId === undefined ? undefined : this.resources.getResource(resourceId);
             await this.requestLogs?.recordAgentTurn({
                 request,
                 response,
@@ -143,8 +158,8 @@ export class LlmToolTurnService {
                 taskDescription: description.taskDescription,
                 requestId,
                 route: resource && (response.route.model ?? resource.model) ? this.routeSnapshot(resource, (response.route.model ?? resource.model)!) : {
-                    resourceId: response.route.route,
-                    resourceLabel: response.route.route,
+                    resourceId: resourceId ?? 'unknown',
+                    resourceLabel: resourceId ?? 'unknown',
                     model: response.route.model,
                     providerKind: response.route.provider,
                 },
@@ -236,11 +251,11 @@ export class LlmToolTurnService {
         const route = this.router.resolveRoute({
             consumer: callerPluginId,
             taskKind: 'generation',
+            execution: 'tool_turn',
             taskKey: request.task,
             requiredCapabilities: ['chat', 'tools'],
-            routeHint: request.route === undefined ? undefined : { resourceId: request.route, ...(request.model === undefined ? {} : { model: request.model }) },
         });
-        const resolved = this.resolveProvider(route.resourceId, request.model ?? route.model);
+        const resolved = this.resolveProvider(route.resourceId, route.model);
         const capability = await this.getCapability(route.resourceId, resolved.model);
         if (!capability || capability.status !== 'verified' || (capability.expiresAt !== undefined && capability.expiresAt <= Date.now())) {
             throw createSSHelperError('LLM_TOOL_CAPABILITY_UNVERIFIED', {
@@ -276,10 +291,13 @@ export class LlmToolTurnService {
             tools,
             outputSchema,
             privacyPolicy: resolved.privacyPolicy,
-            maxTokens: this.resolveMaxTokens(request, callerPluginId, route.profileId),
+            reasoning: this.resources.getReasoningPolicy?.(route.resourceId) ?? DEFAULT_REASONING_POLICY,
+            maxTokens: this.resolveMaxTokens(request, callerPluginId),
+            ...(request.validationMode === undefined ? {} : { validationMode: request.validationMode }),
+            ...(request.validationCollections === undefined ? {} : { validationCollections: request.validationCollections }),
             signal,
         });
-        return this.toResponse(managed, requestId, request.parentRequestId, route.resourceId, resolved.model);
+        return this.toResponse(managed, requestId, request.parentRequestId, resolved.resource, resolved.model);
     }
 
     cancel(toolSessionId: string, callerPluginId: string): boolean {
@@ -289,10 +307,12 @@ export class LlmToolTurnService {
         return this.sessions.cancel(toolSessionId);
     }
     invalidateResource(resourceId: string): void {
+        this.resourceEpochs.set(resourceId, (this.resourceEpochs.get(resourceId) ?? 0) + 1);
         this.cache.invalidateResource(resourceId);
         void this.store?.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
+        this.sessions.cancelByResource(resourceId);
     }
-    dispose(): void { this.sessions.dispose(); this.cache.clear(); }
+    dispose(): void { for (const resourceId of this.resourceEpochs.keys()) this.resourceEpochs.set(resourceId, (this.resourceEpochs.get(resourceId) ?? 0) + 1); this.sessions.dispose(); this.cache.clear(); }
 
     private async ensureHydrated(): Promise<void> {
         if (this.hydrated || this.store === undefined) {
@@ -320,10 +340,11 @@ export class LlmToolTurnService {
             taskKey: request.task,
             pipelineRunId: request.pipelineRunId,
             chatKey: request.chatKey,
-            resourceId: request.route ?? active.resourceId,
-            model: request.model ?? active.model,
+            resourceId: active.resourceId,
+            model: active.model,
         };
         const resource = this.resources.getResource(active.resourceId);
+        if (!resource) throw createSSHelperError('LLM_TOOL_SESSION_EXPIRED', { stage: 'llm.tools.turn.continue', requestId, resourceId: active.resourceId, model: active.model });
         if (resource) {
             await this.requestLogs?.recordAgentTurn({
                 phase: 'started', request, callerPluginId,
@@ -335,10 +356,10 @@ export class LlmToolTurnService {
         }
         await this.requestRateLimiter.acquire(signal, requestId);
         const managed = await this.sessions.continue(toolSessionId, scope, request.toolResults ?? [], signal);
-        return this.toResponse(managed, requestId, request.parentRequestId, active.resourceId, active.model);
+        return this.toResponse(managed, requestId, request.parentRequestId, resource, active.model);
     }
 
-    private toResponse(managed: ManagedToolStep, requestId: string, parentRequestId: string | undefined, resourceId: string, model: string): { response: LlmToolTurnResponse; validationIssues?: Array<{ path: string; keyword: string; expected: string }> } {
+    private toResponse(managed: ManagedToolStep, requestId: string, parentRequestId: string | undefined, resource: ResourceConfig, model: string): { response: LlmToolTurnResponse; validationIssues?: Array<{ path: string; keyword: string; expected: string }> } {
         const diagnostics = {
             toolSessionRound: managed.round,
             totalCalls: managed.totalCalls,
@@ -346,26 +367,49 @@ export class LlmToolTurnService {
             providerAdapterVersion: 1,
             capabilitySnapshotId: managed.capabilitySnapshotId,
         };
-        const route = { route: resourceId, provider: resourceId, model };
+        const route = {
+            resourceId: resource.id,
+            source: resource.source,
+            provider: resource.apiType,
+            model,
+            execution: 'tool_turn' as const,
+            transport: 'tool_call',
+            capabilityDigest: this.resources.getReasoningCapabilityDigest?.(resource.id, model) ?? managed.capabilitySnapshotId,
+            ...(managed.reasoningPolicy === undefined ? {} : { reasoning: managed.reasoningPolicy }),
+        };
         const usage = managed.step.usage;
         if (managed.step.state === 'tool_calls') return { response: {
             requestId, ...(parentRequestId ? { parentRequestId } : {}), state: 'tool_calls',
             toolSessionId: managed.toolSessionId!, calls: managed.step.calls, route, diagnostics,
             ...(usage ? { usage } : {}),
         } };
-        const validation = managed.outputSchema
-            ? validateJsonSchema(managed.step.output, managed.outputSchema as object)
-            : { valid: true as const };
+        const itemizedValidation = managed.outputSchema && managed.validationMode === 'itemized_partial'
+            ? validateJsonSchemaItemized(managed.step.output, managed.outputSchema as object, managed.validationCollections ?? [])
+            : undefined;
+        const validation = itemizedValidation
+            ?? (managed.outputSchema ? validateJsonSchema(managed.step.output, managed.outputSchema as object) : { valid: true as const });
+        const itemRejections: readonly LlmStructuredItemRejection[] = itemizedValidation?.valid
+            ? itemizedValidation.rejections.map(item => ({
+                collection: item.collection,
+                itemIndex: item.itemIndex,
+                issues: item.issues.map(issue => ({ path: issue.path, keyword: issue.keyword, expected: issue.expected })),
+                sourceRefs: [...item.sourceRefs],
+            }))
+            : [];
+        const validationIssues: readonly LlmStructuredValidationIssue[] = itemizedValidation?.valid
+            ? itemRejections.flatMap(item => item.issues)
+            : validation.valid
+                ? []
+                : validation.issues.map(issue => ({ path: issue.path, keyword: issue.keyword, expected: issue.expected }));
+        const output = itemizedValidation?.valid ? itemizedValidation.value as PlainData : managed.step.output;
         return {
             response: {
                 requestId, ...(parentRequestId ? { parentRequestId } : {}), state: 'final',
-                output: managed.step.output, route, diagnostics, ...(usage ? { usage } : {}),
+                output, route, diagnostics, ...(usage ? { usage } : {}),
+                ...(validationIssues.length ? { validationIssues } : {}),
+                ...(itemRejections.length ? { itemRejections } : {}),
             },
-            ...(validation.valid ? {} : { validationIssues: validation.issues.map(issue => ({
-                path: issue.path,
-                keyword: issue.keyword,
-                expected: issue.expected,
-            })) }),
+            ...(validationIssues.length ? { validationIssues: [...validationIssues] } : {}),
         };
     }
 
@@ -381,7 +425,7 @@ export class LlmToolTurnService {
         return { resource, model: resolvedModel, privacyPolicy: normalizeProviderPrivacyPolicy(resource.privacyPolicy), adapter: provider.createToolAdapter() };
     }
 
-    private cacheKey(resource: ResourceConfig, model: string, adapterVersion: number): string {
+    private cacheKey(resource: ResourceConfig, model: string, adapterVersion: number, reasoning: LlmReasoningPolicy): string {
         return capabilityCacheKey({
             resourceId: resource.id,
             endpointDigest: endpointDigest(resource.baseUrl),
@@ -390,6 +434,8 @@ export class LlmToolTurnService {
             adapterVersion,
             toolSchemaProfile: 'ss_helper_tool_v0',
             probeVersion: TOOL_CAPABILITY_PROBE_VERSION,
+            reasoningMode: reasoning.mode,
+            reasoningEffort: reasoning.effort,
         });
     }
 

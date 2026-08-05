@@ -3,7 +3,7 @@
  * 将 Provider 抽象与具体实现解耦
  */
 
-import type { SSHelperFailureContext } from '@ss-helper/sdk';
+import type { LlmReasoningPolicy, SSHelperFailureContext } from '@ss-helper/sdk';
 import type { StructuredOutputIdentity, StructuredOutputPlan, StructuredOutputTransport } from '../schema/structured-output-plan';
 import type { ProviderToolAdapter } from '../tools/tool-adapter';
 
@@ -47,6 +47,7 @@ export interface LLMRequest {
     structuredOutput?: StructuredOutputPlan;
     signal?: AbortSignal;
     timeoutMs?: number;
+    reasoning?: LlmReasoningPolicy;
 }
 
 export interface LLMResponse {

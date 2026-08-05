@@ -9,6 +9,7 @@ import { readSSHelperFailure } from '@ss-helper/sdk';
 import type { ProviderConnectionResult, ProviderModelInfo } from '../providers/types';
 import type { ResourceConfig } from '../schema/types';
 import { createProviderFromResource } from './llm-service-runtime';
+import { isOfficialDeepSeekBetaUrl } from '../providers/deepseek-endpoint';
 
 export type ResourceVerificationCheckId = 'network' | 'auth' | 'model' | 'capability';
 export type ResourceVerificationState = 'idle' | 'running' | 'success' | 'error';
@@ -100,7 +101,7 @@ function supportsTavernCompatibleProbe(resource: ResourceConfig): boolean {
 function responseReason(response: PluginApiResponse, fallback: SSHelperReasonCode): SSHelperReasonCode {
   if (response.status === 401 || response.status === 403) return 'AUTH_FAILED';
   if (response.status === 408 || response.status === 504) return 'HTTP_REQUEST_TIMEOUT';
-  if (response.status >= 500) return 'PROVIDER_UNAVAILABLE';
+  if (response.status >= 500) return 'PROVIDER_SERVICE_UNAVAILABLE';
   return fallback;
 }
 
@@ -194,6 +195,9 @@ export class ResourceVerificationCoordinator {
     apiKey: string,
     options: Pick<ResourceVerificationOptions, 'signal' | 'timeoutMs'> = {},
   ): Promise<ResourceModelDiscoveryResult> {
+    if (resource.apiType === 'deepseek' && isOfficialDeepSeekBetaUrl(resource.baseUrl)) {
+      return { ok: false, supported: false, reasonCode: 'LLM_MODEL_DISCOVERY_UNSUPPORTED', models: [] };
+    }
     if (this.#request !== undefined && supportsTavernCompatibleProbe(resource)) {
       const timeoutController = new AbortController();
       const timeoutMs = Math.max(1_000, Math.min(options.timeoutMs ?? 12_000, 120_000));
@@ -383,6 +387,32 @@ export class ResourceVerificationCoordinator {
     try {
       update('network', 'running', '正在通过酒馆连接服务');
       update('auth', 'running', '正在验证草稿 API Key');
+      if (resource.apiType === 'deepseek' && isOfficialDeepSeekBetaUrl(resource.baseUrl)) {
+        update('model', 'running', '正在直接调用所选模型');
+        const probe = await this.#compatibleGenerationProbe(resource, apiKey, timeoutController.signal);
+        if (timeoutController.signal.aborted) throw new DOMException('aborted', 'AbortError');
+        if (!probe.ok) {
+          const code = probe.reasonCode ?? 'LLM_MODEL_PROBE_FAILED';
+          if (code === 'AUTH_FAILED') {
+            update('network', 'success', '服务地址可访问');
+            update('auth', 'error', 'API Key 无效或权限不足');
+          } else if (code === 'HTTP_TRANSPORT_ERROR' || code === 'HTTP_REQUEST_TIMEOUT') {
+            update('network', 'error', code === 'HTTP_REQUEST_TIMEOUT' ? '连接超时' : '无法连接服务');
+            update('auth', 'error', '尚未完成鉴权');
+          } else {
+            update('network', 'success', '服务已响应');
+            update('auth', 'success', '服务未报告鉴权失败');
+          }
+          update('model', 'error', '模型调用未通过');
+          return { ok: false, reasonCode: code, checks, models: [] };
+        }
+        update('network', 'success', '服务地址可访问');
+        update('auth', 'success', 'API Key 验证通过');
+        update('model', 'success', '模型可用');
+        update('capability', 'running', '正在核对用途能力');
+        update('capability', 'success', '用途能力匹配');
+        return { ok: true, checks, models: [] };
+      }
       const status = await this.#compatibleStatus(resource, apiKey, timeoutController.signal);
       if (timeoutController.signal.aborted) throw new DOMException('aborted', 'AbortError');
       if (!status.ok) {

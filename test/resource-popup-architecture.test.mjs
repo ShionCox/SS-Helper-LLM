@@ -72,6 +72,66 @@ test('editing a generic Grok relay keeps its endpoint when switching to the xAI 
   controller.dispose();
 });
 
+test('DeepSeek official resources switch between standard and Beta endpoints without becoming relays', () => {
+  const controller = resourceWizard({
+    id: 'deepseek-beta', type: 'generation', source: 'custom', apiType: 'deepseek', label: 'DeepSeek Beta',
+    baseUrl: 'https://api.deepseek.com/beta', model: 'deepseek-chat', enabled: true,
+  });
+  let snapshot = controller.snapshot();
+  assert.equal(snapshot.values.connectionMode, 'official');
+  assert.equal(snapshot.values.deepseekApiMode, 'beta');
+  assert.equal(snapshot.values.baseUrl, 'https://api.deepseek.com/beta');
+  assert.equal(snapshot.hiddenFieldIds.includes('deepseekApiMode'), false);
+  assert.equal(snapshot.disabledFieldIds.includes('baseUrl'), true);
+
+  controller.change('deepseekApiMode', 'standard');
+  snapshot = controller.snapshot();
+  assert.equal(snapshot.values.baseUrl, 'https://api.deepseek.com');
+  controller.change('deepseekApiMode', 'beta');
+  assert.equal(controller.snapshot().values.baseUrl, 'https://api.deepseek.com/beta');
+
+  controller.change('connectionMode', 'relay');
+  snapshot = controller.snapshot();
+  assert.equal(snapshot.hiddenFieldIds.includes('deepseekApiMode'), true);
+  assert.equal(snapshot.disabledFieldIds.includes('baseUrl'), false);
+  controller.change('connectionMode', 'official');
+  assert.equal(controller.snapshot().values.baseUrl, 'https://api.deepseek.com/beta');
+  controller.dispose();
+});
+
+test('DeepSeek Beta skips unsupported model discovery and verifies the selected model directly', async () => {
+  const calls = [];
+  const coordinator = new ResourceVerificationCoordinator({
+    request: async (input) => {
+      calls.push(input);
+      return {
+        status: 200,
+        ok: true,
+        body: { choices: [{ message: { content: 'OK' } }] },
+      };
+    },
+  });
+  const betaResource = {
+    ...resource,
+    apiType: 'deepseek',
+    baseUrl: 'https://api.deepseek.com/beta',
+    model: 'deepseek-chat',
+  };
+  const discovered = await coordinator.discoverModels(betaResource, 'secret');
+  assert.deepEqual(discovered, {
+    ok: false,
+    supported: false,
+    reasonCode: 'LLM_MODEL_DISCOVERY_UNSUPPORTED',
+    models: [],
+  });
+  const verified = await coordinator.verify(betaResource, 'secret');
+  assert.equal(verified.ok, true);
+  assert.deepEqual(Object.values(verified.checks).map((check) => check.state), ['success', 'success', 'success', 'success']);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].path, '/api/backends/chat-completions/generate');
+  assert.equal(calls[0].body.reverse_proxy, 'https://api.deepseek.com/beta');
+});
+
 test('resource verification checks network, auth, model, and capability with one disposable provider', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -293,19 +353,22 @@ test('legacy resource popup DOM, prompt editing, and save-before-test paths are 
   assert.doesNotMatch(resourcePopups, /window\.confirm|document\.createElement\(['"]select['"]\)/u);
   assert.match(resourcePopups, /ResourceVerificationCoordinator/u);
   assert.match(resourcePopups, /createMenu|presentation:\s*'workspace'/u);
-  assert.match(resourcePopups, /验证工具调用|verifyToolCapability/u);
+  assert.match(resourcePopups, /验证工具调用|verifyResourceCapability/u);
   assert.match(resourcePopups, /ss-helper-llm-resource-checked-primary/u);
   assert.match(resourceStyles, /ss-helper-llm-resource-row\s*\{\s*height:\s*54px/u);
   assert.match(resourceStyles, /grid-template-columns:[^;]+170px;/u);
+  assert.match(resourceStyles, /grid-template-rows:\s*auto auto auto auto minmax\(0, 1fr\) auto/u);
+  assert.match(resourceStyles, /ss-helper-llm-tavern-reasoning-policy[\s\S]+display:\s*grid/u);
   assert.match(resourceStyles, /resource-columns\s*>\s*:last-child\s*\{\s*text-align:\s*right/u);
   assert.match(resourcePopups, /listResourceHealth|saveResourceHealth|deleteResource/u);
   assert.match(resourcePopups, /工具调用（Agent，可选）[\s\S]+force:\s*true/u);
-  assert.match(resourcePopups, /工具调用验证未通过，不能用于 Agent 模式/u);
+  assert.match(resourcePopups, /describeSSHelperFailure\(capability\?\.failure/u);
+  assert.match(resourcePopups, /diagnostic\.title[\s\S]+diagnostic\.reason[\s\S]+diagnostic\.action/u);
   assert.match(resourcePopups, /enabled:\s*true/u);
   for (const field of ['customParams', 'toolDialect', 'privacyPolicy']) {
     assert.match(resourcePopups, new RegExp(`this\\.#source\\?\\.${field}`, 'u'));
   }
-  assert.match(resourcePopups, /await this\.#verification\.verify[\s\S]+await this\.#repository\.setResourceSecret[\s\S]+await this\.#repository\.saveSettings/u);
+  assert.match(resourcePopups, /await this\.#verification\.verify[\s\S]+await this\.#repository\.saveResource/u);
 });
 
 test('LLM UI has no Memory-owned task routing surface and protects consumer assignments', async () => {

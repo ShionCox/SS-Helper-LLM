@@ -78,7 +78,7 @@ function reasonForHttpStatus(status: number, classification: SafeProviderHttpCla
     if ((code !== undefined && CONTENT_FILTER_CODES.has(code)) || (type !== undefined && CONTENT_FILTER_CODES.has(type))) return 'CONTENT_FILTERED';
     if ((code !== undefined && TOKEN_LIMIT_CODES.has(code)) || (type !== undefined && TOKEN_LIMIT_CODES.has(type))) return 'TOKEN_LIMIT_EXCEEDED';
     if (status === 404) return 'ENDPOINT_NOT_FOUND';
-    if (status >= 500) return 'PROVIDER_UNAVAILABLE';
+    if (status >= 500) return 'PROVIDER_SERVICE_UNAVAILABLE';
     return 'PROVIDER_HTTP_ERROR';
 }
 

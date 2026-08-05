@@ -12,8 +12,9 @@ import type {
     ProviderModelListResult, ProviderFetch,
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
-import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import type { StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { GeminiInteractionsToolAdapter } from '../tools/gemini-interactions-tool-adapter';
+import { compileReasoningFields } from './reasoning-policy';
 import type { ProviderToolAdapter } from '../tools/tool-adapter';
 import { parseSseJson } from './sse';
 import { responseDiagnostics } from './provider-response-diagnostics';
@@ -47,7 +48,8 @@ export class GeminiProvider implements LLMProvider {
         this.id = config.id;
         this.apiKey = config.apiKey;
         this.baseUrl = (config.baseUrl || 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
-        this.model = config.model || 'gemini-2.5-flash';
+        if (!config.model?.trim()) throw createSSHelperError('MODEL_NOT_FOUND', { stage: 'llm.provider.configure.model', resourceId: config.id });
+        this.model = config.model.trim();
         this.capabilities = {
             chat: true,
             json: true,
@@ -59,7 +61,7 @@ export class GeminiProvider implements LLMProvider {
         this.fetchImpl = config.fetchImpl ?? fetch;
         this.embeddingDimensions = config.embeddingDimensions;
         this.streamingEnabled = config.streamingEnabled !== false;
-        this.structuredOutputIdentity = detectStructuredOutputIdentity({ manualVendor: 'gemini', baseUrl: this.baseUrl, model: this.model });
+        this.structuredOutputIdentity = { vendor: 'gemini', evidence: 'manual', confidence: 'high', model: this.model };
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -165,11 +167,15 @@ export class GeminiProvider implements LLMProvider {
 
     async request(req: LLMRequest): Promise<LLMResponse> {
         const split = this.splitMessages(req.messages);
+        const reasoningFields = compileReasoningFields({ provider: 'gemini', dialect: 'gemini_interactions', policy: req.reasoning, execution: req.structuredOutput === undefined ? 'completion' : 'structured' });
+        const thinkingConfig = reasoningFields.thinkingConfig && typeof reasoningFields.thinkingConfig === 'object' && !Array.isArray(reasoningFields.thinkingConfig)
+            ? reasoningFields.thinkingConfig as Record<string, unknown> : undefined;
         const generationConfig: Record<string, unknown> = {
             ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
             ...(typeof req.maxTokens === 'number' ? { maxOutputTokens: req.maxTokens } : {}),
             ...(req.structuredOutput?.transport === 'json_object' ? { responseMimeType: 'application/json' } : {}),
             ...(req.structuredOutput?.transport === 'json_schema' ? { responseMimeType: 'application/json', responseJsonSchema: req.structuredOutput.spec.schema } : {}),
+            ...(thinkingConfig === undefined ? {} : { thinkingConfig }),
         };
 
         const body = this.withCustomParams({
@@ -230,7 +236,7 @@ export class GeminiProvider implements LLMProvider {
     }
 
     async embed(req: EmbedRequest): Promise<EmbedResponse> {
-        const model = req.model || this.model || 'gemini-embedding-001';
+        const model = req.model?.trim() || this.model;
         const batch = req.texts.length > 1;
         const dimensions = req.dimensions ?? this.embeddingDimensions;
         const body = this.withCustomParams(batch

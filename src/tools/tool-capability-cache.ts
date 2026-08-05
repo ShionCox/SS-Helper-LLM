@@ -8,6 +8,8 @@ export interface ToolCapabilityCacheKeyInput {
     readonly adapterVersion: number;
     readonly toolSchemaProfile: 'ss_helper_tool_v0';
     readonly probeVersion: number;
+    readonly reasoningMode?: 'provider_default' | 'enabled' | 'disabled';
+    readonly reasoningEffort?: 'provider_default' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 }
 
 export const TOOL_CAPABILITY_SUCCESS_TTL_MS = 24 * 60 * 60 * 1_000;
@@ -29,7 +31,7 @@ export function endpointDigest(value: string | undefined): string {
 export function capabilityCacheKey(input: ToolCapabilityCacheKeyInput): string {
     return stableToolDigest([
         input.resourceId, input.endpointDigest, input.apiType, input.model,
-        input.adapterVersion, input.toolSchemaProfile, input.probeVersion,
+        input.adapterVersion, input.toolSchemaProfile, input.probeVersion, input.reasoningMode ?? 'provider_default', input.reasoningEffort ?? 'provider_default',
     ].join('\0'));
 }
 
@@ -70,8 +72,8 @@ export function declaredToolCapability(input: {
         model: input.model,
         dialect: input.dialect,
         parallelToolCalls: false,
-        streamingToolCalls: false,
-        strictToolSchema: 'none',
+        streamingToolCalls: 'unknown',
+        strictToolSchema: 'unknown',
         reasoningReplay: input.dialect === 'deepseek_chat' || input.dialect === 'glm_chat' ? 'required' : input.dialect === 'gemini_interactions' || input.dialect === 'openai_responses' ? 'opaque' : 'none',
         probeVersion: input.probeVersion,
     });

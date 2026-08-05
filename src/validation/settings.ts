@@ -1,12 +1,14 @@
 import { createSSHelperError } from '@ss-helper/sdk';
 import type { BudgetConfig } from '../budget/budget-manager';
-import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, PluginAssignment, ResourceConfig, TaskAssignment } from '../schema/types';
+import type { AssignmentEntry, GlobalAssignments, GlobalMaxTokensControl, LLMHubSettings, LLMRequestLoggingSettings, ResourceConfig, TaskAssignment } from '../schema/types';
 
-const TOP_LEVEL = new Set(['enabled', 'generationSource', 'streamingEnabled', 'maxRequestsPerMinute', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'globalProfile', 'maxTokensControl', 'resources', 'globalAssignments', 'pluginAssignments', 'taskAssignments', 'budgets', 'requestLogging']);
+const TOP_LEVEL = new Set(['enabled', 'streamingEnabled', 'maxRequestsPerMinute', 'timeoutMs', 'maxTokensMode', 'maxTokens', 'globalProfile', 'maxTokensControl', 'resources', 'resourcePolicies', 'globalAssignments', 'taskAssignments', 'budgets', 'requestLogging']);
 const RESOURCE_KEYS = new Set(['id', 'type', 'source', 'apiType', 'label', 'baseUrl', 'model', 'enabled', 'embeddingPath', 'embeddingDimensions', 'rerankPath', 'rerankProtocol', 'capabilities', 'customParams', 'toolDialect', 'privacyPolicy']);
 const BUDGET_KEYS = new Set(['maxRPM', 'maxTokens', 'maxLatencyMs']);
 const MAX_JSON_BYTES = 256 * 1024;
 const LOG_DETAIL_MODES = ['full', 'failed-full', 'summary', 'off'] as const;
+const REASONING_MODES = ['provider_default', 'enabled', 'disabled'] as const;
+const REASONING_EFFORTS = ['provider_default', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 function invalid(message: string): never {
   throw createSSHelperError('INVALID_PAYLOAD', {
@@ -52,12 +54,33 @@ function operationPath(value: unknown, name: string): string {
   return path.replace(/\/+$/u, '') || '/';
 }
 
+function validateReasoningPolicy(value: unknown, name: string): import('@ss-helper/sdk').LlmReasoningPolicy {
+  const input = object(value, name);
+  for (const key of Object.keys(input)) if (!['mode', 'effort'].includes(key)) invalid(`${name}.${key} 不受支持`);
+  const mode = enumString(input.mode, `${name}.mode`, REASONING_MODES);
+  const effort = enumString(input.effort, `${name}.effort`, REASONING_EFFORTS);
+  if (mode === 'disabled' && effort !== 'provider_default') invalid(`${name}.disabled 不允许指定思考强度`);
+  return { mode, effort };
+}
+
+function validateResourcePolicies(value: unknown): Record<string, import('@ss-helper/sdk').LlmReasoningPolicy> {
+  const input = object(value, 'resourcePolicies');
+  if (Object.keys(input).length > 500) invalid('resourcePolicies 条目过多');
+  return Object.fromEntries(Object.entries(input).map(([resourceId, policy]) => [
+    string(resourceId, 'resourcePolicies.resourceId', 128),
+    validateReasoningPolicy(policy, `resourcePolicies.${resourceId}`),
+  ]));
+}
+
 function rejectDeprecated(value: unknown, depth = 0): void {
   if (depth > 12) invalid('设置嵌套过深');
   if (Array.isArray(value)) { if (value.length > 1_000) invalid('设置数组过长'); value.forEach((item) => rejectDeprecated(item, depth + 1)); return; }
   if (!value || typeof value !== 'object') return;
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
     if (key === 'maxCost') invalid('maxCost 已废弃，请使用 Token、延迟和 RPM 限制。');
+    if (['thinking', 'reasoning', 'reasoning_effort', 'thinkingConfig', 'output_config'].includes(key)) {
+      invalid(`${key} 已废弃，请在资源的思考策略中配置。`);
+    }
     rejectDeprecated(nested, depth + 1);
   }
 }
@@ -69,7 +92,7 @@ function validateResource(value: unknown): ResourceConfig {
   const source = string(record.source, 'resource.source', 32);
   if (!['generation', 'embedding', 'rerank'].includes(type) || source !== 'custom') invalid('resource 类型无效');
   const apiType = string(record.apiType, 'resource.apiType', 32);
-  if (!['auto', 'openai', 'xai', 'deepseek', 'kimi', 'glm', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
+  if (!['openai', 'xai', 'deepseek', 'kimi', 'glm', 'gemini', 'claude', 'generic'].includes(apiType)) invalid('resource.apiType 无效');
   let baseUrl: string | undefined;
   if (record.baseUrl !== undefined) {
     baseUrl = string(record.baseUrl, 'resource.baseUrl', 2_048);
@@ -88,7 +111,8 @@ function validateResource(value: unknown): ResourceConfig {
   })();
   if (record.customParams !== undefined) rejectDeprecated(record.customParams);
   const id = string(record.id, 'resource.id', 128);
-  if (id === '__builtin_tavern__') invalid('resource.id 保留给酒馆资源');
+  const model = string(record.model, 'resource.model', 256);
+  if (id === 'tavern:active') invalid('resource.id 保留给酒馆当前连接');
   const toolDialect = record.toolDialect === undefined ? undefined : enumString(record.toolDialect, 'resource.toolDialect', [
     'openai_responses', 'anthropic_messages', 'gemini_interactions', 'deepseek_chat', 'kimi_chat', 'glm_chat', 'openai_chat_compatible',
   ] as const);
@@ -113,7 +137,7 @@ function validateResource(value: unknown): ResourceConfig {
   return {
     id, type: type as ResourceConfig['type'], source: 'custom', apiType: apiType as ResourceConfig['apiType'],
     label: string(record.label, 'resource.label', 128), ...(baseUrl ? { baseUrl } : {}),
-    ...(record.model === undefined || record.model === '' ? {} : { model: string(record.model, 'resource.model', 256) }),
+    model,
     ...(record.enabled === undefined ? {} : { enabled: typeof record.enabled === 'boolean' ? record.enabled : invalid('resource.enabled 必须是布尔值') }),
     ...(embeddingPath === undefined ? {} : { embeddingPath }),
     ...(embeddingDimensions === undefined ? {} : { embeddingDimensions }),
@@ -126,8 +150,8 @@ function validateResource(value: unknown): ResourceConfig {
 
 function validateAssignmentEntry(value: unknown, name: string): AssignmentEntry {
   const input = object(value, name);
-  for (const key of Object.keys(input)) if (!['resourceId', 'model'].includes(key)) invalid(`${name}.${key} 不受支持`);
-  return { resourceId: string(input.resourceId, `${name}.resourceId`, 128), ...(input.model === undefined ? {} : { model: string(input.model, `${name}.model`, 256) }) };
+  for (const key of Object.keys(input)) if (key !== 'resourceId') invalid(`${name}.${key} 不受支持`);
+  return { resourceId: string(input.resourceId, `${name}.resourceId`, 128) };
 }
 
 function validateGlobalAssignments(value: unknown): GlobalAssignments {
@@ -140,30 +164,12 @@ function validateGlobalAssignments(value: unknown): GlobalAssignments {
   };
 }
 
-function validatePluginAssignments(value: unknown): PluginAssignment[] {
-  if (!Array.isArray(value) || value.length > 500) invalid('pluginAssignments 无效');
-  const ids = new Set<string>();
-  return value.map((item, index) => {
-    const input = object(item, `pluginAssignments[${index}]`);
-    for (const key of Object.keys(input)) if (!['pluginId', 'generation', 'embedding', 'rerank'].includes(key)) invalid(`pluginAssignments[${index}].${key} 不受支持`);
-    const pluginId = string(input.pluginId, `pluginAssignments[${index}].pluginId`, 128);
-    if (ids.has(pluginId)) invalid('pluginAssignments.pluginId 必须唯一');
-    ids.add(pluginId);
-    return {
-      pluginId,
-      ...(input.generation === undefined ? {} : { generation: validateAssignmentEntry(input.generation, `pluginAssignments[${index}].generation`) }),
-      ...(input.embedding === undefined ? {} : { embedding: validateAssignmentEntry(input.embedding, `pluginAssignments[${index}].embedding`) }),
-      ...(input.rerank === undefined ? {} : { rerank: validateAssignmentEntry(input.rerank, `pluginAssignments[${index}].rerank`) }),
-    };
-  });
-}
-
 function validateTaskAssignments(value: unknown): TaskAssignment[] {
   if (!Array.isArray(value) || value.length > 1_000) invalid('taskAssignments 无效');
   const ids = new Set<string>();
   return value.map((item, index) => {
     const input = object(item, `taskAssignments[${index}]`);
-    for (const key of Object.keys(input)) if (!['pluginId', 'taskKey', 'taskKind', 'resourceId', 'model', 'maxTokens', 'isStale', 'staleReason'].includes(key)) invalid(`taskAssignments[${index}].${key} 不受支持`);
+    for (const key of Object.keys(input)) if (!['pluginId', 'taskKey', 'taskKind', 'resourceId', 'maxTokens', 'isStale', 'staleReason'].includes(key)) invalid(`taskAssignments[${index}].${key} 不受支持`);
     const pluginId = string(input.pluginId, `taskAssignments[${index}].pluginId`, 128);
     const taskKey = string(input.taskKey, `taskAssignments[${index}].taskKey`, 256);
     const taskKind = enumString(input.taskKind, `taskAssignments[${index}].taskKind`, ['generation', 'embedding', 'rerank'] as const);
@@ -174,7 +180,6 @@ function validateTaskAssignments(value: unknown): TaskAssignment[] {
     return {
       pluginId, taskKey, taskKind,
       ...(input.resourceId === undefined ? {} : { resourceId: string(input.resourceId, `taskAssignments[${index}].resourceId`, 128) }),
-      ...(input.model === undefined ? {} : { model: string(input.model, `taskAssignments[${index}].model`, 256) }),
       ...(input.maxTokens === undefined ? {} : { maxTokens: positiveInteger(input.maxTokens, `taskAssignments[${index}].maxTokens`, 1_000_000) }),
       isStale: input.isStale === true,
       ...(input.staleReason === undefined ? {} : { staleReason: string(input.staleReason, `taskAssignments[${index}].staleReason`, 512) }),
@@ -242,7 +247,6 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
   for (const key of Object.keys(input)) if (!TOP_LEVEL.has(key)) invalid(`settings.${key} 不受支持`);
   const result = structuredClone(input) as LLMHubSettings;
   if (input.enabled !== undefined && typeof input.enabled !== 'boolean') invalid('enabled 必须是布尔值');
-  if (input.generationSource !== undefined) result.generationSource = enumString(input.generationSource, 'generationSource', ['tavern', 'custom'] as const);
   if (input.streamingEnabled !== undefined && typeof input.streamingEnabled !== 'boolean') invalid('streamingEnabled 必须是布尔值');
   if (input.maxRequestsPerMinute !== undefined) result.maxRequestsPerMinute = nonNegativeInteger(input.maxRequestsPerMinute, 'maxRequestsPerMinute', 60_000);
   if (input.timeoutMs !== undefined) result.timeoutMs = positiveInteger(input.timeoutMs, 'timeoutMs', 600_000);
@@ -256,8 +260,8 @@ export function validateLlmSettings(value: unknown): LLMHubSettings {
     result.resources = input.resources.map(validateResource);
     if (new Set(result.resources.map((item) => item.id)).size !== result.resources.length) invalid('resource.id 必须唯一');
   }
+  if (input.resourcePolicies !== undefined) result.resourcePolicies = validateResourcePolicies(input.resourcePolicies);
   if (input.globalAssignments !== undefined) result.globalAssignments = validateGlobalAssignments(input.globalAssignments);
-  if (input.pluginAssignments !== undefined) result.pluginAssignments = validatePluginAssignments(input.pluginAssignments);
   if (input.taskAssignments !== undefined) result.taskAssignments = validateTaskAssignments(input.taskAssignments);
   result.budgets = validateBudgetConfigs(input.budgets);
   return result;

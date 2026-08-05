@@ -10,9 +10,10 @@ import type {
   SSHelperReasonCode,
   VerifiedToolCapabilities,
 } from '@ss-helper/sdk';
-import { createSSHelperError, isLlmToolCapabilityVerifyResponse, isSSHelperReasonCode } from '@ss-helper/sdk';
+import { createSSHelperError, LLM_RESOURCE_CAPABILITY_VERIFY_V0, isSSHelperReasonCode } from '@ss-helper/sdk';
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMHubSettings, LLMRequestLogQueryOptions } from '../schema/types';
+import type { ResourceConfig } from '../schema/types';
 import { validateLlmSettings } from '../validation/settings';
 import { buildStoredLog } from '../log/log-sanitizer';
 import { startLlmPerformanceSpan } from '../runtime/logger';
@@ -27,7 +28,6 @@ const MAX_CONSUMERS = 1_000;
 const DEFAULT_LOG_MAX_ENTRIES = 500;
 const DEFAULT_LOG_RETENTION_DAYS = 30;
 const DEFAULT_LOG_MAX_BYTES = 100 * 1024 * 1024;
-const AGENT_PIPELINE_BASELINE_RECORD_ID = 'agent-pipeline-baseline-v1';
 type PersistedSettings = LLMHubSettings & { timeoutMs?: number };
 type LogKind = 'generation' | 'embedding' | 'rerank';
 type SecretSnapshot = {
@@ -64,6 +64,8 @@ export interface LLMConfigArchiveV0 {
 }
 
 export interface PreparedSettingsRuntime {
+  /** Throws when a newer runtime preparation superseded this snapshot. */
+  assertCurrent?(): void;
   commit(): void;
   dispose(): void;
 }
@@ -71,6 +73,17 @@ export interface PreparedSettingsRuntime {
 export interface SettingsRuntimePrepareOptions {
   readonly credentialOverrides?: Readonly<Record<string, string | null>>;
   readonly emptyCredentials?: boolean;
+}
+
+export interface SettingsUpdateOptions {
+  readonly expectedRevision?: number;
+  readonly resourceHealth?: ResourceHealthRecord;
+}
+
+export interface SaveResourceOptions {
+  readonly reasoningPolicy?: import('@ss-helper/sdk').LlmReasoningPolicy;
+  readonly resourceHealth?: ResourceHealthRecord;
+  readonly secretMetadata?: PlainData;
 }
 
 export type SettingsRuntimePreparer = (
@@ -116,7 +129,7 @@ function validateResourceHealth(value: PlainData): ResourceHealthRecord {
 
 function validateToolCapability(cacheKey: string, value: PlainData): StoredToolCapabilityRecord {
   if (!/^fnv1a64:[0-9a-f]{16}$/u.test(cacheKey)
-    || !isLlmToolCapabilityVerifyResponse({ capability: value })) {
+    || LLM_RESOURCE_CAPABILITY_VERIFY_V0.validateResponse?.({ resourceId: (value as Record<string, unknown>).resourceId, taskKeys: [], capabilities: [value] }) !== true) {
     throw repositoryError('INVALID_PAYLOAD', 'llm.tool-capability.validate');
   }
   return { cacheKey, capability: structuredClone(value) as unknown as VerifiedToolCapabilities };
@@ -177,40 +190,6 @@ export class LlmWorkspaceRepository {
     return structuredClone(this.settings);
   }
 
-  private async applyAgentPipelineBaseline(): Promise<void> {
-    const marker = await this.read({ collection: 'settings', id: AGENT_PIPELINE_BASELINE_RECORD_ID });
-    if (marker) return;
-    const current = await this.read({ collection: 'settings', id: 'global' });
-    const operations: WorkspaceCommitOperation[] = [];
-    if (current) {
-      const settings = validateLlmSettings(current.value);
-      const retired = new Set([
-        ['memory', 'capture'].join('_'),
-        ['memory', 'capture', 'repair'].join('_'),
-      ]);
-      const next: LLMHubSettings = {
-        ...settings,
-        taskAssignments: (settings.taskAssignments ?? []).filter(assignment => !(
-          assignment.pluginId === 'ss-helper.memory' && retired.has(assignment.taskKey)
-        )),
-        resources: (settings.resources ?? []).map(resource => ({
-          ...resource,
-          privacyPolicy: {
-            conversationStateMode: 'local_replay' as const,
-            storeProviderState: false,
-            allowRemoteRetention: false,
-          },
-        })),
-      };
-      operations.push({ action: 'put', collection: 'settings', id: 'global', value: asPlain(next), expectedRevision: current.revision });
-    }
-    operations.push({
-      action: 'put', collection: 'settings', id: AGENT_PIPELINE_BASELINE_RECORD_ID,
-      value: { version: 1, appliedAt: Date.now() }, expectedRevision: 0,
-    });
-    await this.write({ idempotencyKey: 'llm-agent-pipeline-baseline-v1', operations });
-  }
-
   private async initialize(): Promise<void> {
     const finish = startLlmPerformanceSpan('repository.initialize');
     try {
@@ -227,7 +206,6 @@ export class LlmWorkspaceRepository {
           })),
         },
       });
-      await this.applyAgentPipelineBaseline();
       await this.loadSettingsFromWorkspace();
       finish();
     } catch (error) {
@@ -355,17 +333,22 @@ export class LlmWorkspaceRepository {
     return structuredClone(this.settings);
   }
 
-  async saveSettings(
-    next: LLMHubSettings & Record<string, unknown>,
-    options: { readonly resourceHealth?: ResourceHealthRecord } = {},
+  async updateSettings(
+    mutator: (current: PersistedSettings) => LLMHubSettings & Record<string, unknown>,
+    options: SettingsUpdateOptions = {},
   ): Promise<PersistedSettings> {
     return this.enqueue(async () => {
       await this.ready();
+      if (options.expectedRevision !== undefined && options.expectedRevision !== this.settingsRevision) {
+        throw repositoryError('WORKSPACE_CONFLICT', 'llm.settings.update');
+      }
+      const next = mutator(structuredClone(this.settings));
       const value = validateLlmSettings(next);
       const health = options.resourceHealth === undefined ? undefined : validateResourceHealth(asPlain(options.resourceHealth));
       const previousHealth = health === undefined ? null : await this.read({ collection: 'resource-health', id: health.resourceId });
       const prepared = await this.prepareRuntime(value);
       try {
+        prepared?.assertCurrent?.();
         const result = await this.write({
           idempotencyKey: operationKey('llm-settings'),
           operations: [
@@ -384,6 +367,81 @@ export class LlmWorkspaceRepository {
         prepared?.commit();
       } catch (error) {
         prepared?.dispose();
+        throw error;
+      }
+      this.notifySettings();
+      this.notifyChanges(['generation', 'embedding', 'rerank']);
+      return structuredClone(this.settings);
+    });
+  }
+
+  async replaceSettings(next: LLMHubSettings & Record<string, unknown>, expectedRevision?: number): Promise<PersistedSettings> {
+    return this.updateSettings(() => next, { ...(expectedRevision === undefined ? {} : { expectedRevision }) });
+  }
+
+  async saveSettings(
+    next: LLMHubSettings & Record<string, unknown>,
+    options: { readonly resourceHealth?: ResourceHealthRecord } = {},
+  ): Promise<PersistedSettings> {
+    return this.updateSettings(() => next, options);
+  }
+
+  /**
+   * Atomically applies a resource, its policy/health and credential. The
+   * secret store is compensated if the Workspace CAS write fails, so another
+   * settings mutation cannot observe a half-enabled resource.
+   */
+  async saveResource(resource: ResourceConfig, secret: string, options: SaveResourceOptions = {}): Promise<PersistedSettings> {
+    return this.enqueue(async () => {
+      await this.ready();
+      const normalizedSecret = secret.trim();
+      if (!normalizedSecret || normalizedSecret.length > 65_536) throw repositoryError('INVALID_PAYLOAD', 'llm.resource.secret');
+      const resources = this.settings.resources ?? [];
+      const nextResources = resources.some((item) => item.id === resource.id)
+        ? resources.map((item) => item.id === resource.id ? structuredClone(resource) : item)
+        : [...resources, structuredClone(resource)];
+      const resourcePolicies = { ...(this.settings.resourcePolicies ?? {}) };
+      if (resource.type === 'generation' && options.reasoningPolicy !== undefined) resourcePolicies[resource.id] = structuredClone(options.reasoningPolicy);
+      if (resource.type !== 'generation') delete resourcePolicies[resource.id];
+      const next = this.settingsFrom({ ...this.settings, resources: nextResources, resourcePolicies });
+      const health = options.resourceHealth === undefined ? undefined : validateResourceHealth(asPlain(options.resourceHealth));
+      const previousHealth = health === undefined ? null : await this.read({ collection: 'resource-health', id: health.resourceId });
+      const staleCapabilities = (await this.queryAll('tool-capabilities')).filter((record) => (record.value as Record<string, PlainData>).resourceId === resource.id);
+      const prepared = await this.prepareRuntime(next, { credentialOverrides: { [resource.id]: normalizedSecret } });
+      const secrets = this.requireSecrets();
+      const secretId = credentialId(resource.id);
+      const previousSecret = await secrets.get({ workspaceId: LLM_WORKSPACE_ID, secretId });
+      let secretWritten = false;
+      try {
+        prepared?.assertCurrent?.();
+        await secrets.set({
+          workspaceId: LLM_WORKSPACE_ID,
+          secretId,
+          value: normalizedSecret,
+          ...(options.secretMetadata === undefined ? {} : { metadata: options.secretMetadata }),
+        });
+        secretWritten = true;
+        const result = await this.write({
+          idempotencyKey: operationKey('llm-resource-save'),
+          operations: [
+            { action: 'put', collection: 'settings', id: 'global', value: asPlain(next), expectedRevision: this.settingsRevision },
+            ...(health === undefined ? [] : [{ action: 'put' as const, collection: 'resource-health', id: health.resourceId, value: asPlain(health), expectedRevision: recordRevision(previousHealth) }]),
+            ...staleCapabilities.map((record) => ({ action: 'delete' as const, collection: 'tool-capabilities', id: record.id, expectedRevision: recordRevision(record) })),
+          ],
+        });
+        this.settingsRevision = result.results[0]?.revision ?? this.settingsRevision + 1;
+        this.settings = next;
+        prepared?.commit();
+      } catch (error) {
+        prepared?.dispose();
+        if (secretWritten) {
+          try {
+            if (previousSecret === null) await secrets.delete({ workspaceId: LLM_WORKSPACE_ID, secretId });
+            else await secrets.set({ workspaceId: LLM_WORKSPACE_ID, secretId, value: previousSecret.value, ...(previousSecret.metadata === undefined ? {} : { metadata: previousSecret.metadata }) });
+          } catch {
+            throw createSSHelperError('WORKSPACE_SECRET_UNAVAILABLE', { stage: 'llm.resource.save.compensate-secret', resourceId: resource.id });
+          }
+        }
         throw error;
       }
       this.notifySettings();
@@ -418,6 +476,7 @@ export class LlmWorkspaceRepository {
       if (operations.length > MAX_TRANSACTION_OPERATIONS) { prepared?.dispose(); throw repositoryError('BACKUP_TOO_LARGE', 'llm.settings.reset'); }
       let removedSecrets: readonly SecretSnapshot[] = [];
       try {
+        prepared?.assertCurrent?.();
         removedSecrets = await this.removeAllSecrets('llm.settings.reset.secret');
         try {
           await this.write({ idempotencyKey: operationKey('llm-reset'), operations });
@@ -478,8 +537,31 @@ export class LlmWorkspaceRepository {
   }
 
   async listToolCapabilities(): Promise<readonly StoredToolCapabilityRecord[]> {
-    await this.ready();
-    return (await this.queryAll('tool-capabilities')).map((record) => validateToolCapability(record.id, record.value));
+    return this.enqueue(async () => {
+      await this.ready();
+      const records = await this.queryAll('tool-capabilities');
+      const valid: StoredToolCapabilityRecord[] = [];
+      const invalid: WorkspaceRecord[] = [];
+      for (const record of records) {
+        if (/^fnv1a64:[0-9a-f]{16}$/u.test(record.id)
+          && LLM_RESOURCE_CAPABILITY_VERIFY_V0.validateResponse?.({ resourceId: (record.value as Record<string, unknown>).resourceId, taskKeys: [], capabilities: [record.value] }) === true) {
+          valid.push(validateToolCapability(record.id, record.value));
+        } else invalid.push(record);
+      }
+      for (let index = 0; index < invalid.length; index += MAX_TRANSACTION_OPERATIONS) {
+        const batch = invalid.slice(index, index + MAX_TRANSACTION_OPERATIONS);
+        await this.write({
+          idempotencyKey: operationKey('llm-tool-capability-prune'),
+          operations: batch.map((record) => ({
+            action: 'delete' as const,
+            collection: 'tool-capabilities',
+            id: record.id,
+            expectedRevision: recordRevision(record),
+          })),
+        });
+      }
+      return valid;
+    });
   }
 
   async saveToolCapability(cacheKey: string, value: VerifiedToolCapabilities): Promise<StoredToolCapabilityRecord> {
@@ -529,6 +611,7 @@ export class LlmWorkspaceRepository {
       if (!normalized || normalized.length > 65_536) throw repositoryError('INVALID_PAYLOAD', 'llm.secret.validate');
       const prepared = await this.prepareRuntime(this.settings, { credentialOverrides: { [resourceId]: normalized } });
       try {
+        prepared?.assertCurrent?.();
         const result = await this.requireSecrets().set({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId), value: normalized, metadata: _metadata });
         prepared?.commit();
         this.notifyChanges(['generation', 'embedding', 'rerank']);
@@ -547,6 +630,7 @@ export class LlmWorkspaceRepository {
       if (current === null) return false;
       const prepared = await this.prepareRuntime(this.settings, { credentialOverrides: { [resourceId]: null } });
       try {
+        prepared?.assertCurrent?.();
         const deleted = await this.requireSecrets().delete({ workspaceId: LLM_WORKSPACE_ID, secretId: credentialId(resourceId) });
         if (!deleted) {
           throw createSSHelperError('WORKSPACE_SECRET_UNAVAILABLE', {
@@ -567,7 +651,9 @@ export class LlmWorkspaceRepository {
   async deleteResource(resourceId: string): Promise<boolean> {
     return this.enqueue(async () => {
       await this.ready();
-      const next = this.settingsFrom({ ...this.settings, resources: (this.settings.resources ?? []).filter((resource) => resource.id !== resourceId) });
+      const resourcePolicies = { ...(this.settings.resourcePolicies ?? {}) };
+      delete resourcePolicies[resourceId];
+      const next = this.settingsFrom({ ...this.settings, resources: (this.settings.resources ?? []).filter((resource) => resource.id !== resourceId), resourcePolicies });
       const prepared = await this.prepareRuntime(next, { credentialOverrides: { [resourceId]: null } });
       const health = await this.read({ collection: 'resource-health', id: resourceId });
       const toolCapabilities = (await this.queryAll('tool-capabilities')).filter((record) => {
@@ -584,6 +670,7 @@ export class LlmWorkspaceRepository {
       ];
       let secretDeleted = false;
       try {
+        prepared?.assertCurrent?.();
         if (previousSecret !== null) {
           const deleted = await secrets.delete({ workspaceId: LLM_WORKSPACE_ID, secretId });
           if (!deleted) {
@@ -664,6 +751,7 @@ export class LlmWorkspaceRepository {
       const prepared = await this.prepareRuntime(settings, { emptyCredentials: true });
       let removedSecrets: readonly SecretSnapshot[] = [];
       try {
+        prepared?.assertCurrent?.();
         removedSecrets = await this.removeAllSecrets('llm.backup.import.secret');
         let result;
         try {
@@ -690,6 +778,7 @@ export class LlmWorkspaceRepository {
       const prepared = await this.prepareRuntime(DEFAULT_LLM_SETTINGS, { emptyCredentials: true });
       let removedSecrets: readonly SecretSnapshot[] = [];
       try {
+        prepared?.assertCurrent?.();
         removedSecrets = await this.removeAllSecrets('llm.clear.secret');
         try {
           await this.workspace.admin.reset({ idempotencyKey: operationKey('llm-clear') });
@@ -917,7 +1006,7 @@ export class LlmWorkspaceRepository {
         const workflow = row.workflow && typeof row.workflow === 'object' && !Array.isArray(row.workflow)
           ? row.workflow as Record<string, unknown>
           : undefined;
-        const agentWorkflow = workflow?.workflowKind === 'agent' || workflow?.workflowKind === 'agent_shadow';
+        const agentWorkflow = workflow?.workflowKind === 'agent';
         if (input.callScope === 'agent_workflow' && !agentWorkflow) return false;
         if (input.callScope === 'ordinary' && agentWorkflow) return false;
         if (input.workflowId && workflow?.workflowId !== input.workflowId) return false;

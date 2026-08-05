@@ -1,6 +1,7 @@
-import { createSSHelperError, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
+import { createSSHelperError, type LlmReasoningPolicy, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
 import type { JsonHttpTransport, ProviderToolAdapter, ProviderToolStartInput, ProviderToolStep } from './tool-adapter';
 import { canonicalToolName, createProviderToolNameAliases, estimateJsonBytes, parseArguments, parseFinalOutput, providerToolName, validateCalls, type ProviderToolNameAliases } from './tool-adapter-utils';
+import { compileReasoningFields } from '../providers/reasoning-policy';
 
 interface AnthropicToolState {
     readonly model: string;
@@ -11,6 +12,7 @@ interface AnthropicToolState {
     readonly toolNames: ProviderToolNameAliases;
     readonly maxTokens: number;
     readonly pendingCalls: readonly { readonly callId: string; readonly name: string }[];
+    readonly reasoning?: LlmReasoningPolicy;
 }
 
 export class AnthropicMessagesToolAdapter implements ProviderToolAdapter<AnthropicToolState> {
@@ -34,6 +36,7 @@ export class AnthropicMessagesToolAdapter implements ProviderToolAdapter<Anthrop
             toolNames,
             maxTokens: input.maxTokens,
             pendingCalls: [],
+            ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
         };
         return this.send(state, true, input.signal);
     }
@@ -65,6 +68,7 @@ export class AnthropicMessagesToolAdapter implements ProviderToolAdapter<Anthrop
             messages: state.messages,
             ...(state.system ? { system: state.system } : {}),
             ...(allowTools ? { tools: state.tools, tool_choice: { type: 'auto' } } : {}),
+            ...compileReasoningFields({ provider: 'claude', dialect: this.dialect, policy: state.reasoning, execution: 'tool_turn' }),
         };
         const streamed = this.transport.sendStream !== undefined;
         const data = streamed

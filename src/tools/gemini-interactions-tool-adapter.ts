@@ -1,6 +1,7 @@
-import { createSSHelperError, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
+import { createSSHelperError, type LlmReasoningPolicy, type NormalizedToolCall, type NormalizedToolResult, type PlainData } from '@ss-helper/sdk';
 import type { JsonHttpTransport, ProviderToolAdapter, ProviderToolStartInput, ProviderToolStep } from './tool-adapter';
 import { providerStoresState } from './provider-privacy-policy';
+import { compileReasoningFields } from '../providers/reasoning-policy';
 import { canonicalToolName, createProviderToolNameAliases, estimateJsonBytes, parseArguments, parseFinalOutput, providerToolName, validateCalls, type ProviderToolNameAliases } from './tool-adapter-utils';
 
 interface GeminiInteractionsState {
@@ -14,6 +15,7 @@ interface GeminiInteractionsState {
     readonly providerManaged: boolean;
     readonly previousInteractionId?: string;
     readonly pendingCalls: readonly { readonly callId: string; readonly name: string }[];
+    readonly reasoning?: LlmReasoningPolicy;
 }
 
 export class GeminiInteractionsToolAdapter implements ProviderToolAdapter<GeminiInteractionsState> {
@@ -39,6 +41,7 @@ export class GeminiInteractionsToolAdapter implements ProviderToolAdapter<Gemini
             maxTokens: input.maxTokens,
             providerManaged,
             pendingCalls: [],
+            ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
         };
         return this.send(state, [], true, input.signal);
     }
@@ -74,6 +77,7 @@ export class GeminiInteractionsToolAdapter implements ProviderToolAdapter<Gemini
             input,
             store: state.providerManaged,
             max_output_tokens: state.maxTokens,
+            ...compileReasoningFields({ provider: 'gemini', dialect: this.dialect, policy: state.reasoning, execution: 'tool_turn' }),
             ...(state.providerManaged && state.previousInteractionId ? { previous_interaction_id: state.previousInteractionId } : {}),
             ...(allowTools ? { tools: state.tools } : {}),
         };

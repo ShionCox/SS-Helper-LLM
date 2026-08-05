@@ -6,14 +6,16 @@ import type {
 } from './types';
 import { providerConnectionFailure, providerHttpErrorFromResponse, providerModelListFailure } from './provider-errors';
 import type { ApiType } from '../schema/types';
-import { detectStructuredOutputIdentity, type StructuredOutputIdentity } from '../schema/structured-output-plan';
+import type { StructuredOutputIdentity } from '../schema/structured-output-plan';
 import { validateJsonSchema, type JsonSchemaIssue } from '../schema/json-schema-validator';
 import { OpenAiChatToolAdapter, OPENAI_CHAT_DIALECT_POLICIES } from '../tools/openai-chat-tool-adapter';
+import { compileReasoningFields } from './reasoning-policy';
 import { OpenAiResponsesToolAdapter } from '../tools/openai-responses-tool-adapter';
 import type { ProviderToolAdapter } from '../tools/tool-adapter';
 import { OpenAiToolStreamAssembler } from '../tools/tool-stream-assembler';
 import { parseSseJson } from './sse';
 import { responseDiagnostics } from './provider-response-diagnostics';
+import { isOfficialDeepSeekBetaUrl } from './deepseek-endpoint';
 
 const RERANK_RESPONSE_SCHEMA = {
     type: 'object',
@@ -79,7 +81,8 @@ export class OpenAIProvider implements LLMProvider {
         this.id = config.id;
         this.apiKey = config.apiKey;
         this.baseUrl = (config.baseUrl || (config.apiType === 'xai' ? 'https://api.x.ai/v1' : 'https://api.openai.com/v1')).replace(/\/+$/, '');
-        this.model = config.model || 'gpt-4o-mini';
+        if (!config.model?.trim()) throw createSSHelperError('MODEL_NOT_FOUND', { stage: 'llm.provider.configure.model', resourceId: config.id });
+        this.model = config.model.trim();
         this.apiType = config.apiType === 'xai' || config.apiType === 'deepseek' || config.apiType === 'kimi' || config.apiType === 'glm'
             ? config.apiType
             : config.apiType === 'gemini'
@@ -102,12 +105,9 @@ export class OpenAIProvider implements LLMProvider {
                     : { transports: ['json_schema', 'json_object', 'prompt_only'], preferred: 'json_schema' },
         };
         this.fetchImpl = config.fetchImpl ?? fetch;
-        const manualVendor = this.apiType === 'openai' || this.apiType === 'deepseek' || this.apiType === 'gemini' || this.apiType === 'claude'
-            ? this.apiType
-            : undefined;
-        this.structuredOutputIdentity = config.structuredOutputIdentity ?? (manualVendor
-            ? detectStructuredOutputIdentity({ manualVendor, model: this.model })
-            : { vendor: 'unknown', evidence: 'manual', confidence: 'high', model: this.model });
+        const manifestVendor = this.apiType === 'openai' || this.apiType === 'deepseek' || this.apiType === 'gemini' || this.apiType === 'claude'
+            ? this.apiType : 'unknown';
+        this.structuredOutputIdentity = config.structuredOutputIdentity ?? { vendor: manifestVendor, evidence: 'manual', confidence: 'high', model: this.model };
         this.customParams = config.customParams && typeof config.customParams === 'object' && !Array.isArray(config.customParams)
             ? { ...config.customParams }
             : {};
@@ -335,12 +335,20 @@ export class OpenAIProvider implements LLMProvider {
         if (!dialect) throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', {
             stage: 'llm.tools.adapter.resolve', resourceId: this.id,
         });
+        const basePolicy = OPENAI_CHAT_DIALECT_POLICIES[dialect];
+        const policy = dialect === 'deepseek' && isOfficialDeepSeekBetaUrl(this.baseUrl)
+            ? { ...basePolicy, supportsStrict: 'beta' as const }
+            : basePolicy;
         return new OpenAiChatToolAdapter({
             resourceId: this.id,
             defaultModel: this.model,
             send: async (body, signal) => (await this.sendChatCompletion(this.withCustomParams(body), signal)).data as Record<string, unknown>,
             ...(this.streamingEnabled ? { sendStream: async (body: Record<string, unknown>, signal?: AbortSignal) => (await this.sendChatCompletionStream(this.withCustomParams(body), signal)).chunks } : {}),
-        }, OPENAI_CHAT_DIALECT_POLICIES[dialect], { requireReasoningContent: this.requireReasoningContent, enableToolStream: this.enableToolStream });
+        }, policy, {
+            requireReasoningContent: this.requireReasoningContent,
+            enableToolStream: this.enableToolStream,
+            reasoningProvider: this.apiType === 'xai' ? 'xai' : this.apiType === 'openai' ? 'openai' : this.apiType === 'deepseek' || this.apiType === 'kimi' || this.apiType === 'glm' ? this.apiType : 'generic',
+        });
     }
 
     async request(req: LLMRequest): Promise<LLMResponse> {
@@ -361,6 +369,14 @@ export class OpenAIProvider implements LLMProvider {
         const responseFormat = this.buildResponseFormat(req);
         const body: Record<string, any> = this.withCustomParams({
             ...baseBody,
+            ...compileReasoningFields({
+                provider: this.apiType === 'deepseek' || this.apiType === 'kimi' || this.apiType === 'glm' || this.apiType === 'xai' || this.apiType === 'openai' ? this.apiType : 'generic',
+                // This provider request is always Chat Completions. The
+                // Responses dialect is used only by its Tool Adapter.
+                transport: 'openai_chat',
+                policy: req.reasoning,
+                execution: req.structuredOutput === undefined ? 'completion' : 'structured',
+            }),
             ...(responseFormat ? { response_format: responseFormat } : {}),
         });
 

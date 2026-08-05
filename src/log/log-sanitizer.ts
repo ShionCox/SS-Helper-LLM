@@ -251,7 +251,6 @@ function runMetadata(value: unknown): Record<string, unknown> | undefined {
         startedAt: meta.startedAt,
         finishedAt: meta.finishedAt,
         latencyMs: meta.latencyMs,
-        fallbackUsed: meta.fallbackUsed,
         attemptCount: meta.attemptCount,
         repairCount: meta.repairCount,
         transport: meta.transport,

@@ -22,16 +22,17 @@ function fixture() {
     port: {},
   };
   let current = { provider: 'openai', model: 'gpt-test' };
-  let settings = { enabled: true, generationSource: 'tavern' };
-  let generationStatus = () => ({ id: 'generation', configured: true, available: true, source: 'tavern', model: current.model });
+  let settings = { enabled: true };
+  let generationStatus = () => ({ id: 'generation', configured: true, available: true, model: current.model });
   let repositoryListener;
   let hostListener;
   let capabilityListener;
   const repository = {
     subscribeChanges(listener) { repositoryListener = listener; return () => { repositoryListener = undefined; }; },
     async loadSettings() { return structuredClone(settings); },
+    async updateSettings(mutator) { settings = structuredClone(mutator(structuredClone(settings))); repositoryListener?.(['generation']); return structuredClone(settings); },
     async saveSettings(values) { settings = structuredClone(values); repositoryListener?.(['generation']); return structuredClone(settings); },
-    async reset() { settings = { enabled: true, generationSource: 'tavern' }; return structuredClone(settings); },
+    async reset() { settings = { enabled: true }; return structuredClone(settings); },
   };
   const session = {
     descriptor: { id: 'ss-helper.llm', displayName: 'LLM', pluginVersion: LLM_PLUGIN_VERSION, sdkPackageVersion: SDK_PACKAGE_VERSION, apiVersion: API_VERSION, minApiVersion: API_VERSION, capabilities: [] },
@@ -43,20 +44,22 @@ function fixture() {
     events: { subscribe(_token, listener) { capabilityListener = listener; return () => { capabilityListener = undefined; }; } },
   };
   const handlers = {
-    capabilityStatus: async () => ({
+    taskStatus: async () => ({
       revision: 1,
-      checks: [
-        generationStatus(),
-        { id: 'embedding', configured: false, available: false, reason: 'no_resource' },
-        { id: 'rerank', configured: false, available: false, reason: 'no_resource' },
+      tasks: [
+        { taskKey: 'settings_generation', execution: 'structured', available: generationStatus().available, resourceId: 'resource:generation', model: current.model, route: { resourceId: 'resource:generation', source: 'custom', provider: current.provider, model: current.model, execution: 'structured', transport: 'json_schema' } },
+        { taskKey: 'settings_embedding', execution: 'embedding', available: false, failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'settings.test' } },
+        { taskKey: 'settings_rerank', execution: 'rerank', available: false, failure: { reasonCode: 'LLM_TASK_ROUTE_UNAVAILABLE', stage: 'settings.test' } },
       ],
+      defaults: {}, assignments: [], resources: [],
     }),
   };
   return {
     target, repository, session, handlers,
     changeModel(next) { current = next; hostListener?.({}); },
     changeRepository() { repositoryListener?.(['generation']); },
-    changeCapabilities() { capabilityListener?.({ revision: 2, kinds: ['embedding'] }); },
+    setSettings(next) { settings = structuredClone(next); repositoryListener?.(['generation']); },
+    changeCapabilities() { capabilityListener?.({ revision: 2, taskKeys: ['settings_embedding'], resourceIds: [] }); },
     setGenerationStatus(factory) { generationStatus = factory; },
   };
 }
@@ -68,6 +71,7 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   const unsubscribe = monitor.subscribeStatus((snapshot) => snapshots.push(snapshot));
   await monitor.start();
   assert.equal(monitor.loadStatus().tavernStatus.value, '酒馆 · gpt-test');
+  assert.equal(monitor.loadStatus().generationSourceStatus.value, '酒馆 · gpt-test');
   assert.equal(monitor.loadStatus().generationStatus.value, '可用');
   assert.equal(monitor.loadStatus().embeddingStatus.value, '未配置');
   assert.equal(monitor.loadStatus().rerankStatus.value, '未配置');
@@ -76,6 +80,7 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   value.changeModel({ provider: 'claude', model: 'claude-test' });
   await wait();
   assert.equal(snapshots.at(-1).tavernStatus.value, '酒馆 · claude-test');
+  assert.equal(snapshots.at(-1).generationSourceStatus.value, '酒馆 · claude-test');
 
   value.changeRepository();
   await wait();
@@ -91,7 +96,23 @@ test('LLM settings status is sourced live from Tavern, capabilities, and actual 
   monitor.dispose();
 });
 
-test('adapter warns once for a user source switch and background refreshes stay silent', async () => {
+test('LLM settings status identifies a selected custom generation default without exposing credentials', async () => {
+  const value = fixture();
+  const monitor = new LlmSettingsStatusMonitor(value.session, value.repository, value.handlers, value.target);
+  await monitor.start();
+  value.setSettings({
+    enabled: true,
+    globalAssignments: { generation: { resourceId: 'custom-main' } },
+    resources: [{ id: 'custom-main', type: 'generation', source: 'custom', apiType: 'openai', label: '自定义主模型', model: 'gpt-custom', baseUrl: 'https://secret.example/v1', enabled: true }],
+  });
+  await wait();
+  assert.equal(monitor.loadStatus().generationSourceStatus.value, '自定义 · 自定义主模型');
+  assert.match(monitor.loadStatus().generationSourceStatus.description, /gpt-custom/u);
+  assert.equal(monitor.loadStatus().generationSourceStatus.description.includes('https://'), false);
+  monitor.dispose();
+});
+
+test('adapter saves execution settings without a source-switch side channel', async () => {
   const value = fixture();
   const monitor = new LlmSettingsStatusMonitor(value.session, value.repository, value.handlers, value.target);
   await monitor.start();
@@ -99,23 +120,23 @@ test('adapter warns once for a user source switch and background refreshes stay 
   const adapter = createWorkspaceLlmSettingsAdapter(value.repository, monitor, (notification) => notifications.push(notification));
   await adapter.load();
   value.setGenerationStatus(() => ({ id: 'generation', configured: false, available: false, reason: 'no_resource' }));
-  await adapter.save({ enabled: true, generationSource: 'custom' });
+  await adapter.save({ enabled: true, globalProfile: 'economy' });
   await wait(0);
-  assert.equal(notifications.length, 1);
-  assert.equal(notifications[0].code, 'LLM_GENERATION_SOURCE_UNAVAILABLE');
-  await adapter.save({ enabled: true, generationSource: 'custom', globalProfile: 'economy' });
+  assert.equal(notifications.length, 0);
+  await adapter.save({ enabled: true, globalProfile: 'precise' });
   value.changeCapabilities();
   await wait();
-  assert.equal(notifications.length, 1);
+  assert.equal(notifications.length, 0);
   monitor.dispose();
 });
 
 test('source status probing never blocks the committed settings save', async () => {
-  let settings = { enabled: true, generationSource: 'tavern' };
+  let settings = { enabled: true };
   const repository = {
     async loadSettings() { return structuredClone(settings); },
+    async updateSettings(mutator) { settings = structuredClone(mutator(structuredClone(settings))); return structuredClone(settings); },
     async saveSettings(values) { settings = structuredClone(values); return structuredClone(settings); },
-    async reset() { return { enabled: true, generationSource: 'tavern' }; },
+    async reset() { return { enabled: true }; },
   };
   const statusSource = {
     loadStatus() { return {}; },
@@ -125,11 +146,11 @@ test('source status probing never blocks the committed settings save', async () 
   const adapter = createWorkspaceLlmSettingsAdapter(repository, statusSource, () => assert.fail('a pending status probe must not emit'));
   await adapter.load();
   const result = await Promise.race([
-    adapter.save({ enabled: true, generationSource: 'custom' }).then(() => 'saved'),
+    adapter.save({ enabled: true, globalProfile: 'economy' }).then(() => 'saved'),
     new Promise((resolve) => setTimeout(() => resolve('timeout'), 100)),
   ]);
   assert.equal(result, 'saved');
-  assert.equal(settings.generationSource, 'custom');
+  assert.equal(settings.globalProfile, 'economy');
 });
 
 test('adapter exposes live status and disposed monitors ignore later host events', async () => {

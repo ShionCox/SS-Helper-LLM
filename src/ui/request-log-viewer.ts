@@ -217,16 +217,16 @@ function resultContent(value: unknown, registerCleanup: (cleanup: () => void) =>
     return section;
 }
 
-function workflowMode(value: unknown): 'agent' | 'agent_shadow' | undefined {
+function workflowMode(value: unknown): 'agent' | undefined {
     const kind = text(asRecord(value).workflowKind, '');
-    return kind === 'agent' || kind === 'agent_shadow' ? kind : undefined;
+    return kind === 'agent' ? kind : undefined;
 }
 
-function modeLabel(mode: 'agent' | 'agent_shadow' | undefined): string | undefined {
-    return mode === 'agent_shadow' ? 'Agent Shadow' : mode === 'agent' ? 'Agent' : undefined;
+function modeLabel(mode: 'agent' | undefined): string | undefined {
+    return mode === 'agent' ? 'Agent' : undefined;
 }
 
-function appendModeTag(parent: HTMLElement, mode: 'agent' | 'agent_shadow' | undefined): void {
+function appendModeTag(parent: HTMLElement, mode: 'agent' | undefined): void {
     const label = modeLabel(mode);
     if (!label) return;
     const tag = document.createElement('span');
@@ -564,7 +564,7 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
         const ordinary = entries.filter(row => !groupedIds.has(text(row.logId, '')));
         list.replaceChildren(); listCount.textContent = `${ordinary.length} 条请求 · ${groups.length} 个流程`;
         if (!entries.length) { const empty = document.createElement('div'); empty.className = 'ss-helper-llm-log-empty'; empty.textContent = '没有符合条件的请求日志'; list.append(empty); return; }
-        const renderRow = (row: LogRow, child = false, inheritedMode?: 'agent' | 'agent_shadow', parent: HTMLElement = list): void => {
+        const renderRow = (row: LogRow, child = false, inheritedMode?: 'agent', parent: HTMLElement = list): void => {
             const view = presentLogRow(row);
             const mode = inheritedMode ?? workflowMode(row.workflow);
             const modeText = modeLabel(mode);

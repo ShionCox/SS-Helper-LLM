@@ -47,8 +47,10 @@ Import tokens from the package root only:
 - `LLM_STRUCTURED_TASK_V0` — schema-constrained structured tasks.
 - `LLM_EMBEDDING_V0` — one or more embedding inputs.
 - `LLM_RERANK_V0` — provider-backed document reranking.
-- `LLM_CAPABILITY_STATUS_V0` — current provider capability status.
-- `LLM_ROUTE_CHANGED_V0` — typed route-change event.
+- `LLM_TASK_STATUS_V0` — one consistent task declaration, route, resource and capability snapshot.
+- `LLM_TASK_ROUTE_SET_V0` — explicit task or execution-default resource assignment.
+- `LLM_TASK_STATUS_CHANGED_V0` — revisioned task/resource status event.
+- `LLM_RESOURCE_CAPABILITY_VERIFY_V0` — independent resource capability verification.
 
 Calls accept `signal` and `timeoutMs` in `session.bus.request` options. Provider timeout, cancellation, disposal, late results, and Core replacement are handled by the Bus/session lifecycle; consumers must not build a second RPC bus or global compatibility bridge.
 
@@ -83,7 +85,7 @@ Rerank fails closed when no native rerank provider is available; a lexical fallb
 
 ## Settings and personalized UI
 
-Ordinary LLM settings are registered by the LLM plugin through the single Core Settings Host. A consumer must not create another settings root or mutate LLM storage directly. Personalized advanced routing UI is opened only through the registered Core popup token; arbitrary settings HTML is not a public API.
+Ordinary LLM settings are registered by the LLM plugin through the single Core Settings Host. A consumer must not create another settings root or mutate LLM storage directly. Personalized advanced routing UI is opened only through the registered Core popup capability; arbitrary settings HTML is not a public API.
 
 ## Availability and cleanup
 

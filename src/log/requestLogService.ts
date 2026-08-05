@@ -49,7 +49,7 @@ function numeric(value: unknown): number | undefined {
 }
 
 function isAgentWorkflow(entry: Pick<LLMRequestLogEntry, 'workflow'>): boolean {
-    return entry.workflow?.workflowKind === 'agent' || entry.workflow?.workflowKind === 'agent_shadow';
+    return entry.workflow?.workflowKind === 'agent';
 }
 
 function valueMetadata(value: unknown): LLMRequestLogValueMetadata {
@@ -82,7 +82,7 @@ function requestMetadata(record: RequestRecord, plannedTransport?: string): LLMP
     const embeddingTexts = Array.isArray(snapshot?.embeddingTexts) ? snapshot.embeddingTexts : [];
     const rerankDocs = Array.isArray(snapshot?.rerankDocs) ? snapshot.rerankDocs : [];
     const route = record.routeSnapshot;
-    const authScheme = route?.resourceId === '__builtin_tavern__' ? 'none'
+    const authScheme = route?.resourceId === 'tavern:active' ? 'none'
         : route?.apiType === 'claude' || route?.apiType === 'gemini' ? 'api_key'
             : route?.apiType ? 'bearer' : 'unknown';
     const headerNames = authScheme === 'none' ? []
@@ -386,10 +386,11 @@ export class RequestLogService {
             ? input.parsedResponse
             : response?.state === 'final' ? response.output : undefined;
         const round = response?.diagnostics.toolSessionRound ?? input.toolSessionRound ?? (input.request.toolSessionId ? 2 : 1);
-        const route = input.route ?? (response ? {
-            resourceId: response.route.route,
-            model: response.route.model,
-            providerKind: response.route.provider,
+        const route: LLMRequestLogRouteSnapshot | undefined = input.route ?? (response ? {
+            resourceId: response.route.resourceId ?? 'unknown',
+            resourceLabel: response.route.resourceId ?? 'unknown',
+            ...(response.route.model === undefined ? {} : { model: response.route.model }),
+            ...(response.route.provider === undefined ? {} : { providerKind: response.route.provider }),
         } : undefined);
         const workflow = input.request.trace ?? {
             workflowId: input.request.pipelineRunId,
@@ -660,7 +661,6 @@ export class RequestLogService {
                 startedAt: record.meta.startedAt,
                 finishedAt: record.meta.finishedAt,
                 latencyMs: record.meta.latencyMs,
-                fallbackUsed: record.meta.fallbackUsed,
                 usage: record.meta.usage,
             }
             : undefined;
@@ -689,7 +689,6 @@ export class RequestLogService {
                 startedAt: result.meta.startedAt,
                 finishedAt: result.meta.finishedAt,
                 latencyMs: result.meta.latencyMs,
-                fallbackUsed: result.meta.fallbackUsed,
                 usage: result.meta.usage,
             }
             : undefined;

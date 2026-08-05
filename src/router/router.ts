@@ -5,17 +5,14 @@ import type {
     LLMCapability,
     CapabilityKind,
     ResourceType,
-    GlobalAssignments,
-    AssignmentEntry,
-    GenerationSource,
-    PluginAssignment,
     TaskAssignment,
+    LLMExecution,
 } from '../schema/types';
 import type { ConsumerRegistry } from '../registry/consumer-registry';
-import { createSSHelperError } from '@ss-helper/sdk';
+import { createSSHelperError, type SSHelperReasonCode } from '@ss-helper/sdk';
 
-/** 内置酒馆资源固定 ID */
-export const BUILTIN_TAVERN_RESOURCE_ID = '__builtin_tavern__';
+/** 动态酒馆资源固定 ID；与自定义资源走同一条能力、路由和日志链。 */
+export const BUILTIN_TAVERN_RESOURCE_ID = 'tavern:active';
 
 export interface ProviderRegistration {
     readonly provider: LLMProvider;
@@ -25,49 +22,29 @@ export interface ProviderRegistration {
 }
 
 /**
- * 资源感知任务路由器
+ * 唯一任务路由器。
  *
- * 路由优先级：
- *   generation 来源门控 → routeHint → 任务分配 → 插件注册推荐 → 插件分配 → 全局分配 → fallback
+ * 路由解析只有两级：显式 task assignment → execution default。
+ * 不根据 Provider 名称、URL、模型名或其他同类型资源猜测，也不跨类型
+ * fallback；失败必须停在当前资源并返回结构化诊断。
  */
 export class TaskRouter {
-    private providers: Map<string, LLMProvider> = new Map();
-    private providerCapabilities: Map<string, LLMCapability[]> = new Map();
-    private providerDefaultModels: Map<string, string | undefined> = new Map();
-    private resourceTypes: Map<string, ResourceType> = new Map();
-
-    private globalAssignments: GlobalAssignments = {};
-    private pluginAssignments: Map<string, PluginAssignment> = new Map();
-    private taskAssignments: Map<string, TaskAssignment> = new Map();
-    private generationSource: GenerationSource = 'tavern';
-
+    private providers = new Map<string, LLMProvider>();
+    private providerCapabilities = new Map<string, LLMCapability[]>();
+    private providerDefaultModels = new Map<string, string | undefined>();
+    private resourceTypes = new Map<string, ResourceType>();
+    private executionDefaults = new Map<LLMExecution, string>();
+    private taskAssignments = new Map<string, TaskAssignment>();
     private registry: ConsumerRegistry | null = null;
+    private executionAvailabilityQuery?: (resourceId: string, execution: LLMExecution) => { readonly available: boolean; readonly reasonCode?: SSHelperReasonCode };
 
-    setRegistry(registry: ConsumerRegistry): void {
-        this.registry = registry;
-    }
+    setRegistry(registry: ConsumerRegistry): void { this.registry = registry; }
+    setExecutionAvailabilityQuery(query: (resourceId: string, execution: LLMExecution) => { readonly available: boolean; readonly reasonCode?: SSHelperReasonCode }): void { this.executionAvailabilityQuery = query; }
 
-    // ─── Provider 管理 ───
-
-    registerProvider(
-        provider: LLMProvider,
-        resourceType: ResourceType,
-        capabilities?: LLMCapability[],
-        defaultModel?: string,
-    ): void {
+    registerProvider(provider: LLMProvider, resourceType: ResourceType, capabilities?: readonly LLMCapability[], defaultModel?: string): void {
         this.providers.set(provider.id, provider);
         this.resourceTypes.set(provider.id, resourceType);
-        if (capabilities) {
-            this.providerCapabilities.set(provider.id, capabilities);
-        } else {
-            const caps: LLMCapability[] = [];
-            if (provider.capabilities.chat) caps.push('chat');
-            if (provider.capabilities.json) caps.push('json');
-            if (provider.capabilities.tools) caps.push('tools');
-            if (provider.capabilities.embeddings) caps.push('embeddings');
-            if (provider.capabilities.rerank) caps.push('rerank');
-            this.providerCapabilities.set(provider.id, caps);
-        }
+        this.providerCapabilities.set(provider.id, capabilities ? [...capabilities] : this.inferCapabilities(provider));
         this.providerDefaultModels.set(provider.id, defaultModel);
     }
 
@@ -76,13 +53,9 @@ export class TaskRouter {
         this.providerCapabilities.delete(resourceId);
         this.providerDefaultModels.delete(resourceId);
         this.resourceTypes.delete(resourceId);
+        for (const [execution, value] of this.executionDefaults) if (value === resourceId) this.executionDefaults.delete(execution);
     }
 
-    /**
-     * Atomically replace a caller-owned provider set. All validation and map
-     * construction happens before the live maps are swapped, so a failed
-     * registration cannot leave the router partially updated.
-     */
     replaceManagedProviders(managedIds: readonly string[], registrations: readonly ProviderRegistration[]): void {
         const managed = new Set(managedIds);
         const ids = new Set<string>();
@@ -92,28 +65,8 @@ export class TaskRouter {
             if (!managed.has(id) && this.providers.has(id)) throw new Error(`Provider ID 已被占用: ${id}`);
             ids.add(id);
         }
-
-        const providers = new Map(this.providers);
-        const capabilities = new Map(this.providerCapabilities);
-        const defaultModels = new Map(this.providerDefaultModels);
-        const resourceTypes = new Map(this.resourceTypes);
-        for (const id of managed) {
-            providers.delete(id);
-            capabilities.delete(id);
-            defaultModels.delete(id);
-            resourceTypes.delete(id);
-        }
-        for (const registration of registrations) {
-            const id = registration.provider.id;
-            providers.set(id, registration.provider);
-            resourceTypes.set(id, registration.resourceType);
-            capabilities.set(id, registration.capabilities ? [...registration.capabilities] : this.inferCapabilities(registration.provider));
-            defaultModels.set(id, registration.defaultModel);
-        }
-        this.providers = providers;
-        this.providerCapabilities = capabilities;
-        this.providerDefaultModels = defaultModels;
-        this.resourceTypes = resourceTypes;
+        for (const id of managed) this.removeProvider(id);
+        for (const registration of registrations) this.registerProvider(registration.provider, registration.resourceType, registration.capabilities, registration.defaultModel);
     }
 
     private inferCapabilities(provider: LLMProvider): LLMCapability[] {
@@ -126,198 +79,87 @@ export class TaskRouter {
         return capabilities;
     }
 
-    // ─── 分配设置管理 ───
-
-    applyGenerationSource(source: GenerationSource): void {
-        this.generationSource = source;
+    /** 设置 execution 默认资源；同一 execution 只保留一个确定资源。 */
+    applyExecutionDefaults(defaults: Partial<Record<LLMExecution, string>>): void {
+        for (const execution of ['completion', 'structured', 'tool_turn', 'embedding', 'rerank'] as const) {
+            const resourceId = defaults[execution];
+            if (resourceId === undefined) this.executionDefaults.delete(execution);
+            else this.executionDefaults.set(execution, resourceId);
+        }
     }
 
-    applyGlobalAssignments(assignments: GlobalAssignments): void {
-        this.globalAssignments = { ...assignments };
-    }
-
-    applyPluginAssignments(assignments: PluginAssignment[]): void {
-        this.pluginAssignments.clear();
-        for (const a of assignments) this.pluginAssignments.set(a.pluginId, a);
-    }
-
-    applyTaskAssignments(assignments: TaskAssignment[]): void {
+    applyTaskAssignments(assignments: readonly TaskAssignment[]): void {
         this.taskAssignments.clear();
-        for (const a of assignments) this.taskAssignments.set(`${a.pluginId}::${a.taskKey}`, a);
+        for (const assignment of assignments) {
+            this.taskAssignments.set(`${assignment.pluginId}::${assignment.taskKey}`, { ...assignment });
+        }
     }
 
-    getTaskAssignment(pluginId: string, taskKey: string): TaskAssignment | undefined {
-        return this.taskAssignments.get(`${pluginId}::${taskKey}`);
-    }
-
-    // ─── 统一路由解析 ───
+    getTaskAssignment(pluginId: string, taskKey: string): TaskAssignment | undefined { return this.taskAssignments.get(`${pluginId}::${taskKey}`); }
+    getExecutionDefault(execution: LLMExecution): string | undefined { return this.executionDefaults.get(execution); }
 
     resolveRoute(args: RouteResolveArgs): RouteResolveResult {
-        const { consumer, taskKind, taskKey, requiredCapabilities, routeHint } = args;
-
-        // 1. routeHint
-        if (routeHint?.resourceId) {
-            if (this.providerSatisfiesTask(routeHint.resourceId, taskKind, requiredCapabilities)) {
-                return {
-                    resourceId: routeHint.resourceId,
-                    model: routeHint.model || this.resolveDefaultModel(routeHint.resourceId),
-                    profileId: routeHint.profileId,
-                    resolvedBy: 'route_hint',
-                };
+        const execution = this.resolveExecution(args);
+        const required = [...(args.requiredCapabilities ?? [])];
+        const assignment = args.taskKey ? this.taskAssignments.get(`${args.consumer}::${args.taskKey}`) : undefined;
+        if (assignment?.resourceId) {
+            if (assignment.isStale || !this.providerSatisfiesExecution(assignment.resourceId, execution, required)) {
+                throw createSSHelperError('LLM_TASK_ROUTE_UNAVAILABLE', { stage: 'llm.router.task_assignment', resourceId: assignment.resourceId });
             }
+            this.assertExecutionAvailable(assignment.resourceId, execution);
+            return this.route(assignment.resourceId, 'task_assignment', execution);
         }
-
-        // 2. 任务分配
-        if (taskKey) {
-            const assignment = this.taskAssignments.get(`${consumer}::${taskKey}`);
-            if (assignment) {
-                if (assignment.resourceId && !assignment.isStale && this.providerSatisfiesTask(assignment.resourceId, taskKind, requiredCapabilities)) {
-                    return {
-                        resourceId: assignment.resourceId,
-                        model: assignment.model || this.resolveDefaultModel(assignment.resourceId),
-                        resolvedBy: 'user_task_override',
-                    };
-                }
-                throw createSSHelperError('LLM_TASK_ROUTE_UNAVAILABLE', {
-                    stage: 'llm.router.task_assignment',
-                    ...(assignment.resourceId === undefined ? {} : { resourceId: assignment.resourceId }),
-                    ...(assignment.model === undefined ? {} : { model: assignment.model }),
-                });
-            }
+        const resourceId = this.executionDefaults.get(execution);
+        if (resourceId !== undefined && this.providerSatisfiesExecution(resourceId, execution, required)) {
+            this.assertExecutionAvailable(resourceId, execution);
+            return this.route(resourceId, 'execution_default', execution);
         }
-
-        // 3. 插件注册任务推荐
-        if (taskKey && this.registry) {
-            const taskDesc = this.registry.getTaskDescriptor(consumer, taskKey);
-            if (taskDesc?.recommendedRoute?.resourceId) {
-                if (this.providerSatisfiesTask(taskDesc.recommendedRoute.resourceId, taskKind, requiredCapabilities)) {
-                    return {
-                        resourceId: taskDesc.recommendedRoute.resourceId,
-                        model: this.resolveDefaultModel(taskDesc.recommendedRoute.resourceId),
-                        profileId: taskDesc.recommendedRoute.profileId,
-                        resolvedBy: 'plugin_task_recommend',
-                    };
-                }
-            }
-        }
-
-        // 4. 插件分配
-        const pluginAssignment = this.pluginAssignments.get(consumer);
-        const pluginEntry = pluginAssignment?.[taskKind] as AssignmentEntry | undefined;
-        if (pluginEntry?.resourceId) {
-            if (this.providerSatisfiesTask(pluginEntry.resourceId, taskKind, requiredCapabilities)) {
-                return {
-                    resourceId: pluginEntry.resourceId,
-                    model: pluginEntry.model || this.resolveDefaultModel(pluginEntry.resourceId),
-                    resolvedBy: 'user_plugin_default',
-                };
-            }
-        }
-
-        // 5. 全局分配
-        const globalEntry = this.globalAssignments[taskKind] as AssignmentEntry | undefined;
-        if (globalEntry?.resourceId) {
-            if (this.providerSatisfiesTask(globalEntry.resourceId, taskKind, requiredCapabilities)) {
-                return {
-                    resourceId: globalEntry.resourceId,
-                    model: globalEntry.model || this.resolveDefaultModel(globalEntry.resourceId),
-                    resolvedBy: 'user_global_default',
-                };
-            }
-        }
-
-        // 6. 酒馆模式只允许内置酒馆；自定义模式会在这里跳过。
-        if (taskKind === 'generation' && this.generationSource === 'tavern') {
-            if (this.providers.has(BUILTIN_TAVERN_RESOURCE_ID)) {
-                if (this.providerSatisfiesTask(BUILTIN_TAVERN_RESOURCE_ID, taskKind, requiredCapabilities)) {
-                    return {
-                        resourceId: BUILTIN_TAVERN_RESOURCE_ID,
-                        model: this.resolveDefaultModel(BUILTIN_TAVERN_RESOURCE_ID),
-                        resolvedBy: 'builtin_tavern_fallback',
-                    };
-                }
-            }
-        }
-
-        // 7. 终极 fallback: 先找同类型资源
-        for (const [rid] of this.providers) {
-            const rType = this.resourceTypes.get(rid);
-            if (rType === taskKind && this.providerSatisfiesTask(rid, taskKind, requiredCapabilities)) {
-                return {
-                    resourceId: rid,
-                    model: this.resolveDefaultModel(rid),
-                    resolvedBy: 'fallback',
-                };
-            }
-        }
-
-        // 8. 跨类型 fallback：允许具备所需能力的资源参与，例如 generation 资源承担 rerank
-        for (const [rid] of this.providers) {
-            if (this.providerSatisfiesTask(rid, taskKind, requiredCapabilities)) {
-                return {
-                    resourceId: rid,
-                    model: this.resolveDefaultModel(rid),
-                    resolvedBy: 'fallback',
-                };
-            }
-        }
-
-        throw createSSHelperError('PROVIDER_UNAVAILABLE', {
-            stage: 'llm.router.resolve',
-        });
+        throw createSSHelperError('PROVIDER_UNAVAILABLE', { stage: 'llm.router.resolve', ...(resourceId ? { resourceId } : {}) });
     }
 
-    // ─── 能力查询 ───
-
-    getProviderCapabilities(resourceId: string): LLMCapability[] {
-        return this.providerCapabilities.get(resourceId) || [];
-    }
-
-    listProvidersWithCapabilities(required?: LLMCapability[]): LLMProvider[] {
-        if (!required || required.length === 0) {
-            return Array.from(this.providers.values());
+    private resolveExecution(args: RouteResolveArgs): LLMExecution {
+        if (args.execution) return args.execution;
+        if (args.taskKey) {
+            const descriptor = this.registry?.getTaskDescriptor(args.consumer, args.taskKey);
+            if (descriptor?.execution) return descriptor.execution;
+            if (descriptor?.taskKind === 'embedding') return 'embedding';
+            if (descriptor?.taskKind === 'rerank') return 'rerank';
+            if (descriptor?.requiredCapabilities.includes('tools')) return 'tool_turn';
         }
-        return Array.from(this.providers.values()).filter(p =>
-            this.providerSatisfies(p.id, required),
-        );
+        if (args.taskKind === 'embedding') return 'embedding';
+        if (args.taskKind === 'rerank') return 'rerank';
+        return args.requiredCapabilities?.includes('tools') ? 'tool_turn' : 'structured';
     }
 
-    getAllProviders(): LLMProvider[] {
-        return Array.from(this.providers.values());
+    private route(resourceId: string, resolvedBy: 'task_assignment' | 'execution_default', execution: LLMExecution): RouteResolveResult {
+        return { resourceId, model: this.resolveDefaultModel(resourceId), resolvedBy };
     }
 
-    getProvider(resourceId: string): LLMProvider | undefined {
-        return this.providers.get(resourceId);
+    private providerSatisfiesExecution(resourceId: string, execution: LLMExecution, required: readonly LLMCapability[]): boolean {
+        const type = this.resourceTypes.get(resourceId);
+        const expectedType = execution === 'embedding' ? 'embedding' : execution === 'rerank' ? 'rerank' : 'generation';
+        if (type !== expectedType) return false;
+        const capabilities = this.providerCapabilities.get(resourceId);
+        return capabilities !== undefined && required.every((capability) => capabilities.includes(capability));
     }
 
-    getResourceType(resourceId: string): ResourceType | undefined {
-        return this.resourceTypes.get(resourceId);
-    }
-
-    getDefaultModel(resourceId: string): string | undefined {
-        return this.resolveDefaultModel(resourceId);
-    }
-
-    // ─── 内部方法 ───
-
-    private providerSatisfies(resourceId: string, required?: LLMCapability[]): boolean {
-        if (!required || required.length === 0) return true;
-        const caps = this.providerCapabilities.get(resourceId);
-        if (!caps) return false;
-        return required.every(c => caps.includes(c));
-    }
-
-    private providerSatisfiesTask(resourceId: string, taskKind: CapabilityKind, required?: LLMCapability[]): boolean {
-        const tavern = resourceId === BUILTIN_TAVERN_RESOURCE_ID;
-        if (taskKind === 'generation') {
-            if (this.generationSource === 'tavern' ? !tavern : tavern) return false;
-        } else if (tavern) {
-            return false;
+    private assertExecutionAvailable(resourceId: string, execution: LLMExecution): void {
+        const result = this.executionAvailabilityQuery?.(resourceId, execution);
+        if (result?.available === false) {
+            throw createSSHelperError(result.reasonCode ?? 'LLM_REASONING_CAPABILITY_UNVERIFIED', {
+                stage: 'llm.router.reasoning',
+                resourceId,
+            });
         }
-        return this.providerSatisfies(resourceId, required);
     }
 
-    private resolveDefaultModel(resourceId: string): string | undefined {
-        return this.providerDefaultModels.get(resourceId);
+    getProviderCapabilities(resourceId: string): LLMCapability[] { return this.providerCapabilities.get(resourceId) || []; }
+    listProvidersWithCapabilities(required?: readonly LLMCapability[]): LLMProvider[] {
+        return [...this.providers.values()].filter((provider) => !required || required.every((capability) => this.getProviderCapabilities(provider.id).includes(capability)));
     }
+    getAllProviders(): LLMProvider[] { return [...this.providers.values()]; }
+    getProvider(resourceId: string): LLMProvider | undefined { return this.providers.get(resourceId); }
+    getResourceType(resourceId: string): ResourceType | undefined { return this.resourceTypes.get(resourceId); }
+    getDefaultModel(resourceId: string): string | undefined { return this.resolveDefaultModel(resourceId); }
+    private resolveDefaultModel(resourceId: string): string | undefined { return this.providerDefaultModels.get(resourceId); }
 }

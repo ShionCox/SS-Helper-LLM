@@ -127,11 +127,8 @@ export class RequestOrchestrator {
         if (record.state === 'queued') {
             record.state = 'cancelled';
             record.finishedAt = Date.now();
-            const diagnostic = describeSSHelperFailure(createSSHelperError('CANCELLED', {
-                stage: 'llm.orchestrator.cancel',
-                requestId: record.requestId,
-            }));
-            record.resolveResult?.({ ok: false, error: diagnostic.title, reasonCode: diagnostic.reasonCode });
+            const failure = readSSHelperFailure(createSSHelperError('CANCELLED', { stage: 'llm.orchestrator.cancel', requestId: record.requestId }))!;
+            record.resolveResult?.({ ok: false, reasonCode: failure.reasonCode, failure });
             this.removeFromQueue(requestId);
             this.archiveRecord(record);
         }
@@ -201,11 +198,8 @@ export class RequestOrchestrator {
         for (const record of pending) this.finishCancelled(record, 'LLM 请求编排器已关闭');
         for (const activeRequest of this.activeRequests.values()) {
             activeRequest.validity.isCancelled = true;
-            const diagnostic = describeSSHelperFailure(createSSHelperError('CANCELLED', {
-                stage: 'llm.orchestrator.dispose',
-                requestId: activeRequest.requestId,
-            }));
-            activeRequest.resolveResult?.({ ok: false, error: diagnostic.title, reasonCode: diagnostic.reasonCode });
+            const failure = readSSHelperFailure(createSSHelperError('CANCELLED', { stage: 'llm.orchestrator.dispose', requestId: activeRequest.requestId }))!;
+            activeRequest.resolveResult?.({ ok: false, reasonCode: failure.reasonCode, failure });
         }
         this.executeCallback = null;
         this.archiveCallback = null;
@@ -271,7 +265,6 @@ export class RequestOrchestrator {
                     };
                 }
                 if (result.ok || result.meta) {
-                    const fallbackUsed = result.ok ? result.meta.fallbackUsed : (result.meta?.fallbackUsed ?? result.fallbackUsed);
                     const meta: LLMRunMeta = {
                         ...(result.meta ?? {}),
                         requestId: record.requestId,
@@ -282,7 +275,6 @@ export class RequestOrchestrator {
                         startedAt: record.startedAt,
                         finishedAt: record.finishedAt,
                         latencyMs: record.finishedAt - (record.startedAt ?? record.queuedAt),
-                        ...(fallbackUsed === undefined ? {} : { fallbackUsed }),
                     };
                     record.meta = meta;
                     if (result.ok) result.meta = meta;
@@ -310,9 +302,9 @@ export class RequestOrchestrator {
             record.debug = { ...(record.debug ?? {}), failure };
             record.resolveResult?.({
                 ok: false,
-                error: diagnostic.title,
                 retryable: diagnostic.retryable,
                 reasonCode: failure.reasonCode,
+                failure,
             });
             this.archiveRecord(record);
             logger.error('[RequestLifecycle][Failed]', {
@@ -342,11 +334,8 @@ export class RequestOrchestrator {
         record.validity.isCancelled = true;
         record.state = 'cancelled';
         record.finishedAt = Date.now();
-        const diagnostic = describeSSHelperFailure(createSSHelperError('CANCELLED', {
-            stage: 'llm.orchestrator.cancel',
-            requestId: record.requestId,
-        }));
-        record.resolveResult?.({ ok: false, error: diagnostic.title, reasonCode: diagnostic.reasonCode });
+        const failure = readSSHelperFailure(createSSHelperError('CANCELLED', { stage: 'llm.orchestrator.cancel', requestId: record.requestId }))!;
+        record.resolveResult?.({ ok: false, reasonCode: failure.reasonCode, failure });
         this.archiveRecord(record);
     }
 

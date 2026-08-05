@@ -84,9 +84,11 @@ test('request log viewer uses JSONEditor and keeps status beside the title', () 
   assert.match(viewerSource, /titleGroup\.append\(title\)/u);
   assert.match(viewerSource, /top\.append\(titleGroup, time\)/u);
   assert.match(viewerStyles, /\.ss-helper-llm-log-item-status\[data-state="failed"\]/u);
-  assert.match(viewerStyles, /\.ss-helper-llm-log-mode-tag\[data-mode="agent_shadow"\]/u);
   assert.match(viewerStyles, /\.ss-helper-llm-log-detail-pane > \.ss-helper-llm-json-editor[^}]+width: auto;[^}]+max-width: calc\(100% - 24px\)/u);
-  assert.match(viewerStyles, /\.ss-helper-llm-json-editor \.jse-main[^}]+min-width: 0;[^}]+overflow: hidden/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-json-editor \.jse-main[^}]+min-width: 0;[^}]+height: 100%;[^}]+flex: 1 1 auto;[^}]+overflow: hidden/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-log-detail-section[^}]+min-height: 0;[^}]+display: flex;[^}]+flex-direction: column/u);
+  assert.match(viewerStyles, /\.ss-helper-llm-log-detail-section > \.ss-helper-llm-json-editor[^}]+height: auto;[^}]+min-height: 0;[^}]+flex: 1 1 0/u);
+  assert.match(viewerStyles, /details\[open\][^}]+display: flex;[^}]+flex: 1 1 0;[^}]+flex-direction: column/u);
 });
 
 test('request log viewer removes undefined values recursively from detail payloads', () => {
@@ -115,7 +117,6 @@ test('request log viewer groups Agent turns with accessible controls and SDK-own
   assert.match(viewerSource, /\.confirm\(/u);
   assert.equal(viewerSource.includes('navigator.clipboard'), false);
   assert.equal(viewerSource.includes('rerankQuery: undefined'), false);
-  assert.match(viewerSource, /Agent Shadow/u);
   assert.match(viewerSource, /callScope/u);
   assert.match(viewerSource, /agent_workflow/u);
 });

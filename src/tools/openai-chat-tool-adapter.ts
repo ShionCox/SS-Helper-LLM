@@ -1,7 +1,8 @@
-import { createSSHelperError, type NormalizedToolCall, type NormalizedToolResult, type PlainData, type ProviderToolDialect } from '@ss-helper/sdk';
+import { createSSHelperError, type LlmReasoningPolicy, type NormalizedToolCall, type NormalizedToolResult, type PlainData, type ProviderToolDialect } from '@ss-helper/sdk';
 import type { JsonHttpTransport, ProviderToolAdapter, ProviderToolStartInput, ProviderToolStep } from './tool-adapter';
 import { canonicalToolName, createProviderToolNameAliases, estimateJsonBytes, parseArguments, parseFinalOutput, providerToolName, usageFromOpenAi, validateCalls, type ProviderToolNameAliases } from './tool-adapter-utils';
 import { OpenAiToolStreamAssembler } from './tool-stream-assembler';
+import { compileReasoningFields, type ReasoningProvider } from '../providers/reasoning-policy';
 
 export type OpenAiChatDialectKind = 'standard' | 'deepseek' | 'kimi' | 'glm';
 export interface OpenAiChatToolDialectPolicy {
@@ -16,7 +17,7 @@ export interface OpenAiChatToolDialectPolicy {
 
 export const OPENAI_CHAT_DIALECT_POLICIES: Readonly<Record<OpenAiChatDialectKind, OpenAiChatToolDialectPolicy>> = Object.freeze({
     standard: { kind: 'standard', preserveAssistantMessageVerbatim: true, preserveReasoningContent: false, requireToolNameOnResult: false, toolChoiceMode: 'full', supportsStrict: 'none', supportsToolStream: false },
-    deepseek: { kind: 'deepseek', preserveAssistantMessageVerbatim: true, preserveReasoningContent: true, requireToolNameOnResult: false, toolChoiceMode: 'full', supportsStrict: 'beta', supportsToolStream: false },
+    deepseek: { kind: 'deepseek', preserveAssistantMessageVerbatim: true, preserveReasoningContent: true, requireToolNameOnResult: false, toolChoiceMode: 'full', supportsStrict: 'none', supportsToolStream: false },
     kimi: { kind: 'kimi', preserveAssistantMessageVerbatim: true, preserveReasoningContent: true, requireToolNameOnResult: true, toolChoiceMode: 'full', supportsStrict: 'none', supportsToolStream: true },
     glm: { kind: 'glm', preserveAssistantMessageVerbatim: true, preserveReasoningContent: true, requireToolNameOnResult: false, toolChoiceMode: 'auto_only', supportsStrict: 'none', supportsToolStream: true },
 });
@@ -28,6 +29,7 @@ interface OpenAiChatToolState {
     readonly allowedNames: readonly string[];
     readonly toolNames: ProviderToolNameAliases;
     readonly maxTokens: number;
+    readonly reasoning?: LlmReasoningPolicy;
     readonly lastAssistant?: Record<string, unknown>;
 }
 
@@ -37,13 +39,17 @@ const DIALECTS: Readonly<Record<OpenAiChatDialectKind, ProviderToolDialect>> = O
 
 export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatToolState> {
     readonly dialect: ProviderToolDialect;
-    readonly version = 5;
+    readonly version = 8;
+    readonly toolStreamCapability: 'incremental' | 'unsupported';
+    readonly strictToolSchemaCapability: 'beta' | 'unsupported';
     constructor(
         private readonly transport: JsonHttpTransport,
         private readonly policy: OpenAiChatToolDialectPolicy,
-        private readonly options: { readonly requireReasoningContent?: boolean; readonly enableToolStream?: boolean } = {},
+        private readonly options: { readonly requireReasoningContent?: boolean; readonly enableToolStream?: boolean; readonly reasoningProvider?: ReasoningProvider } = {},
     ) {
         this.dialect = DIALECTS[policy.kind];
+        this.toolStreamCapability = policy.supportsToolStream ? 'incremental' : 'unsupported';
+        this.strictToolSchemaCapability = policy.supportsStrict === 'beta' ? 'beta' : 'unsupported';
     }
 
     async start(input: ProviderToolStartInput): Promise<ProviderToolStep<OpenAiChatToolState>> {
@@ -70,8 +76,9 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
             allowedNames: input.tools.map((tool) => tool.name),
             toolNames,
             maxTokens: input.maxTokens,
+            ...(input.reasoning === undefined ? {} : { reasoning: input.reasoning }),
         };
-        const toolChoice = input.toolChoice === 'required' && this.policy.kind === 'standard' ? 'required' : 'auto';
+        const toolChoice = input.toolChoice === 'required' && this.policy.toolChoiceMode === 'full' ? 'required' : 'auto';
         return this.send(base, true, input.signal, toolChoice);
     }
 
@@ -109,9 +116,22 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
             messages: state.messages,
             max_tokens: state.maxTokens,
             stream: useStream,
+            ...compileReasoningFields({
+                provider: this.options.reasoningProvider ?? (this.policy.kind === 'deepseek' ? 'deepseek' : this.policy.kind === 'kimi' ? 'kimi' : this.policy.kind === 'glm' ? 'glm' : 'generic'),
+                dialect: this.dialect,
+                policy: state.reasoning,
+                execution: 'tool_turn',
+            }),
+            ...(this.options.reasoningProvider === 'tavern' && state.reasoning !== undefined ? { __ss_helper_reasoning: state.reasoning } : {}),
             ...(useStream && this.policy.kind === 'glm' ? { tool_stream: true } : {}),
-            ...(allowTools ? { tools: state.tools, tool_choice: toolChoice } : {}),
-            ...(this.policy.kind === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
+            ...(allowTools ? {
+                tools: state.tools,
+                // DeepSeek V4 enables thinking by default and rejects tool_choice
+                // in thinking mode. The caller still enforces required tool use
+                // locally by rejecting a turn that does not emit a valid call.
+                ...(this.policy.kind === 'deepseek' ? {} : { tool_choice: toolChoice }),
+            } : {}),
+            ...(!allowTools && this.policy.kind === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
         };
         const data = useStream
             ? this.assembleStream(await this.transport.sendStream!(body, signal))
@@ -125,11 +145,14 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
         const message = choices[0]?.message;
         if (typeof message !== 'object' || message === null || Array.isArray(message)) this.integrity('one assistant message');
         const assistant: Record<string, unknown> = { ...(message as Record<string, unknown>), role: 'assistant' };
-        if (this.options.requireReasoningContent === true && Array.isArray(assistant.tool_calls) && assistant.reasoning_content === undefined) {
+        const rawCalls = Array.isArray(assistant.tool_calls) ? assistant.tool_calls as Array<Record<string, unknown>> : [];
+        if (this.policy.kind === 'deepseek' && rawCalls.length > 0 && assistant.content == null) assistant.content = '';
+        const requiresReasoningReplay = this.options.requireReasoningContent === true
+            || (this.policy.kind === 'deepseek' && state.reasoning?.mode === 'enabled');
+        if (requiresReasoningReplay && rawCalls.length > 0 && assistant.reasoning_content === undefined) {
             this.integrity('reasoning_content for an enabled thinking tool turn');
         }
         const next = { ...state, messages: [...state.messages, assistant], lastAssistant: assistant };
-        const rawCalls = Array.isArray(assistant.tool_calls) ? assistant.tool_calls as Array<Record<string, unknown>> : [];
         if (rawCalls.length > 0) {
             const calls: NormalizedToolCall[] = rawCalls.map((call, index) => {
                 const fn = call.function;

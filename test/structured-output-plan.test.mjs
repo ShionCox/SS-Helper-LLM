@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { OpenAIProvider, createStructuredOutputPlan, detectStructuredOutputIdentity } from '../dist/index.js';
+import { OpenAIProvider, createStructuredOutputPlan, structuredOutputIdentityFromSource } from '../dist/index.js';
 
 const strictSchema = {
   type: 'object',
@@ -9,7 +9,7 @@ const strictSchema = {
   required: ['value'],
 };
 
-const identity = detectStructuredOutputIdentity({ manualVendor: 'openai', model: 'gpt-4o-mini' });
+const identity = structuredOutputIdentityFromSource({ manualVendor: 'openai', model: 'gpt-4o-mini' });
 
 test('planner follows explicit provider capability instead of URL or model-name guessing', () => {
   const strict = createStructuredOutputPlan({
@@ -43,7 +43,7 @@ test('planner deterministically falls back when strict schema transport cannot r
 
 test('Tavern capability selects the host native schema transport regardless of model identity', () => {
   const plan = createStructuredOutputPlan({
-    identity: detectStructuredOutputIdentity({ manualVendor: 'auto', provider: 'custom', model: 'oracle-x' }),
+    identity: structuredOutputIdentityFromSource({ manualVendor: 'auto', provider: 'custom', model: 'oracle-x' }),
     capability: { transports: ['tavern_json_schema', 'prompt_only'], preferred: 'tavern_json_schema' },
     spec: { name: 'memory_capture', schema: strictSchema },
   });
@@ -125,7 +125,7 @@ test('Provider does not infer DeepSeek response_format support from an unsafe me
     }), { status: 400 }),
   });
   const plan = createStructuredOutputPlan({
-    identity: detectStructuredOutputIdentity({ manualVendor: 'deepseek', model: 'deepseek-v4' }),
+    identity: structuredOutputIdentityFromSource({ manualVendor: 'deepseek', model: 'deepseek-v4' }),
     capability: provider.capabilities.structuredOutput,
     spec: { name: 'extract', schema: strictSchema },
   });
