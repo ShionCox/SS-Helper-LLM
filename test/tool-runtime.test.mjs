@@ -343,6 +343,51 @@ test('Agent schema failures log the parsed output and every safe validation issu
   service.dispose();
 });
 
+test('itemized Agent validation rejects invalid envelopes and preserves partial results across continuation', async () => {
+  let useTools = false;
+  const adapter = {
+    dialect: 'openai_chat_compatible', version: 1,
+    async start(input) {
+      if (input.messages[0].content.includes('probe')) {
+        return { state: 'tool_calls', calls: [{ callId: 'probe-1', name: 'ss_helper_tool_probe', arguments: { value: 'probe-a' } }], adapterState: { probe: true } };
+      }
+      return useTools
+        ? { state: 'tool_calls', calls: [{ callId: 'call-1', name: tool.name, arguments: { mentions: ['x'] } }], adapterState: {} }
+        : { state: 'final', output: { actors: 'invalid' }, adapterState: {} };
+    },
+    async continue(state) {
+      return { state: 'final', output: state.probe ? { ok: true } : { actors: [{}, { localId: 'valid' }] }, adapterState: {} };
+    },
+    estimateStateBytes: () => 1, dispose() {},
+  };
+  const provider = { id: 'resource:partial', capabilities: { chat: true, json: true, tools: true }, createToolAdapter: () => adapter };
+  const resource = { id: provider.id, type: 'generation', source: 'custom', apiType: 'generic', label: 'Partial', baseUrl: 'https://example.invalid/v1', model: 'model:partial', enabled: true };
+  const router = new TaskRouter();
+  router.registerProvider(provider, 'generation', ['chat', 'json', 'tools'], resource.model);
+  router.applyExecutionDefaults({ tool_turn: resource.id });
+  const service = new LlmToolTurnService(router, { getResource: () => resource }, fixedTestMaxTokens);
+  const signal = new AbortController().signal;
+  try {
+    assert.equal((await service.verify(resource.id, resource.model, true, 'verify-partial', signal)).capability.status, 'verified');
+    const scope = { task: 'entities', pipelineRunId: 'pipeline-partial', chatKey: 'chat-partial' };
+    const request = {
+      ...scope, input: { messages: startInput().messages }, tools: [tool],
+      outputSchema: { type: 'object', properties: { actors: { type: 'array', items: { type: 'object', properties: { localId: { type: 'string' } }, required: ['localId'], additionalProperties: false } } }, required: ['actors'], additionalProperties: false },
+      validationMode: 'itemized_partial', validationCollections: ['actors'],
+    };
+    await assert.rejects(service.turn(request, 'memory', 'invalid-envelope', signal),
+      (error) => error?.details?.reasonCode === 'SCHEMA_VALIDATION_FAILED');
+    useTools = true;
+    const started = await service.turn(request, 'memory', 'partial-start', signal);
+    assert.equal(started.state, 'tool_calls');
+    const result = await service.turn({ ...scope, toolSessionId: started.toolSessionId, toolResults: [{ callId: 'call-1', name: tool.name, ok: true, content: {} }] }, 'memory', 'partial-final', signal);
+    assert.equal(result.state, 'final');
+    assert.deepEqual(result.output, { actors: [{ localId: 'valid' }] });
+    assert.equal(result.itemRejections.length, 1);
+    assert.equal(result.itemRejections[0].itemIndex, 0);
+  } finally { service.dispose(); }
+});
+
 test('Agent protocol failures forward private response evidence to the request logger', async () => {
   const logged = [];
   const rawResponseText = 'data: {"choices":[';
@@ -688,6 +733,45 @@ test('ToolSessionManager enforces scope, exact result pairing and bounded active
   const completed = await manager.continue(started.toolSessionId, scope, [{ callId: 'call-1', name: tool.name, ok: true, content: { ref: 'O07' } }], startInput().signal);
   assert.equal(completed.step.state, 'final');
   assert.equal(manager.activeCount, 0);
+});
+
+test('ToolSessionManager reserves capacity during asynchronous starts and releases failed or completed reservations', async () => {
+  const manager = new ToolSessionManager();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let starts = 0;
+  let fail = false;
+  let final = false;
+  const adapter = {
+    dialect: 'openai_chat_compatible', version: 1,
+    async start() {
+      starts += 1;
+      await gate;
+      if (fail) throw new Error('start failed');
+      return final
+        ? { state: 'final', output: { itemRef: 'O07' }, adapterState: {} }
+        : { state: 'tool_calls', calls: [{ callId: 'call-1', name: tool.name, arguments: { mentions: ['x'] } }], adapterState: {} };
+    },
+    estimateStateBytes: () => 1, dispose() {},
+  };
+  const base = { ...startInput(), callerPluginId: 'memory', taskKey: 'inventory', pipelineRunId: 'p1', chatKey: 'c1', adapter, capability: { status: 'verified', resourceId: 'resource:1', model: 'model:1', dialect: adapter.dialect, probeVersion: 1 } };
+  try {
+    const first = manager.start(base);
+    const second = manager.start(base);
+    await assert.rejects(manager.start(base), (error) => error?.details?.reasonCode === 'LLM_TOOL_SESSION_CAPACITY_EXCEEDED');
+    assert.equal(starts, 2);
+    release();
+    const sessions = await Promise.all([first, second]);
+    assert.equal(manager.activeCount, 2);
+    sessions.forEach((session) => manager.cancel(session.toolSessionId));
+    fail = true;
+    await assert.rejects(manager.start(base), /start failed/);
+    fail = false;
+    final = true;
+    await manager.start(base);
+    await manager.start(base);
+    assert.equal(manager.activeCount, 0);
+  } finally { release(); manager.dispose(); }
 });
 
 test('ToolSessionManager admits six calls in one round and records a rejected seventh call safely', async () => {

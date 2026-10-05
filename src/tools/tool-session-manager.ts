@@ -97,10 +97,21 @@ const nextSessionId = (): string => `tool_session_${Date.now()}_${++sessionSeque
 
 export class ToolSessionManager {
     private readonly sessions = new Map<string, ToolSessionRecord>();
+    private readonly pendingStarts = new Set<ToolSessionScope>();
 
     async start(input: ToolSessionStartInput, now = Date.now()): Promise<ManagedToolStep> {
         this.sweep(now);
         this.assertCapacity(input);
+        const reservation = { ...input };
+        this.pendingStarts.add(reservation);
+        try {
+            return await this.startReserved(input, now);
+        } finally {
+            this.pendingStarts.delete(reservation);
+        }
+    }
+
+    private async startReserved(input: ToolSessionStartInput, now: number): Promise<ManagedToolStep> {
         const step = await input.adapter.start({
             resourceId: input.resourceId,
             model: input.model,
@@ -227,7 +238,7 @@ export class ToolSessionManager {
     }
 
     private assertCapacity(input: ToolSessionScope): void {
-        const records = [...this.sessions.values()];
+        const records = [...this.sessions.values(), ...this.pendingStarts];
         if (records.length >= TOOL_SESSION_LIMITS.global
             || records.filter((record) => record.callerPluginId === input.callerPluginId).length >= TOOL_SESSION_LIMITS.perPlugin
             || records.filter((record) => record.callerPluginId === input.callerPluginId && record.chatKey === input.chatKey).length >= TOOL_SESSION_LIMITS.perChat

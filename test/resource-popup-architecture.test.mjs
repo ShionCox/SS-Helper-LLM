@@ -29,8 +29,28 @@ function resourceWizard(source) {
   });
 }
 
+test('resource names are optional and advanced visibility never changes saved overrides', async () => {
+  for (const label of ['', 'My custom resource']) {
+    let saved;
+    const controller = new ResourceWizardController({
+      mode: 'edit', source: { ...resource, label, toolDialect: 'openai_responses' }, hasStoredSecret: true, timeoutMs: 30000,
+      repository: { getResourceSecret: async () => 'existing-key', saveResource: async (candidate) => { saved = candidate; } },
+      ui: { close() {} }, notify() {}, verification: { verify: async () => ({ ok: true, checks: {} }) }, toolServices: {},
+    });
+    controller.change('showAdvanced', true);
+    controller.change('showAdvanced', false);
+    assert.equal(controller.snapshot().dirty, false);
+    await controller.submit(); await controller.submit(); await controller.submit(); await controller.submit();
+    assert.equal(saved.label, label || 'OpenAI-compatible · model-a');
+    assert.equal(saved.toolDialect, 'openai_responses');
+    controller.dispose();
+  }
+});
+
 test('resource wizard shows only purpose-specific connection fields', () => {
   const controller = resourceWizard();
+  assert.equal(controller.snapshot().hiddenFieldIds.includes('toolDialect'), true);
+  controller.change('showAdvanced', true);
   controller.change('apiType', 'xai');
   let snapshot = controller.snapshot();
   assert.equal(snapshot.values.connectionMode, 'official');
@@ -77,6 +97,7 @@ test('DeepSeek official resources switch between standard and Beta endpoints wit
     id: 'deepseek-beta', type: 'generation', source: 'custom', apiType: 'deepseek', label: 'DeepSeek Beta',
     baseUrl: 'https://api.deepseek.com/beta', model: 'deepseek-chat', enabled: true,
   });
+  controller.change('showAdvanced', true);
   let snapshot = controller.snapshot();
   assert.equal(snapshot.values.connectionMode, 'official');
   assert.equal(snapshot.values.deepseekApiMode, 'beta');
@@ -376,7 +397,6 @@ test('LLM UI has no Memory-owned task routing surface and protects consumer assi
   const settings = await readFile(new URL('../src/ss-helper/settings.ts', import.meta.url), 'utf8');
   assert.doesNotMatch(plugin, /route-manager|MEMORY_ROUTING_TASKS|memory_extract_(?:single|entities|narrative|inventory|repair)/u);
   assert.doesNotMatch(settings, /route-manager|routeManager|open-route-manager/u);
-  assert.match(plugin, /editableGenericRoutingSettings[\s\S]+taskAssignments:\s*_consumerOwnedTaskAssignments/u);
-  assert.match(plugin, /mergeGenericRoutingSettings[\s\S]+Object\.hasOwn\(edited, 'taskAssignments'\)[\s\S]+current\.taskAssignments/u);
+  assert.doesNotMatch(plugin, /editableGenericRoutingSettings|mergeGenericRoutingSettings|advanced-routing|queue-manager/u);
   assert.doesNotMatch(plugin, /pluginAssignments:[^\n]+taskAssignments/u);
 });

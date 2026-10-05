@@ -5,6 +5,29 @@ import { API_VERSION, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION } from '@ss-hel
 import { LlmSettingsStatusMonitor, createWorkspaceLlmSettingsAdapter } from '../dist/index.js';
 
 const wait = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('simplified settings preserve hidden values and convert seconds without losing precision', async () => {
+  let settings = { timeoutMs: 12345, maxTokensMode: 'adaptive', maxTokens: 5120, maxTokensControl: { adaptive: { min: 800 } }, requestLogging: { enabled: false, detailMode: 'full', maxEntries: 333 } };
+  const adapter = createWorkspaceLlmSettingsAdapter({
+    loadSettings: async () => settings,
+    updateSettings: async (mutator) => (settings = mutator(settings)),
+  }, { loadStatus: () => ({}), subscribeStatus: () => () => {} });
+  const values = await adapter.load();
+  assert.equal(values.timeoutSeconds, 12.345);
+  assert.equal(values['requestLogging.detailMode'], 'off');
+  assert.equal('requestLogging.enabled' in values, false);
+  assert.equal((await adapter.loadFieldState()).maxTokens.hidden, true);
+  await adapter.save({ ...values, enabled: true });
+  assert.equal(settings.timeoutMs, 12345);
+  assert.equal(settings.maxTokens, 5120);
+  assert.equal(settings.maxTokensControl.adaptive.min, 800);
+  assert.equal(settings.requestLogging.maxEntries, 333);
+  await adapter.save({ maxTokensMode: 'manual', 'requestLogging.detailMode': 'summary', timeoutSeconds: 30 });
+  assert.equal(settings.timeoutMs, 30000);
+  assert.equal(settings.requestLogging.enabled, true);
+  assert.equal(settings.maxTokensControl.manualValue, 5120);
+  assert.equal((await adapter.loadFieldState()).maxTokens.hidden, false);
+});
 const llmConfig = JSON.parse(readFileSync(new URL('../plugin.config.json', import.meta.url), 'utf8'));
 const sdkConfig = JSON.parse(readFileSync(new URL('../../SS-Helper-SDK/plugin.config.json', import.meta.url), 'utf8'));
 const LLM_PLUGIN_VERSION = llmConfig.manifest.version;

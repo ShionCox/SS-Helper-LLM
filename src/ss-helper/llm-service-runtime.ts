@@ -356,6 +356,7 @@ export function createProductionLlmServices(
                 settingsState.value = { ...settings };
                 requestRateLimiter.setMaxRequestsPerMinute(settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute);
                 sdk.setGlobalProfile(settings.globalProfile ?? 'balanced');
+                router.replaceManagedProviders([...managed], registrations);
                 const generationDefault = settings.globalAssignments?.generation?.resourceId ?? BUILTIN_TAVERN_RESOURCE_ID;
                 router.applyExecutionDefaults({
                     completion: generationDefault,
@@ -366,7 +367,6 @@ export function createProductionLlmServices(
                 });
                 router.applyTaskAssignments(settings.taskAssignments ?? []);
                 budget.replaceConfigs(settings.budgets ?? {});
-                router.replaceManagedProviders([...managed], registrations);
                 const nextResources = settings.resources ?? [];
                 const nextById = new Map(nextResources.map((resource) => [resource.id, resource]));
                 for (const previous of previousResources) {
@@ -600,7 +600,7 @@ export function createProductionLlmServices(
             const required = descriptor.requiredCapabilities ?? (execution === 'tool_turn' ? ['chat', 'tools'] : execution === 'embedding' ? ['embeddings'] : execution === 'rerank' ? ['rerank'] : ['chat', 'json']);
             const capabilities = router.getProviderCapabilities(assignment.resourceId);
             if (router.getResourceType(assignment.resourceId) !== expectedType || !required.every((capability) => capabilities.includes(capability))) throw createSSHelperError('LLM_CAPABILITY_UNAVAILABLE', { stage: 'llm.task-route.save', resourceId: assignment.resourceId });
-            return [{ pluginId: callerPluginId, taskKey: assignment.taskKey, taskKind: descriptor.taskKind ?? (expectedType === 'embedding' ? 'embedding' : expectedType === 'rerank' ? 'rerank' : 'generation'), execution, resourceId: assignment.resourceId, isStale: false }];
+            return [{ pluginId: callerPluginId, taskKey: assignment.taskKey, taskKind: descriptor.taskKind ?? (expectedType === 'embedding' ? 'embedding' : expectedType === 'rerank' ? 'rerank' : 'generation'), resourceId: assignment.resourceId, isStale: false }];
         });
         const apply = (current: LLMHubSettings): LLMHubSettings & Record<string, unknown> => {
             const retained = (current.taskAssignments ?? []).filter((assignment) => assignment.pluginId !== callerPluginId || !incomingKeys.has(assignment.taskKey));

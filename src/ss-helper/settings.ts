@@ -1,4 +1,4 @@
-import type { SettingsAdapter, SettingsSchema, SettingsValues, ToastNotification } from '@ss-helper/sdk';
+import type { SettingsAdapter, SettingsFieldStateMap, SettingsSchema, SettingsValues, ToastNotification } from '@ss-helper/sdk';
 import config from '../../plugin.config.json' with { type: 'json' };
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMHubSettings } from '../schema/types';
@@ -32,10 +32,10 @@ export const LLM_SETTINGS_SCHEMA = {
                 { kind: 'select', id: 'maxTokensMode', label: '输出长度', description: '自动按内容决定长度；手动可以设置最大值。', options: [{ value: 'inherit', label: '跟随模型' }, { value: 'adaptive', label: '自动估算' }, { value: 'manual', label: '手动上限' }], defaultValue: DEFAULT_LLM_SETTINGS.maxTokensMode },
                 { kind: 'number', id: 'maxTokens', label: '手动最大长度', description: '仅在选择手动上限时使用。', defaultValue: DEFAULT_LLM_SETTINGS.maxTokens, validation: { min: 1, max: 32768 }, step: 128, unit: 'tokens', showStepper: true },
             ] },
-            { kind: 'section', id: 'requestDisplay', label: '请求与展示', children: [
+            { kind: 'section', id: 'requestDisplay', label: '高级：请求与展示', collapsible: true, children: [
                 { kind: 'toggle', id: 'streamingEnabled', label: '流式响应', description: '控制自定义 API 的普通生成、结构化请求和 Agent 工具调用；酒馆当前模型沿用酒馆设置。', defaultValue: DEFAULT_LLM_SETTINGS.streamingEnabled },
                 { kind: 'number', id: 'maxRequestsPerMinute', label: '请求速率上限', description: '限制普通请求、自动重试和 Agent 模型轮次的启动频率；0 表示不限速。', defaultValue: DEFAULT_LLM_SETTINGS.maxRequestsPerMinute, validation: { min: 0, max: 60000 }, step: 1, unit: '次/分钟', showStepper: true },
-                { kind: 'number', id: 'timeoutMs', label: '请求超时', description: '超过这个时间仍未完成时停止请求。', defaultValue: DEFAULT_LLM_SETTINGS.timeoutMs, validation: { min: 1000, max: 300000 }, step: 1000, unit: '毫秒', showStepper: true },
+                { kind: 'number', id: 'timeoutSeconds', label: '请求超时', description: '超过这个时间仍未完成时停止请求。', defaultValue: DEFAULT_LLM_SETTINGS.timeoutMs / 1000, validation: { min: 1, max: 300 }, step: 0.001, unit: '秒', showStepper: false },
             ] },
             { kind: 'section', id: 'sourceConfiguration', label: '模型来源', children: [
                 { kind: 'action', id: 'generationSourceConfig', label: '默认生成来源', description: '选择酒馆当前连接或已添加的自定义生成 API。', actionId: 'open-generation-source', placement: 'inline', buttonLabel: '设置', popup: LLM_GENERATION_SOURCE_POPUP },
@@ -55,28 +55,28 @@ export const LLM_SETTINGS_SCHEMA = {
                 { kind: 'action', id: 'routePreview', label: '路由预览', description: '查看一次请求最终会使用哪个资源和模型。', actionId: 'open-route-preview', placement: 'inline', buttonLabel: '预览', popup: popup('route-preview') },
             ] },
             { kind: 'section', id: 'routingAdvanced', label: '高级配置', children: [
-                { kind: 'action', id: 'advanced', label: '高级规则', description: '编辑全局与插件级通用路由；各插件拥有的任务分配不会在这里展示或修改。', actionId: 'open-advanced', placement: 'inline', buttonLabel: '编辑', popup: popup('advanced-routing') },
+                { kind: 'action', id: 'defaultRoutes', label: '默认资源', description: '选择生成、向量和重排的默认资源；任务专属分配由对应插件管理。', actionId: 'open-default-routes', placement: 'inline', buttonLabel: '选择', popup: popup('default-routes') },
             ] },
         ] },
         { kind: 'section', id: 'runtime', label: '运行', children: [
             { kind: 'section', id: 'runtimeLimits', label: '额度与任务', children: [
-                { kind: 'action', id: 'budgetManager', label: '使用额度与熔断', description: '限制插件的请求频率、Token、等待时间和成本。', actionId: 'open-budget-manager', placement: 'inline', buttonLabel: '配置', popup: popup('budget-manager') },
-                { kind: 'action', id: 'queueManager', label: '请求队列', description: '查看正在等待和运行的任务，也可以取消任务。', actionId: 'open-queue-manager', placement: 'inline', buttonLabel: '查看', popup: popup('queue-manager') },
+                { kind: 'action', id: 'budgetManager', label: '使用额度', description: '按调用方限制请求频率、Token 和等待时间。', actionId: 'open-budget-manager', placement: 'inline', buttonLabel: '配置', popup: popup('budget-manager') },
             ] },
         ] },
         { kind: 'section', id: 'diagnostics', label: '诊断', children: [
             { kind: 'section', id: 'diagnosticsChecks', label: '检查与日志', children: [
                 { kind: 'action', id: 'serviceDiagnostics', label: '服务检查', description: '检查数据库、酒馆连接和外部资源是否正常。', actionId: 'open-diagnostics', placement: 'inline', buttonLabel: '运行检查', popup: popup('diagnostics') },
-                { kind: 'action', id: 'requestLogs', label: '请求日志', description: '查看请求经过了哪个资源，以及成功或失败的原因。', actionId: 'open-request-logs', placement: 'inline', buttonLabel: '查看', popup: LLM_REQUEST_LOGS_POPUP },
+                { kind: 'action', id: 'requestLogs', label: '请求日志', description: '查看等待与运行中的任务、请求使用的资源及成功或失败原因。', actionId: 'open-request-logs', placement: 'inline', buttonLabel: '查看', popup: LLM_REQUEST_LOGS_POPUP },
             ] },
             { kind: 'section', id: 'requestLogPolicy', label: '日志记录策略', children: [
-                { kind: 'toggle', id: 'requestLogging.enabled', label: '保存请求日志', description: '保存请求诊断链路；关闭后不再写入新的日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.enabled },
                 { kind: 'select', id: 'requestLogging.detailMode', label: '记录范围', description: '完整模式会在本机保存模型返回、解析结果和最终记忆内容；不保存 Prompt、API Key 或认证头。', options: [
                     { value: 'full', label: '完整返回与诊断' }, { value: 'failed-full', label: '仅失败保存完整返回' }, { value: 'summary', label: '仅诊断摘要' }, { value: 'off', label: '不记录' },
                 ], defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.detailMode },
+                { kind: 'section', id: 'logRetention', label: '高级：日志保留', collapsible: true, children: [
                 { kind: 'number', id: 'requestLogging.maxEntries', label: '最大条数', description: '达到上限后自动删除最旧日志。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.maxEntries, validation: { min: 1, max: 5000 }, step: 50, unit: '条', showStepper: true },
                 { kind: 'number', id: 'requestLogging.retentionDays', label: '保留天数', description: '超过天数的日志会自动删除。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.retentionDays, validation: { min: 1, max: 3650 }, step: 1, unit: '天', showStepper: true },
                 { kind: 'number', id: 'requestLogging.maxBytesMb', label: '最大占用', description: '达到空间上限后自动删除最旧诊断记录。', defaultValue: DEFAULT_LLM_SETTINGS.requestLogging.maxBytes / (1024 * 1024), validation: { min: 1, max: 1024 }, step: 10, unit: 'MB', showStepper: true },
+                ] },
             ] },
             { kind: 'section', id: 'diagnosticsData', label: '数据管理', children: [
                 { kind: 'action', id: 'backup', label: '导入导出', description: '备份或恢复配置。密钥不会包含在备份中。', actionId: 'open-backup', placement: 'inline', buttonLabel: '管理', popup: popup('backup') },
@@ -98,9 +98,8 @@ function toSettingsValues(settings: LLMHubSettings): SettingsValues {
         globalProfile: settings.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
         maxTokensMode: settings.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
         maxTokens: settings.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
-        timeoutMs: settings.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
-        'requestLogging.enabled': logging.enabled ?? DEFAULT_LLM_SETTINGS.requestLogging.enabled,
-        'requestLogging.detailMode': logging.detailMode ?? DEFAULT_LLM_SETTINGS.requestLogging.detailMode,
+        timeoutSeconds: (settings.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs) / 1000,
+        'requestLogging.detailMode': logging.enabled === false ? 'off' : logging.detailMode ?? DEFAULT_LLM_SETTINGS.requestLogging.detailMode,
         'requestLogging.maxEntries': logging.maxEntries ?? DEFAULT_LLM_SETTINGS.requestLogging.maxEntries,
         'requestLogging.retentionDays': logging.retentionDays ?? DEFAULT_LLM_SETTINGS.requestLogging.retentionDays,
         'requestLogging.maxBytesMb': (logging.maxBytes ?? DEFAULT_LLM_SETTINGS.requestLogging.maxBytes) / (1024 * 1024),
@@ -127,10 +126,10 @@ function applySettingsValues(current: LLMHubSettings, values: SettingsValues): L
             mode: maxTokensMode,
             ...(maxTokensMode === 'manual' ? { manualValue: maxTokens } : {}),
         },
-        timeoutMs: typeof values.timeoutMs === 'number' ? values.timeoutMs : current.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
+        timeoutMs: typeof values.timeoutSeconds === 'number' ? Math.round(values.timeoutSeconds * 1000) : current.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
         requestLogging: {
             ...existingLogging,
-            enabled: typeof values['requestLogging.enabled'] === 'boolean' ? values['requestLogging.enabled'] : existingLogging.enabled,
+            enabled: detailMode === undefined ? existingLogging.enabled : detailMode !== 'off',
             detailMode: detailMode === 'full' || detailMode === 'failed-full' || detailMode === 'summary' || detailMode === 'off'
                 ? detailMode
                 : existingLogging.detailMode,
@@ -144,6 +143,13 @@ function applySettingsValues(current: LLMHubSettings, values: SettingsValues): L
 }
 
 export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceRepository, statusSource: LlmSettingsStatusSource, notify?: (notification: ToastNotification) => void): SettingsAdapter {
+    const fieldState = (settings: LLMHubSettings): SettingsFieldStateMap => {
+        const values = toSettingsValues(settings);
+        return {
+            maxTokens: { disabled: false, hidden: values.maxTokensMode !== 'manual' },
+            ...Object.fromEntries(['maxEntries', 'retentionDays', 'maxBytesMb'].map((key) => [`requestLogging.${key}`, { disabled: false, hidden: values['requestLogging.detailMode'] === 'off' }])),
+        };
+    };
     const reportSaveFailure = (failure: unknown): void => {
         const code = failure && typeof failure === 'object' && 'code' in failure && typeof failure.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(failure.code)
             ? failure.code
@@ -153,15 +159,15 @@ export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceReposi
     return {
         async load(): Promise<SettingsValues> { return toSettingsValues(await repository.loadSettings()); },
         async save(values): Promise<void> {
-            let saved: SettingsValues;
             try {
-                saved = toSettingsValues(await repository.updateSettings((current) => applySettingsValues(current, values) as LLMHubSettings & Record<string, unknown>));
+                await repository.updateSettings((current) => applySettingsValues(current, values) as LLMHubSettings & Record<string, unknown>);
             }
             catch (failure) { reportSaveFailure(failure); throw failure; }
-            void saved;
         },
         async reset(): Promise<SettingsValues> { return toSettingsValues(await repository.reset()); },
         subscribe: (listener) => repository.subscribeSettings((settings) => listener(toSettingsValues(settings))),
+        loadFieldState: async () => fieldState(await repository.loadSettings()),
+        subscribeFieldState: (listener) => repository.subscribeSettings((settings) => listener(fieldState(settings))),
         loadStatus: () => statusSource.loadStatus(),
         subscribeStatus: (listener) => statusSource.subscribeStatus(listener),
     };

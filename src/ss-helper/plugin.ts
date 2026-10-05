@@ -25,8 +25,9 @@ import { renderRequestLogViewer } from '../ui/request-log-viewer';
 import { registerResourcePopups } from './resource-popups';
 import { createCoreBridgeFetch } from './core-bridge-fetch';
 import { BUILTIN_TAVERN_RESOURCE_ID } from '../router/router';
+import { renderConfigurationPopup } from './configuration-popups';
 
-const POPUP_NAMES = ['rerank-test', 'route-preview', 'advanced-routing', 'budget-manager', 'queue-manager', 'diagnostics', 'request-logs', 'backup', 'reset-confirm', 'generation-source'] as const;
+const POPUP_NAMES = ['rerank-test', 'route-preview', 'default-routes', 'budget-manager', 'diagnostics', 'request-logs', 'backup', 'reset-confirm', 'generation-source'] as const;
 type PopupName = typeof POPUP_NAMES[number];
 
 const GENERATION_SOURCE_WIZARD: PopupWizardDefinition = {
@@ -212,24 +213,9 @@ function reportBackgroundFailure(session: PluginSession, stage: string, error: u
     }
 }
 
-export function editableGenericRoutingSettings(settings: LLMHubSettings): Record<string, unknown> {
-    const { taskAssignments: _consumerOwnedTaskAssignments, ...genericSettings } = settings;
-    return genericSettings;
-}
-
-export function mergeGenericRoutingSettings(current: LLMHubSettings, edited: Record<string, unknown>): Record<string, unknown> {
-    if (Object.hasOwn(edited, 'taskAssignments')) {
-        throw createSSHelperError('LLM_REQUEST_INVALID', { stage: 'llm.routing.advanced' });
-    }
-    return {
-        ...edited,
-        ...(current.taskAssignments === undefined ? {} : { taskAssignments: current.taskAssignments }),
-    };
-}
-
 async function renderPopup(container: HTMLElement, name: PopupName, repository: LlmWorkspaceRepository, fetchImpl: typeof fetch, ui?: PopupUiContext, notify?: (notification: { level: 'info' | 'success' | 'warning' | 'error'; title: string; message: string; code: string }) => void, services?: LlmServiceHandlers, openResourceWizard?: () => void): Promise<() => void> {
     if (ui === undefined) throw createSSHelperError('CORE_BRIDGE_UNAVAILABLE', { stage: 'llm.ui.popup' });
-    const title = document.createElement('h3'); title.textContent = ({ 'rerank-test': 'Rerank 测试', 'route-preview': '路由预览', 'advanced-routing': '高级规则', 'budget-manager': '额度与熔断', 'queue-manager': '请求队列', diagnostics: '服务检查', 'request-logs': '请求日志', backup: '配置导入导出', 'reset-confirm': '全局重置', 'generation-source': '默认生成来源' } as Record<PopupName, string>)[name];
+    const title = document.createElement('h3'); title.textContent = ({ 'rerank-test': 'Rerank 测试', 'route-preview': '路由预览', 'default-routes': '默认资源', 'budget-manager': '调用方额度', diagnostics: '服务检查', 'request-logs': '请求日志', backup: '配置导入导出', 'reset-confirm': '全局重置', 'generation-source': '默认生成来源' } as Record<PopupName, string>)[name];
     const body = document.createElement('div'); body.className = `ss-helper-llm-popup-body${name === 'request-logs' ? ' ss-helper-llm-popup-body--workspace' : ''}`;
     if (name === 'request-logs') container.append(body);
     else container.append(title, body);
@@ -272,11 +258,8 @@ async function renderPopup(container: HTMLElement, name: PopupName, repository: 
             return () => { addResource.remove(); handle.dispose(); };
         }
         return () => handle.dispose();
-    } else if (name === 'advanced-routing') {
-        const settings = await repository.loadSettings();
-        const area = ui.createTextarea({ label: '通用路由与调度 JSON', value: JSON.stringify(editableGenericRoutingSettings(settings), null, 2) }); area.style.minHeight = '20rem';
-        const save = ui.createButton({ label: '校验并应用', tone: 'primary' });
-        const status = document.createElement('p'); save.addEventListener('click', async () => { try { const parsed = JSON.parse(area.value) as Record<string, unknown>; await repository.updateSettings((current) => mergeGenericRoutingSettings(current, parsed)); status.textContent = '已校验并应用。'; } catch (error) { status.textContent = `JSON 无效（${safeDiagnostic(error, 'LLM_REQUEST_INVALID')}）`; } }); body.append(area, save, status);
+    } else if (name === 'default-routes' || name === 'budget-manager') {
+        return renderConfigurationPopup(body, name, repository, ui, notify);
     } else if (name === 'backup') {
         const exportButton = ui.createButton({ label: '导出配置' }); const importButton = ui.createButton({ label: '导入配置', tone: 'primary' }); const area = ui.createTextarea({ label: '配置备份 JSON', placeholder: '粘贴备份 JSON' }); const status = document.createElement('p'); exportButton.addEventListener('click', async () => { try { const value = await repository.exportConfig(); area.value = JSON.stringify(value); status.textContent = '已生成备份（不包含密钥）。'; } catch (error) { status.textContent = `导出失败（${safeDiagnostic(error, 'INTERNAL_ERROR')}）`; } }); importButton.addEventListener('click', async () => { try { const value = JSON.parse(area.value) as { archive: unknown; sha256: string }; await repository.importConfig(value.archive as never, value.sha256); status.textContent = '恢复完成。'; } catch (error) { status.textContent = `恢复失败（${safeDiagnostic(error, 'LLM_REQUEST_INVALID')}）`; } }); body.append(exportButton, importButton, area, status);
     } else if (name === 'reset-confirm') {
@@ -285,12 +268,8 @@ async function renderPopup(container: HTMLElement, name: PopupName, repository: 
         return renderRequestLogViewer(body, repository, { ui, notify, describeTask: services?.describeTask });
     } else if (name === 'diagnostics') {
         const output = document.createElement('pre'); body.append(output); try { const health = await repository.health(); output.textContent = JSON.stringify({ ...health, secretReady: health.secretReady === true ? '可用' : '不可用' }, null, 2); } catch (error) { output.textContent = `workspace 不可用（${safeDiagnostic(error, 'WORKSPACE_UNAVAILABLE')}）`; }
-    } else if (name === 'budget-manager') {
-        const settings = await repository.loadSettings(); const area = ui.createTextarea({ label: '额度 JSON', value: JSON.stringify((settings as Record<string, unknown>).budgets ?? {}, null, 2) }); area.style.minHeight = '15rem'; const save = ui.createButton({ label: '应用', tone: 'primary' }); const status = document.createElement('p'); save.addEventListener('click', async () => { try { const value = JSON.parse(area.value) as LLMHubSettings['budgets']; await repository.updateSettings((current) => ({ ...current, budgets: value })); status.textContent = '已应用，正在热加载。'; } catch (error) { status.textContent = `配置无效（${safeDiagnostic(error, 'LLM_REQUEST_INVALID')}）`; } }); body.append(area, save, status);
     } else if (name === 'route-preview') {
         const settings = await repository.loadSettings(); const output = document.createElement('pre'); output.textContent = JSON.stringify({ executionDefaults: settings.globalAssignments ?? {}, taskAssignments: settings.taskAssignments ?? [], routingPolicy: '仅按任务分配或 execution 默认资源解析；不跨类型回退' }, null, 2); body.append(output);
-    } else if (name === 'queue-manager') {
-        const output = document.createElement('p'); output.textContent = '队列由 LLM Runtime 实时管理；正在等待的任务会显示在请求日志中。'; body.append(output);
     } else {
         const settings = await repository.loadSettings(); const output = document.createElement('pre'); output.textContent = JSON.stringify(settings, null, 2); body.append(output);
     }

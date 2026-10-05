@@ -136,7 +136,7 @@ export class LlmToolTurnService {
             if (response.state === 'final') {
                 parsedResponse = response.output;
                 validationIssues = prepared.validationIssues;
-                const partialValidation = request.validationMode === 'itemized_partial' || response.itemRejections !== undefined;
+                const partialValidation = (response.itemRejections?.length ?? 0) > 0;
                 if (validationIssues?.length && !partialValidation) {
                     const issue = validationIssues[0];
                     throw createSSHelperError('SCHEMA_VALIDATION_FAILED', {

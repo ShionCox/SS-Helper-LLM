@@ -242,7 +242,7 @@ const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
       title: '连接到服务',
       description: '填写地址、密钥和模型',
       fields: [
-        { kind: 'text', id: 'label', label: '资源名称', placeholder: '例如：主要生成服务', validation: { required: true, min: 1, max: 128 } },
+        { kind: 'text', id: 'label', label: '资源名称（选填）', placeholder: '留空按服务与模型命名', validation: { max: 128 } },
         { kind: 'segmented', id: 'connectionMode', label: '连接方式', description: '官方直连使用标准地址；第三方中转允许填写兼容服务地址。', options: [
           { value: 'official', label: '官方直连' },
           { value: 'relay', label: '第三方中转' },
@@ -263,6 +263,7 @@ const RESOURCE_WIZARD_DEFINITION: PopupWizardDefinition = {
           customPlaceholder: '输入模型 ID',
           validation: { required: true },
         },
+        { kind: 'toggle', id: 'showAdvanced', label: '显示高级连接选项' },
         { kind: 'segmented', id: 'toolDialect', label: 'Agent 工具协议', description: '只影响 Agent 工具续轮；中转站默认使用 Chat Completions。', options: [
           { value: 'openai_chat_compatible', label: 'Chat Completions' },
           { value: 'openai_responses', label: 'Responses API' },
@@ -316,6 +317,7 @@ export class ResourceWizardController implements PopupWizardAdapter {
   readonly #state: ResourceWizardState;
   #modelDiscoveryAbort?: AbortController;
   #modelDiscoveryTimer?: ReturnType<typeof setTimeout>;
+  #showAdvanced = false;
 
   constructor(options: {
     mode: 'create' | 'edit' | 'copy';
@@ -385,7 +387,7 @@ export class ResourceWizardController implements PopupWizardAdapter {
     return {
       activeStepId: this.#state.activeStepId,
       completedStepIds: [...this.#state.completed],
-      values: { ...this.#state.draft },
+      values: { ...this.#state.draft, showAdvanced: this.#showAdvanced },
       fieldErrors: { ...this.#state.fieldErrors },
       fieldOptions: {
         apiType: providerOptions(this.#state.draft.type),
@@ -393,6 +395,8 @@ export class ResourceWizardController implements PopupWizardAdapter {
       },
       disabledFieldIds: draft.connectionMode === 'official' && PROVIDER_URLS[draft.apiType] ? ['baseUrl'] : [],
       hiddenFieldIds: [
+        ...(!this.#showAdvanced ? ['toolDialect', 'reasoningMode', 'reasoningEffort', 'embeddingPath', 'embeddingDimensions', 'rerankPath', 'deepseekApiMode'] : []),
+        ...(draft.reasoningMode === 'disabled' ? ['reasoningEffort'] : []),
         ...(PROVIDER_URLS[draft.apiType] ? [] : ['connectionMode']),
         ...(draft.type === 'generation' && draft.apiType === 'deepseek' && draft.connectionMode === 'official' ? [] : ['deepseekApiMode']),
         ...(showToolProtocol ? [] : ['toolDialect']),
@@ -416,6 +420,7 @@ export class ResourceWizardController implements PopupWizardAdapter {
 
   change(fieldId: string, value: PlainData): void {
     if (this.#state.busy) return;
+    if (fieldId === 'showAdvanced') { this.#showAdvanced = value === true; this.#emit(); return; }
     const draft = this.#state.draft;
     if (fieldId === 'type' && typeof value === 'string' && ['generation', 'embedding', 'rerank'].includes(value)) {
       draft.type = value as ResourceType;
@@ -602,8 +607,7 @@ export class ResourceWizardController implements PopupWizardAdapter {
     if (step === 'purpose' && !['generation', 'embedding', 'rerank'].includes(draft.type)) errors.type = '请选择资源用途';
     if (step === 'provider' && !providerOptions(draft.type).some((option) => option.value === draft.apiType)) errors.apiType = '当前服务不支持所选用途';
     if (step === 'connection') {
-      if (!draft.label.trim()) errors.label = '请输入资源名称';
-      else if (draft.label.trim().length > 128) errors.label = '资源名称不能超过 128 个字符';
+      if (draft.label.trim().length > 128) errors.label = '资源名称不能超过 128 个字符';
       if (!draft.baseUrl.trim() || parseBaseUrl(draft.baseUrl.trim()) === undefined) errors.baseUrl = '请输入无凭据、查询参数和片段的 HTTP(S) 地址';
       if (!draft.model.trim()) errors.model = '请输入模型 ID';
       if ((this.#mode !== 'edit' || !this.#hasStoredSecret) && !draft.apiKey.trim()) errors.apiKey = '请输入 API Key';
@@ -650,7 +654,7 @@ export class ResourceWizardController implements PopupWizardAdapter {
         type: this.#state.draft.type,
         source: 'custom',
         apiType: this.#state.draft.apiType,
-        label: this.#state.draft.label.trim(),
+        label: this.#state.draft.label.trim() || `${PROVIDER_LABELS[this.#state.draft.apiType]} · ${this.#state.draft.model.trim()}`.slice(0, 128),
         baseUrl: parseBaseUrl(this.#state.draft.baseUrl.trim()),
         model: this.#state.draft.model.trim(),
         enabled: true,

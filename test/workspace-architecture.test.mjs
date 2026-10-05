@@ -160,7 +160,7 @@ test('settings schema exposes five progressive pages and generic popup actions',
   });
   assert.equal(new Set(allFields.map((field) => field.id)).size, allFields.length, 'settings field IDs must be globally unique');
   assert.deepEqual(Object.fromEntries(sections.map((section) => [section.id, section.children.map((field) => field.label)])), {
-    start: ['服务状态', '生成偏好', '请求与展示', '模型来源'],
+    start: ['服务状态', '生成偏好', '高级：请求与展示', '模型来源'],
     resources: ['资源管理', '能力测试'],
     routing: ['通用路由', '高级配置'],
     runtime: ['额度与任务'],
@@ -189,16 +189,15 @@ test('settings schema exposes five progressive pages and generic popup actions',
     resourceManager: ['resources', 'open-resource-manager', 'resource-manager', '打开'],
     rerankTest: ['resources', 'open-rerank-test', 'rerank-test', '开始测试'],
     routePreview: ['routing', 'open-route-preview', 'route-preview', '预览'],
-    advanced: ['routing', 'open-advanced', 'advanced-routing', '编辑'],
+    defaultRoutes: ['routing', 'open-default-routes', 'default-routes', '选择'],
     budgetManager: ['runtime', 'open-budget-manager', 'budget-manager', '配置'],
-    queueManager: ['runtime', 'open-queue-manager', 'queue-manager', '查看'],
     serviceDiagnostics: ['diagnostics', 'open-diagnostics', 'diagnostics', '运行检查'],
     requestLogs: ['diagnostics', 'open-request-logs', 'request-logs', '查看'],
     generationSourceConfig: ['start', 'open-generation-source', 'generation-source', '设置'],
     backup: ['diagnostics', 'open-backup', 'backup', '管理'],
     reset: ['diagnostics', 'reset-llm', 'reset-confirm', '重置'],
   };
-  assert.equal(actions.length, 12);
+  assert.equal(actions.length, 11);
   assert.deepEqual(Object.fromEntries(actions.map((field) => [field.id, [field.tabId, field.actionId, field.popup?.name, field.buttonLabel]])), expectedActions);
   assert.ok(actions.every((field) => field.placement === 'inline'));
   assert.equal(actions.find((field) => field.id === 'reset')?.tone, 'danger');
@@ -730,6 +729,35 @@ test('execution defaults switch between the dynamic Tavern resource and an expli
   } finally {
     handlers.dispose?.();
     globalThis.fetch = originalFetch;
+  }
+});
+
+test('task route bindings persist the current contract for generation, embedding and rerank', async () => {
+  const repository = new LlmWorkspaceRepository(new MemoryWorkspace(), new MemorySecrets());
+  const session = {
+    host: { generation: { available: async () => false, current: async () => ({}) }, has: () => false },
+    events: { publish() {}, subscribe() { return () => {}; } },
+  };
+  const handlers = createProductionLlmServices(session, { repository });
+  try {
+    await repository.ready();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const kinds = ['generation', 'embedding', 'rerank'];
+    const tasks = kinds.map((kind) => ({ taskKey: `test-${kind}`, taskKind: kind, execution: kind === 'generation' ? 'structured' : kind, requiredCapabilities: kind === 'generation' ? ['chat', 'json'] : kind === 'embedding' ? ['embeddings'] : ['rerank'] }));
+    for (const task of tasks) {
+      await repository.saveResource({ id: task.taskKey, type: task.taskKind, source: 'custom', apiType: 'openai', label: task.taskKey, baseUrl: 'https://provider.example/v1', model: 'test-model', enabled: true, capabilities: task.requiredCapabilities }, 'test-secret');
+    }
+    await repository.updateSettings((current) => ({ ...current, globalAssignments: Object.fromEntries(kinds.map((kind) => [kind, { resourceId: `test-${kind}` }])) }));
+    const automatic = { ...tasks[0], taskKey: 'automatic-generation' };
+    handlers.registerConsumer({ displayName: 'Route test', tasks: [...tasks, automatic] }, 'ss-helper.memory');
+    const snapshot = await handlers.taskStatus({}, 'ss-helper.memory');
+    const saved = await handlers.taskRouteSet({ expectedRevision: snapshot.revision, assignments: [...tasks.map((task) => ({ taskKey: task.taskKey, resourceId: task.taskKey })), { taskKey: automatic.taskKey }] }, 'ss-helper.memory');
+    assert.equal(saved.tasks.every((task) => task.available), true);
+    assert.deepEqual(saved.defaults, { completion: 'test-generation', structured: 'test-generation', tool_turn: 'test-generation', embedding: 'test-embedding', rerank: 'test-rerank' });
+    assert.equal(saved.tasks.find((task) => task.taskKey === automatic.taskKey)?.resourceId, 'test-generation');
+    assert.deepEqual((await repository.loadSettings()).taskAssignments, tasks.map((task) => ({ pluginId: 'ss-helper.memory', taskKey: task.taskKey, taskKind: task.taskKind, resourceId: task.taskKey, isStale: false })));
+  } finally {
+    handlers.dispose?.();
   }
 });
 
