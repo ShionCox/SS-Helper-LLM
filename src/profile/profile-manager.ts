@@ -1,8 +1,7 @@
 import { logger } from '../runtime/logger';
 
 /**
- * Profile 配置层 —— 一套参数组合（温度、maxTokens、重试等）
- * 用于 LLM Hub 的 consumer+task → provider+profile 路由
+ * Profile 配置层：温度和默认输出预算。
  */
 
 export interface LLMProfile {
@@ -10,11 +9,6 @@ export interface LLMProfile {
     name: string;
     temperature: number;
     maxTokens: number;
-    retryCount: number;
-    retryDelayMs: number;
-    topP?: number;
-    frequencyPenalty?: number;
-    presencePenalty?: number;
 }
 
 /**
@@ -27,8 +21,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '精确模式',
         temperature: 0.1,
         maxTokens: 2048,
-        retryCount: 2,
-        retryDelayMs: 1000,
     },
     /** 创意模式：中温度、适合叙事生成 */
     creative: {
@@ -36,8 +28,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '创意模式',
         temperature: 0.8,
         maxTokens: 4096,
-        retryCount: 1,
-        retryDelayMs: 500,
     },
     /** 平衡模式：适合通用任务 */
     balanced: {
@@ -45,8 +35,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '平衡模式',
         temperature: 0.5,
         maxTokens: 2048,
-        retryCount: 2,
-        retryDelayMs: 800,
     },
     /** 经济模式：低 token、快速返回 */
     economy: {
@@ -54,8 +42,6 @@ export const BUILTIN_PROFILES: Record<string, LLMProfile> = {
         name: '经济模式',
         temperature: 0.3,
         maxTokens: 1024,
-        retryCount: 1,
-        retryDelayMs: 500,
     },
 };
 

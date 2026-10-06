@@ -81,7 +81,7 @@ export class RequestOrchestrator {
                 return existing as RequestRecord<T>;
             }
         }
-        if (options.replacePendingByKey) this.replacePending(options.replacePendingByKey, requestId);
+        if (options.replacePendingByKey) this.replacePending(options.replacePendingByKey);
 
         let resolveResult!: (value: LLMRunResult<T>) => void;
         const resultPromise = new Promise<LLMRunResult<T>>((resolve) => { resolveResult = resolve; });
@@ -195,7 +195,7 @@ export class RequestOrchestrator {
         this.disposed = true;
         const pending = [...this.queue];
         this.queue.length = 0;
-        for (const record of pending) this.finishCancelled(record, 'LLM 请求编排器已关闭');
+        for (const record of pending) this.finishCancelled(record);
         for (const activeRequest of this.activeRequests.values()) {
             activeRequest.validity.isCancelled = true;
             const failure = readSSHelperFailure(createSSHelperError('CANCELLED', { stage: 'llm.orchestrator.dispose', requestId: activeRequest.requestId }))!;
@@ -215,7 +215,7 @@ export class RequestOrchestrator {
                 const [record] = this.queue.splice(index, 1);
                 if (!record) break;
                 if (this.isInvalid(record)) {
-                    this.finishCancelled(record, '请求已作废');
+                    this.finishCancelled(record);
                     continue;
                 }
                 this.activeRequests.set(record.requestId, record);
@@ -250,7 +250,7 @@ export class RequestOrchestrator {
             // A cancellation arriving after that point must not retroactively replace the
             // persisted completed attempt with a second cancelled terminal record.
             if (this.isInvalid(record) && !result.ok) {
-                this.finishCancelled(record, '请求结果已作废');
+                this.finishCancelled(record);
             } else {
                 record.state = result.ok ? 'completed' : 'failed';
                 if (!result.ok) {
@@ -320,17 +320,17 @@ export class RequestOrchestrator {
         }
     }
 
-    private replacePending(key: string, replacementRequestId: string): void {
+    private replacePending(key: string): void {
         const targets = this.queue.filter((record) =>
             record.enqueueOptions.dedupeKey === key || record.enqueueOptions.replacePendingByKey === key);
         for (const record of targets) {
             record.validity.isSuperseded = true;
             this.removeFromQueue(record.requestId);
-            this.finishCancelled(record, `请求已被 ${replacementRequestId} 替换`);
+            this.finishCancelled(record);
         }
     }
 
-    private finishCancelled(record: RequestRecord, reason: string): void {
+    private finishCancelled(record: RequestRecord): void {
         record.validity.isCancelled = true;
         record.state = 'cancelled';
         record.finishedAt = Date.now();

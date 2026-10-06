@@ -3,7 +3,6 @@ import type {
     RouteResolveArgs,
     RouteResolveResult,
     LLMCapability,
-    CapabilityKind,
     ResourceType,
     TaskAssignment,
     LLMExecution,
@@ -97,22 +96,28 @@ export class TaskRouter {
 
     getTaskAssignment(pluginId: string, taskKey: string): TaskAssignment | undefined { return this.taskAssignments.get(`${pluginId}::${taskKey}`); }
     getExecutionDefault(execution: LLMExecution): string | undefined { return this.executionDefaults.get(execution); }
+    getTaskRequirements(consumer: string, taskKey: string) { return this.registry?.getTaskDescriptor(consumer, taskKey)?.requirements; }
 
     resolveRoute(args: RouteResolveArgs): RouteResolveResult {
         const execution = this.resolveExecution(args);
-        const required = [...(args.requiredCapabilities ?? [])];
+        const task = args.taskKey ? this.registry?.getTaskDescriptor(args.consumer, args.taskKey) : undefined;
+        if ((task?.requirements?.nativeStructured === 'required' && execution !== 'structured')
+            || ((task?.requirements?.strictToolSchema === 'required' || task?.requirements?.streamingToolCalls === 'required') && execution !== 'tool_turn')) {
+            throw createSSHelperError('LLM_TASK_REQUIREMENT_UNSUPPORTED', { stage: 'llm.router.requirements' });
+        }
+        const required = [...(args.requiredCapabilities ?? []), ...(task?.requiredCapabilities ?? [])];
         const assignment = args.taskKey ? this.taskAssignments.get(`${args.consumer}::${args.taskKey}`) : undefined;
         if (assignment?.resourceId) {
             if (assignment.isStale || !this.providerSatisfiesExecution(assignment.resourceId, execution, required)) {
                 throw createSSHelperError('LLM_TASK_ROUTE_UNAVAILABLE', { stage: 'llm.router.task_assignment', resourceId: assignment.resourceId });
             }
             this.assertExecutionAvailable(assignment.resourceId, execution);
-            return this.route(assignment.resourceId, 'task_assignment', execution);
+            return this.route(assignment.resourceId, 'task_assignment');
         }
         const resourceId = this.executionDefaults.get(execution);
         if (resourceId !== undefined && this.providerSatisfiesExecution(resourceId, execution, required)) {
             this.assertExecutionAvailable(resourceId, execution);
-            return this.route(resourceId, 'execution_default', execution);
+            return this.route(resourceId, 'execution_default');
         }
         throw createSSHelperError('PROVIDER_UNAVAILABLE', { stage: 'llm.router.resolve', ...(resourceId ? { resourceId } : {}) });
     }
@@ -131,7 +136,7 @@ export class TaskRouter {
         return args.requiredCapabilities?.includes('tools') ? 'tool_turn' : 'structured';
     }
 
-    private route(resourceId: string, resolvedBy: 'task_assignment' | 'execution_default', execution: LLMExecution): RouteResolveResult {
+    private route(resourceId: string, resolvedBy: 'task_assignment' | 'execution_default'): RouteResolveResult {
         return { resourceId, model: this.resolveDefaultModel(resourceId), resolvedBy };
     }
 

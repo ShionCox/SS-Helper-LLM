@@ -162,6 +162,8 @@ function providerRequestMetadata(value: unknown): Record<string, unknown> | unde
         toolNames: meta.toolNames,
         schemaHash: meta.schemaHash,
         structuredTransport: meta.structuredTransport,
+        jsonOutputMode: meta.jsonOutputMode,
+        strictToolSchema: meta.strictToolSchema,
         maxTokens: meta.maxTokens,
         temperature: meta.temperature,
         embeddingTextCount: meta.embeddingTextCount,
@@ -314,10 +316,12 @@ function summaryValue(entry: Record<string, unknown>, response: Record<string, u
         request: request ? {
             taskKind: request.taskKind,
             schemaHash,
+            providerRequestMeta: providerRequestMetadata(request.providerRequestMeta),
         } : undefined,
         response: response ? {
             usage: responseMeta?.usage,
             failure,
+            providerResponseMeta: providerResponseMetadata(response.providerResponseMeta),
         } : undefined,
         agent: agentMetadata(entry.agent),
     };
@@ -470,8 +474,6 @@ export function buildStoredLog(entry: Record<string, unknown>, mode: LLMLogDetai
             'agent.toolCalls[*].arguments',
             'agent.toolResults[*].content',
             'agent.finalOutput',
-            'request.providerRequestMeta',
-            'response.providerResponseMeta',
             'response.parseMeta',
         ] : [];
         const fallback = toPlain({

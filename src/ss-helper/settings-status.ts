@@ -1,6 +1,7 @@
 import {
   CORE_DISCOVERY_SYMBOL,
   LLM_TASK_STATUS_CHANGED_V0,
+  describeSSHelperFailure,
   type CoreDiscoverySnapshot,
   type LlmTaskStatusSnapshot,
   type PluginSession,
@@ -52,6 +53,11 @@ function generationSnapshot(response: LlmTaskStatusSnapshot | undefined): Settin
     return error('生成不可用', task?.failure?.reasonCode ? `当前生成任务不可用（${task.failure.reasonCode}）。` : '当前没有可用的生成任务。');
   }
   return success('可用', `${task.route?.provider ?? '生成资源'} 当前可用。`);
+}
+
+function settingsFailureDescription(error: unknown): string {
+  const failure = describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'llm.settings.status' });
+  return `${failure.reasonCode} · ${failure.title}：${failure.reason} ${failure.action}${failure.requestId ? `（${failure.requestId}）` : ''}`;
 }
 
 function generationSourceSnapshot(
@@ -168,13 +174,16 @@ export class LlmSettingsStatusMonitor implements LlmSettingsStatusSource {
     const capabilityPromise = this.handlers.taskStatus
       ? this.handlers.taskStatus({}, this.session.descriptor.id).catch(() => undefined)
       : Promise.resolve(undefined);
-    const settingsPromise = this.repository.loadSettings().catch(() => undefined);
+    let settingsFailure: unknown;
+    const settingsPromise = this.repository.loadSettings().catch((failure) => { settingsFailure = failure; return undefined; });
 
     const [tavernStatus, capabilities, settings] = await Promise.all([tavernPromise, capabilityPromise, settingsPromise]);
     if (this.disposed || controller.signal.aborted || generation !== this.refreshGeneration) return;
     this.status = Object.freeze({
       tavernStatus,
-      generationSourceStatus: generationSourceSnapshot(settings, tavernStatus, capabilities),
+      generationSourceStatus: settings === undefined
+        ? error('设置不可用', settingsFailureDescription(settingsFailure))
+        : generationSourceSnapshot(settings, tavernStatus, capabilities),
       generationStatus: generationSnapshot(capabilities),
       embeddingStatus: optionalCapabilitySnapshot(capabilities, 'embedding', '向量'),
       rerankStatus: optionalCapabilitySnapshot(capabilities, 'rerank', '重排'),

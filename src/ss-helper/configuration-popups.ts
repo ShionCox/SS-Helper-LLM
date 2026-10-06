@@ -41,7 +41,7 @@ export async function renderConfigurationPopup(
       for (const [type, label] of [['generation', '生成'], ['embedding', '向量'], ['rerank', '重排']] as const) {
         const current = settings.globalAssignments?.[type]?.resourceId ?? '';
         const options = [
-          { value: '', label: type === 'generation' ? '酒馆当前连接（默认）' : '自动选择可用资源' },
+          { value: '', label: type === 'generation' ? '酒馆当前连接（默认）' : '未配置默认资源' },
           ...(type === 'generation' ? [{ value: BUILTIN_TAVERN_RESOURCE_ID, label: '酒馆当前连接' }] : []),
           ...(settings.resources ?? []).filter((resource) => resource.type === type && resource.enabled !== false).map((resource) => ({ value: resource.id, label: `${resource.label} · ${resource.model}` })),
         ];

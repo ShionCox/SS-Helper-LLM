@@ -10,7 +10,7 @@ import {
 } from '../dist/index.js';
 import { createSSHelperError } from '@ss-helper/sdk';
 
-function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'] }) {
+function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALID_JSON', 'SCHEMA_VALIDATION_FAILED'] }, requirements) {
   const calls = [];
   const provider = {
     id: 'fixture-provider',
@@ -50,6 +50,7 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
       taskKind: 'generation',
       requiredCapabilities: ['chat', 'json'],
       structuredPolicy,
+      requirements,
     }],
   });
   const logs = new RequestLogService();
@@ -59,6 +60,25 @@ function fixture(structuredPolicy = { maxProviderAttempts: 2, repairOn: ['INVALI
   });
   return { sdk, calls, logs, provider, rateSlots };
 }
+
+test('required native structured output rejects unsupported providers and runtime downgrades', async () => {
+  const input = { consumer: 'ss-helper.memory', taskKey: 'memory_capture', taskKind: 'generation', input: { messages: [{ role: 'user', content: 'extract' }] }, schema: { type: 'object', additionalProperties: false, required: ['value'], properties: { value: { type: 'string' } } } };
+  const unsupported = fixture(undefined, { nativeStructured: 'required' });
+  unsupported.provider.capabilities.structuredOutput = { transports: ['prompt_only'], preferred: 'prompt_only' };
+  const rejected = await unsupported.sdk.runTask(input);
+  assert.equal(rejected.ok, false);
+  assert.equal(rejected.failure.reasonCode, 'LLM_TASK_REQUIREMENT_UNSUPPORTED');
+  assert.equal(unsupported.calls.length, 0);
+  const downgraded = fixture(undefined, { nativeStructured: 'required' });
+  downgraded.provider.request = async request => {
+    downgraded.calls.push(request);
+    return { content: '{"value":"ok"}', structuredOutput: { plannedTransport: 'json_schema', actualTransport: 'prompt_only' } };
+  };
+  const result = await downgraded.sdk.runTask(input);
+  assert.equal(result.ok, false);
+  assert.equal(result.failure.reasonCode, 'LLM_TASK_REQUIREMENT_UNSUPPORTED');
+  assert.equal(downgraded.calls.length, 1);
+});
 
 test('Schema failure performs one same-provider repair and logs both attempts under one root request', async () => {
   const { sdk, calls, logs, rateSlots } = fixture();
@@ -85,7 +105,7 @@ test('Schema failure performs one same-provider repair and logs both attempts un
   assert.match(calls[1].messages.at(-1).content, /安全校验问题/u);
   assert.doesNotMatch(calls[1].messages.at(-1).content, /\{"value":1\}/u);
 
-  const rows = (await logs.listLogs({ limit: 10 })).sort((left, right) => left.attemptIndex - right.attemptIndex);
+  const rows = (await logs.listLogs({ limit: 10 })).filter(row => row.requestId === 'root-capture-1').sort((left, right) => left.attemptIndex - right.attemptIndex);
   assert.equal(rows.length, 2);
   assert.deepEqual(rows.map((row) => [row.requestId, row.attemptPhase, row.state]), [
     ['root-capture-1', 'initial', 'failed'],

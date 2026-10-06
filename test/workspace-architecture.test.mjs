@@ -59,6 +59,33 @@ class MemoryWorkspace {
   async commit({ operations, idempotencyKey }) { this.transactionKeys.push(idempotencyKey); if (this.failNextTransaction) { this.failNextTransaction = false; const error = new Error('injected transaction failure'); error.code = 'WORKSPACE_FAILURE'; throw error; } const snapshot = new Map(this.records); const results = []; try { for (const operation of operations) { if (operation.action === 'put') { const record = await this.put(operation); results.push({ collection: operation.collection, id: record.id, action: 'put', revision: record.revision }); } else { const removed = await this.remove(operation); results.push({ collection: operation.collection, id: operation.id, action: 'delete', revision: (snapshot.get(this.key(operation.collection, operation.id))?.revision ?? 0) + (removed ? 1 : 0), removed }); } } return { requestId: idempotencyKey, replayed: false, results }; } catch (error) { this.records = snapshot; throw error; } }
 }
 
+test('permanent invalid settings stop runtime retries and explicit repository recovery restores nested output limits', async () => {
+  const workspace = new MemoryWorkspace();
+  let opens = 0;
+  const open = workspace.open.bind(workspace);
+  workspace.open = async input => { opens++; return open(input); };
+  const original = { enabled: true, generationSource: 'tavern' };
+  workspace.records.set('settings:global', { id: 'global', value: original, revision: 1, updatedAt: 0 });
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  let actualMaxTokens;
+  const handlers = createProductionLlmServices({
+    host: { has: () => false, generation: { available: async () => true, current: async () => ({ provider: 'openai', model: 'fixture' }), generate: async request => { actualMaxTokens = request.maxTokens; return { text: 'ok', model: 'fixture' }; } } },
+    events: { publish() {}, subscribe() { return () => {}; } },
+  }, { repository });
+  try {
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const stopped = opens;
+    await new Promise(resolve => setTimeout(resolve, 250));
+    assert.equal(opens, stopped);
+    assert.deepEqual(workspace.records.get('settings:global').value, original);
+    workspace.records.set('settings:global', { id: 'global', value: { enabled: true, maxTokensControl: { mode: 'manual', manualValue: 12345 } }, revision: 2, updatedAt: 1 });
+    await repository.ready();
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal((await handlers.completion({ messages: [{ role: 'user', content: 'fixture' }] }, new AbortController().signal)).text, 'ok');
+    assert.equal(actualMaxTokens, 12345);
+  } finally { handlers.dispose?.(); }
+});
+
 test('repository retries a failed first initialization and broadcasts one authoritative snapshot after recovery', async () => {
   class RetryWorkspace extends MemoryWorkspace {
     constructor() { super(); this.openAttempts = 0; this.lifecycle = []; }
@@ -141,7 +168,7 @@ test('atomic settings mutations merge independent callers and reject a stale sam
   const second = repository.updateSettings((current) => ({ ...current, maxTokens: 8_192 }), { expectedRevision });
   await first;
   await assert.rejects(second, (error) => error?.code === 'CONFLICT' || error?.details?.reasonCode === 'WORKSPACE_CONFLICT');
-  assert.equal((await repository.loadSettings()).maxTokens, 4_096);
+  assert.equal((await repository.loadSettings()).maxTokensControl.manualValue, 4_096);
 });
 
 class MemorySecrets {
@@ -250,7 +277,7 @@ test('LLM browser repository summary policy keeps semantic metadata and excludes
   const secrets = new MemorySecrets();
   const repository = new LlmWorkspaceRepository(workspace, secrets);
   await repository.ready();
-  const expectedDefaults = { enabled: true, streamingEnabled: true, maxRequestsPerMinute: 0, globalProfile: 'balanced', maxTokensMode: 'adaptive', maxTokens: 2048, timeoutMs: 60000 };
+  const expectedDefaults = { enabled: true, streamingEnabled: true, maxRequestsPerMinute: 0, globalProfile: 'balanced', maxTokensControl: { mode: 'adaptive', manualValue: 2048 }, timeoutMs: 60000 };
   const settingsDefaults = (settings) => Object.fromEntries(Object.keys(expectedDefaults).map((key) => [key, settings[key]]));
   const initialSettings = await repository.loadSettings();
   assert.deepEqual(settingsDefaults(initialSettings), expectedDefaults);
@@ -753,6 +780,10 @@ test('task route bindings persist the current contract for generation, embedding
     const snapshot = await handlers.taskStatus({}, 'ss-helper.memory');
     const saved = await handlers.taskRouteSet({ expectedRevision: snapshot.revision, assignments: [...tasks.map((task) => ({ taskKey: task.taskKey, resourceId: task.taskKey })), { taskKey: automatic.taskKey }] }, 'ss-helper.memory');
     assert.equal(saved.tasks.every((task) => task.available), true);
+    handlers.registerConsumer({ displayName: 'Required capability', tasks: [{ taskKey: 'strict-required', taskKind: 'generation', execution: 'tool_turn', requiredCapabilities: ['chat', 'tools'], requirements: { strictToolSchema: 'required' } }] }, 'example.required');
+    const requiredStatus = await handlers.taskStatus({}, 'example.required');
+    assert.equal(requiredStatus.tasks[0].available, false);
+    assert.equal(requiredStatus.tasks[0].failure.reasonCode, 'LLM_TASK_REQUIREMENT_UNSUPPORTED');
     assert.deepEqual(saved.defaults, { completion: 'test-generation', structured: 'test-generation', tool_turn: 'test-generation', embedding: 'test-embedding', rerank: 'test-rerank' });
     assert.equal(saved.tasks.find((task) => task.taskKey === automatic.taskKey)?.resourceId, 'test-generation');
     assert.deepEqual((await repository.loadSettings()).taskAssignments, tasks.map((task) => ({ pluginId: 'ss-helper.memory', taskKey: task.taskKey, taskKind: task.taskKind, resourceId: task.taskKey, isStale: false })));

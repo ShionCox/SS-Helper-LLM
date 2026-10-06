@@ -428,6 +428,8 @@ export class RequestLogService {
             ? (plainRecord(input.request.input)!.messages as unknown[]).map(plainRecord).filter((item): item is Record<string, unknown> => item !== undefined)
             : [];
         const requestMeta: LLMProviderRequestMetadata = {
+            ...(response?.diagnostics.jsonOutputMode ? { jsonOutputMode: response.diagnostics.jsonOutputMode } : {}),
+            ...(response?.diagnostics.strictToolSchema ? { strictToolSchema: response.diagnostics.strictToolSchema } : {}),
             requestFormat: 'agent_tool_turn',
             operation: 'tool_turn',
             method: 'POST',
@@ -459,7 +461,7 @@ export class RequestLogService {
             outcome: responseOutcome(input.failure),
             ...(input.failure?.httpStatus === undefined ? {} : { httpStatus: input.failure.httpStatus }),
             ...(typeof providerDiagnostics?.contentType === 'string' ? { contentType: providerDiagnostics.contentType } : {}),
-            ...(response ? { receivedBytes: jsonBytes(response), finishReason: response.state }
+            ...(response ? { receivedBytes: jsonBytes(response), finishReason: response.diagnostics.finishReason ?? response.state }
                 : typeof input.rawResponseText === 'string' ? { receivedBytes: new TextEncoder().encode(input.rawResponseText).byteLength }
                     : typeof providerDiagnostics?.receivedBytes === 'number' ? { receivedBytes: providerDiagnostics.receivedBytes } : {}),
             ...(route?.streaming === undefined ? {} : { streamed: route.streaming }),

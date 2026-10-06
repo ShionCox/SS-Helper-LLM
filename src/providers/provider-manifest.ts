@@ -26,20 +26,7 @@ const MANIFESTS: readonly ProviderManifest[] = Object.freeze([
   { id: 'generic', protocol: 'openai_chat_compatible', aliases: [], supports: { chat: true, structured: false, tools: true, streaming: false, strict: false, parallel: false, reasoning: false }, reasoning: { defaultMode: 'provider_default', modes: ['provider_default'], efforts: ['provider_default'], transport: 'unknown', replay: 'none' } },
 ]);
 
-export function providerManifests(): readonly ProviderManifest[] { return MANIFESTS; }
 export function providerManifest(value?: string): ProviderManifest {
   const token = String(value ?? '').trim().toLowerCase();
   return MANIFESTS.find((m) => m.aliases.some((a) => token === a || token.includes(a))) ?? MANIFESTS[MANIFESTS.length - 1];
-}
-
-/** Resolve Tavern's source boundary; task assignment must win over URL/model guesses. */
-export function detectTavernSource(source?: string, taskSource?: 'tavern' | 'custom'): 'tavern' | 'custom' {
-  if (taskSource) return taskSource;
-  return String(source ?? '').trim().toLowerCase() === 'tavern' ? 'tavern' : 'custom';
-}
-
-export interface CapabilityProbeResult { readonly base: boolean; readonly structured: boolean; readonly tools: boolean; readonly streaming: boolean; readonly strict: boolean; readonly parallel: boolean; readonly reasoning: boolean; readonly optionalFailures?: readonly string[] }
-/** Optional probe failures are reported but never downgrade base/tool capability. */
-export function mergeCapabilityProbe(manifest: ProviderManifest, probe?: Partial<CapabilityProbeResult>, optionalFailures: readonly string[] = []): CapabilityProbeResult {
-  return { base: manifest.supports.chat, structured: probe?.structured ?? manifest.supports.structured, tools: probe?.tools ?? manifest.supports.tools, streaming: probe?.streaming ?? manifest.supports.streaming, strict: probe?.strict ?? manifest.supports.strict, parallel: probe?.parallel ?? manifest.supports.parallel, reasoning: probe?.reasoning ?? manifest.supports.reasoning, ...(optionalFailures.length ? { optionalFailures } : {}) };
 }

@@ -5,15 +5,36 @@ import {
   CORE_DISCOVERY_SYMBOL,
   CORE_LIFECYCLE_EVENT,
 } from '@ss-helper/sdk';
-import { LLM_REQUEST_LOGS_POPUP, LLM_SETTINGS_SCHEMA, startLlmPlugin } from '../dist/index.js';
+import { ConsumerRegistry, LLM_REQUEST_LOGS_POPUP, LLM_SETTINGS_SCHEMA, startLlmPlugin } from '../dist/index.js';
 
+const route = { resourceId: 'fixture', source: 'custom', provider: 'openai', model: 'fixture', execution: 'structured', transport: 'json_schema' };
 const services = {
-  completion: async () => ({ text: 'ok', route: 'fixture', model: 'fixture' }),
-  runTask: async () => ({ output: {}, route: { route: 'fixture' } }),
-  embed: async () => ({ embeddings: [], route: { route: 'fixture' } }),
-  rerank: async () => ({ results: [], route: { route: 'fixture' } }),
+  completion: async () => ({ text: 'ok', route }),
+  runTask: async () => ({ output: {}, route }),
+  embed: async () => ({ embeddings: [], route: { ...route, execution: 'embedding', transport: 'embedding' } }),
+  rerank: async () => ({ results: [], route: { ...route, execution: 'rerank', transport: 'rerank' } }),
   diagnostics: () => ({ entries: [] }),
 };
+
+test('async registry persistence failures are handled and disposal cancels pending persistence', async () => {
+  const registry = new ConsumerRegistry();
+  const unhandled = [];
+  const listen = error => unhandled.push(error);
+  process.on('unhandledRejection', listen);
+  let persisted = 0;
+  registry.setPersistCallback(async () => { persisted++; throw new Error('fixture persistence failure'); });
+  const registration = { pluginId: 'example.persist', displayName: 'Persist', registrationVersion: 1, tasks: [{ taskKey: 'completion', taskKind: 'generation', requiredCapabilities: ['chat'] }] };
+  try {
+    registry.registerConsumer(registration);
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(persisted, 1);
+    assert.deepEqual(unhandled, []);
+    registry.registerConsumer(registration);
+    registry.dispose();
+    await new Promise(resolve => setTimeout(resolve, 600));
+    assert.equal(persisted, 1);
+  } finally { registry.dispose(); process.off('unhandledRejection', listen); }
+});
 
 function coreDescriptor(generation, overrides = {}) {
   return {

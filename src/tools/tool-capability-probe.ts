@@ -3,7 +3,7 @@ import type { ProviderToolAdapter } from './tool-adapter';
 import { ToolSchemaCompiler } from './tool-schema-compiler';
 import { TOOL_CAPABILITY_FAILURE_TTL_MS, TOOL_CAPABILITY_SUCCESS_TTL_MS, stableToolDigest } from './tool-capability-cache';
 
-export const TOOL_CAPABILITY_PROBE_VERSION = 5;
+export const TOOL_CAPABILITY_PROBE_VERSION = 6;
 export const TOOL_CAPABILITY_PROBE_MAX_TOKENS = 512;
 
 const PROBE_TOOL: LlmToolDefinition = Object.freeze({
@@ -94,6 +94,7 @@ export class ToolCapabilityProbe {
                 }
             } catch (error) {
                 if (input.signal.aborted) throw error;
+                if (input.adapter.dialect === 'deepseek_chat') throw error;
                 const failure = readSSHelperFailure(error, { reasonCode: 'LLM_MODEL_PROBE_FAILED', stage: 'llm.tools.capability_probe.continue', requestId: input.requestId, providerKind: input.adapter.dialect, resourceId: input.resourceId, model: input.model })!;
                 optionalFailures.push(failure);
             }
@@ -105,7 +106,7 @@ export class ToolCapabilityProbe {
                     const strict = await input.adapter.start({
                         resourceId: input.resourceId,
                         model: input.model,
-                        messages: [{ role: 'system', content: 'Call the provided strict probe tool once with value="probe-a".' }, { role: 'user', content: 'Run the strict tool Schema probe now.' }],
+                        messages: [{ role: 'system', content: 'Call the provided strict probe tool once with value="probe-a". After its result return the JSON object {"ok":true}.' }, { role: 'user', content: 'Run the strict tool Schema probe now.' }],
                         tools: this.compiler.compile([PROBE_TOOL], input.adapter.dialect),
                         outputSchema: { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'], additionalProperties: false },
                         privacyPolicy: input.privacyPolicy,

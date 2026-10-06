@@ -3,6 +3,7 @@ import type { JsonHttpTransport, ProviderToolAdapter, ProviderToolStartInput, Pr
 import { canonicalToolName, createProviderToolNameAliases, estimateJsonBytes, parseArguments, parseFinalOutput, providerToolName, usageFromOpenAi, validateCalls, type ProviderToolNameAliases } from './tool-adapter-utils';
 import { OpenAiToolStreamAssembler } from './tool-stream-assembler';
 import { compileReasoningFields, type ReasoningProvider } from '../providers/reasoning-policy';
+import { isStrictJsonSchemaCompatible } from '../schema/strict-json-schema';
 
 export type OpenAiChatDialectKind = 'standard' | 'deepseek' | 'kimi' | 'glm';
 export interface OpenAiChatToolDialectPolicy {
@@ -39,7 +40,7 @@ const DIALECTS: Readonly<Record<OpenAiChatDialectKind, ProviderToolDialect>> = O
 
 export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatToolState> {
     readonly dialect: ProviderToolDialect;
-    readonly version = 8;
+    readonly version = 9;
     readonly toolStreamCapability: 'incremental' | 'unsupported';
     readonly strictToolSchemaCapability: 'beta' | 'unsupported';
     constructor(
@@ -57,8 +58,8 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
         // Provider-side strict mode is request-wide for DeepSeek: one optional
         // schema makes a mixed strict request invalid. The session compiler still
         // validates every emitted call locally against its original schema.
-        const useProviderStrict = this.policy.supportsStrict !== 'none'
-            && input.tools.every((tool) => tool.strict !== false);
+        const useProviderStrict = input.tools.length > 0 && this.policy.supportsStrict !== 'none'
+            && input.tools.every((tool) => tool.strict !== false && isStrictJsonSchemaCompatible(tool.parameters));
         const toolNames = createProviderToolNameAliases(input.tools.map((tool) => tool.name));
         const tools = input.tools.map((tool) => ({
             type: 'function',
@@ -131,12 +132,18 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
                 // locally by rejecting a turn that does not emit a valid call.
                 ...(this.policy.kind === 'deepseek' ? {} : { tool_choice: toolChoice }),
             } : {}),
-            ...(!allowTools && this.policy.kind === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
+            ...(this.policy.kind === 'deepseek' ? { response_format: { type: 'json_object' } } : {}),
         };
         const data = useStream
             ? this.assembleStream(await this.transport.sendStream!(body, signal))
             : await this.transport.send(body, signal);
         const choices = Array.isArray(data.choices) ? data.choices as Array<Record<string, unknown>> : [];
+        const finishReason = choices[0]?.finish_reason;
+        const diagnostics: NonNullable<ProviderToolStep['diagnostics']> = {
+            jsonOutputMode: this.policy.kind === 'deepseek' ? 'json_object' as const : 'prompt_json' as const,
+            strictToolSchema: allowTools && state.tools.length > 0 && state.tools.every(tool => (tool.function as Record<string, unknown>).strict === true) ? 'beta' as const : 'none' as const,
+            ...(finishReason === undefined ? {} : { finishReason: finishReason === 'stop' || finishReason === 'tool_calls' || finishReason === 'length' ? finishReason : 'other' as const }),
+        };
         if (choices[0]?.finish_reason === 'length') {
             throw createSSHelperError('STRUCTURED_OUTPUT_TRUNCATED', {
                 stage: 'llm.tools.openai_chat.final',
@@ -164,10 +171,10 @@ export class OpenAiChatToolAdapter implements ProviderToolAdapter<OpenAiChatTool
                     arguments: parseArguments(functionRecord.arguments, `$.choices[0].message.tool_calls[${index}].function.arguments`),
                 };
             });
-            return { state: 'tool_calls', calls: validateCalls(calls, new Set(state.allowedNames)), adapterState: next, transport: useStream ? 'stream' : 'non_stream', usage: usageFromOpenAi(data) };
+            return { state: 'tool_calls', calls: validateCalls(calls, new Set(state.allowedNames)), adapterState: next, transport: useStream ? 'stream' : 'non_stream', usage: usageFromOpenAi(data), diagnostics };
         }
         const content = assistant.content;
-        return { state: 'final', output: parseFinalOutput(content, 'llm.tools.openai_chat.final'), adapterState: next, transport: useStream ? 'stream' : 'non_stream', usage: usageFromOpenAi(data) };
+        return { state: 'final', output: parseFinalOutput(content, 'llm.tools.openai_chat.final'), adapterState: next, transport: useStream ? 'stream' : 'non_stream', usage: usageFromOpenAi(data), diagnostics };
     }
 
     private assembleStream(chunks: readonly Record<string, unknown>[]): Record<string, unknown> {

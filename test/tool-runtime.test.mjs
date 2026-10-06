@@ -13,6 +13,7 @@ import {
   ToolSchemaCompiler,
   ToolCapabilityProbe,
   LlmToolTurnService,
+  ConsumerRegistry,
   TaskRouter,
   ToolSessionManager,
   createProviderFromResource,
@@ -30,6 +31,31 @@ const tool = {
     additionalProperties: false,
   },
 };
+
+test('required strict and streaming tool capabilities fail before starting a provider turn', async () => {
+  const adapter = { dialect: 'openai_chat_compatible', version: 1, start: async () => assert.fail('unsupported capability must not start'), dispose() {} };
+  const resource = { id: 'required-tools', type: 'generation', source: 'custom', apiType: 'openai', label: 'Required tools', model: 'test', baseUrl: 'https://example.invalid/v1', enabled: true };
+  const registry = new ConsumerRegistry();
+  const router = new TaskRouter();
+  router.setRegistry(registry);
+  router.registerProvider({ id: resource.id, capabilities: { chat: true, tools: true }, createToolAdapter: () => adapter }, 'generation', ['chat', 'tools'], resource.model);
+  router.applyExecutionDefaults({ tool_turn: resource.id });
+  let streamingEnabled = true;
+  const service = new LlmToolTurnService(router, { getResource: () => resource, getStreamingEnabled: () => streamingEnabled }, fixedTestMaxTokens);
+  let capability = { status: 'verified', strictToolSchema: 'unsupported', streamingToolCalls: 'whole_call' };
+  service.getCapability = async () => capability;
+  for (const [requirements, nextCapability, streaming] of [
+    [{ strictToolSchema: 'required' }, capability, true],
+    [{ streamingToolCalls: 'required' }, capability, true],
+    [{ streamingToolCalls: 'required' }, { ...capability, streamingToolCalls: 'incremental' }, false],
+  ]) {
+    capability = nextCapability;
+    streamingEnabled = streaming;
+    registry.registerConsumer({ pluginId: 'ss-helper.memory', displayName: 'Memory', registrationVersion: 1, tasks: [{ taskKey: 'required-tools', taskKind: 'generation', execution: 'tool_turn', requiredCapabilities: ['chat', 'tools'], requirements }] });
+    await assert.rejects(service.turn({ task: 'required-tools', pipelineRunId: 'required-pipeline', chatKey: 'required-chat', input: { messages: startInput().messages }, outputSchema: startInput().outputSchema, tools: [tool] }, 'ss-helper.memory', 'required-request', new AbortController().signal), error => error.details.reasonCode === 'LLM_TASK_REQUIREMENT_UNSUPPORTED' && error.details.requestId === 'required-request');
+  }
+  service.dispose();
+});
 const providerToolName = 'ssht_0_inventory_resolve_context';
 const fixedTestMaxTokens = () => 2048;
 const startInput = (signal = new AbortController().signal) => ({
@@ -123,7 +149,7 @@ test('tool capability probe preserves safe provider failure context', async () =
   });
 });
 
-test('DeepSeek basic tool call remains usable when optional continuation probe fails', async () => {
+test('DeepSeek rejects the tool and JSON capability combination when continuation fails', async () => {
   const adapter = {
     dialect: 'deepseek_chat', version: 1, toolStreamCapability: 'unsupported',
     async start() {
@@ -136,11 +162,8 @@ test('DeepSeek basic tool call remains usable when optional continuation probe f
     resourceId: 'resource:deepseek-basic', model: 'deepseek-chat', requestId: 'request:deepseek-basic', adapter,
     privacyPolicy: DEFAULT_PROVIDER_PRIVACY_POLICY, signal: new AbortController().signal,
   });
-  assert.equal(capability.status, 'verified');
-  assert.equal(capability.parallelToolCalls, false);
-  assert.equal(capability.strictToolSchema, 'unsupported');
-  assert.equal(capability.streamingToolCalls, 'unsupported');
-  assert.equal(capability.optionalFailures?.[0]?.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
+  assert.equal(capability.status, 'failed');
+  assert.equal(capability.failure?.reasonCode, 'RESPONSE_FORMAT_UNSUPPORTED');
 });
 
 test('DeepSeek Beta strict Schema is probed independently from the basic tool call', async () => {
@@ -554,7 +577,9 @@ test('Chat dialects preserve assistant messages, enforce thinking replay integri
   const ordinaryDeepSeekFirst = await ordinaryDeepSeek.start({ ...startInput(), toolChoice: 'required' });
   assert.equal(ordinaryDeepSeekFirst.state, 'tool_calls');
   assert.equal('tool_choice' in deepSeekBodies[0], false);
-  assert.equal('response_format' in deepSeekBodies[0], false);
+  assert.deepEqual(deepSeekBodies[0].response_format, { type: 'json_object' });
+  assert.equal(ordinaryDeepSeekFirst.diagnostics.jsonOutputMode, 'json_object');
+  assert.equal(ordinaryDeepSeekFirst.diagnostics.strictToolSchema, 'none');
   assert.equal('strict' in deepSeekBodies[0].tools[0].function, false);
   assert.equal(deepSeekBodies[0].tools[0].function.name, providerToolName);
   await ordinaryDeepSeek.finalize(ordinaryDeepSeekFirst.adapterState, 'Return final JSON.', startInput().outputSchema, startInput().signal);
@@ -666,6 +691,12 @@ test('DeepSeek Beta endpoint enables strict tool Schema without changing the Dee
   await adapter.start(startInput());
   assert.equal(bodies[0].tools[0].function.strict, true);
   assert.equal('tool_choice' in bodies[0], false);
+  const input = startInput();
+  const optional = { ...input.tools[0], name: 'optional', parameters: { type: 'object', additionalProperties: false, required: [], properties: { value: { type: 'string' } } } };
+  const mixed = await adapter.start({ ...input, tools: [...input.tools, optional] });
+  assert.equal(bodies[1].tools.every(tool => !('strict' in tool.function)), true);
+  assert.equal(mixed.diagnostics.strictToolSchema, 'none');
+  assert.deepEqual(bodies[1].response_format, { type: 'json_object' });
 });
 
 test('streamed OpenAI-compatible arguments assemble by index only after completion', () => {
@@ -772,6 +803,23 @@ test('ToolSessionManager reserves capacity during asynchronous starts and releas
     await manager.start(base);
     assert.equal(manager.activeCount, 0);
   } finally { release(); manager.dispose(); }
+});
+
+test('DeepSeek normal continuation enables JSON Output and preserves thinking history', async () => {
+  const bodies = [];
+  const adapter = new OpenAiChatToolAdapter(transport([
+    { choices: [{ finish_reason: 'tool_calls', message: { role: 'assistant', content: null, reasoning_content: 'opaque thinking', tool_calls: [{ id: 'json-call', function: { name: providerToolName, arguments: '{"mentions":["急救包"]}' } }] } }] },
+    { choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: '{"itemRef":"O07"}' } }] },
+  ], bodies), OPENAI_CHAT_DIALECT_POLICIES.deepseek);
+  const first = await adapter.start({ ...startInput(), reasoning: { mode: 'enabled', effort: 'provider_default' } });
+  const final = await adapter.continue(first.adapterState, [{ callId: 'json-call', name: tool.name, ok: true, content: { ref: 'O07' } }], startInput().signal);
+  for (const body of bodies) {
+    assert.deepEqual(body.response_format, { type: 'json_object' });
+    assert.equal('tool_choice' in body, false);
+  }
+  assert.equal(bodies[1].messages.at(-2).content, '');
+  assert.equal(bodies[1].messages.at(-2).reasoning_content, 'opaque thinking');
+  assert.deepEqual(final.diagnostics, { jsonOutputMode: 'json_object', strictToolSchema: 'none', finishReason: 'stop' });
 });
 
 test('ToolSessionManager admits six calls in one round and records a rejected seventh call safely', async () => {

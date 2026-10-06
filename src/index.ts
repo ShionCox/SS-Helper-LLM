@@ -17,8 +17,7 @@ export { RequestLogService } from './log/requestLogService';
 export { LLMSDKImpl } from './sdk/llm-sdk';
 export { resolveMaxTokens } from './sdk/max-tokens';
 export type { MaxTokensSource, ResolvedMaxTokensResult } from './sdk/max-tokens';
-export { validateZodSchema, parseJsonOutput } from './schema/validator';
-export type { ValidationResult } from './schema/validator';
+export { parseJsonOutput } from './schema/validator';
 export type * from './schema/types';
 export { logger } from './runtime/logger';
 export { RequestRateLimiter } from './runtime/request-rate-limiter';
@@ -28,7 +27,7 @@ export { LlmSettingsStatusMonitor, type LlmSettingsStatusMap, type LlmSettingsSt
 export { createLlmSdkServiceHandlers, exposeLlmServices } from './ss-helper/services';
 export type { LlmSdkServicePort, LlmServiceHandlers } from './ss-helper/services';
 export { createProductionLlmServices, createProviderFromResource } from './ss-helper/llm-service-runtime';
-export { DEFAULT_REASONING_POLICY, compileReasoningFields, compileTavernReasoning, normalizeReasoningPolicy } from './providers/reasoning-policy';
+export { DEFAULT_REASONING_POLICY, compileReasoningFields, normalizeReasoningPolicy } from './providers/reasoning-policy';
 export { verifyReasoningCapabilities, REASONING_CAPABILITY_PROBE_VERSION } from './providers/reasoning-capability-probe';
 export { LlmToolTurnService } from './ss-helper/tool-turn-service';
 export type { ToolCapabilityStore, ToolTurnMaxTokensResolver, ToolTurnResourceResolver } from './ss-helper/tool-turn-service';

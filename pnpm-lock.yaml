@@ -20,9 +20,6 @@ importers:
       svelte-jsoneditor:
         specifier: 3.13.0
         version: 3.13.0(svelte@5.56.8)
-      zod:
-        specifier: ^4.3.6
-        version: 4.4.3
     devDependencies:
       '@types/node':
         specifier: ^25.3.3
@@ -380,7 +377,7 @@ packages:
     resolution: {integrity: sha512-XExJS3cLqgrmNBIP3bBw6+1oQ1ksGjFh0+oClDKFYpCCqx/hlqwWO5KO/S63fzUo67SxI9dMrF0y5T/Ey7h8Zw==}
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-0.0.1.tgz':
-    resolution: {integrity: sha512-grSLwk2fAMFG8vzZHI2FeghFmWFfKAchLegyox8KpbWb8xiewh9fGxO5kpbEH7L/7yqyyRqpQqZmFbb/lhW1aQ==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
+    resolution: {integrity: sha512-ldgbPmpGi8lSMZuovtJ4G/qhSXvuX5yH1Mjwsy0d7aoEW692r13PhZCClnzMv9Kji1SRG4WwJgoDBvvpx3Q9HQ==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
     version: 0.0.1
     engines: {node: '>=20'}
 
@@ -590,9 +587,6 @@ packages:
 
   zimmerframe@1.1.4:
     resolution: {integrity: sha512-B58NGBEoc8Y9MWWCQGl/gq9xBCe4IiKM0a2x7GZdQKOW5Exr8S1W24J6OgM1njK8xCRGvAJIL/MxXHf6SkmQKQ==}
-
-  zod@4.4.3:
-    resolution: {integrity: sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ==}
 
 snapshots:
 
@@ -1094,5 +1088,3 @@ snapshots:
   w3c-keyname@2.2.8: {}
 
   zimmerframe@1.1.4: {}
-
-  zod@4.4.3: {}

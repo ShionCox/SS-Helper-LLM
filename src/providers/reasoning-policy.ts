@@ -1,4 +1,4 @@
-import { createSSHelperError, type LlmReasoningEffort, type LlmReasoningMode, type LlmReasoningPolicy, type ProviderToolDialect } from '@ss-helper/sdk';
+import { createSSHelperError, type LlmReasoningEffort, type LlmReasoningPolicy, type ProviderToolDialect } from '@ss-helper/sdk';
 
 export const DEFAULT_REASONING_POLICY: LlmReasoningPolicy = Object.freeze({ mode: 'provider_default', effort: 'provider_default' });
 
@@ -95,14 +95,5 @@ export function compileReasoningFields(context: ReasoningCompileContext): Record
     return {
         ...(thinking === undefined ? {} : { thinking }),
         ...(mappedEffort === undefined ? {} : { reasoning_effort: mappedEffort }),
-    };
-}
-
-/** Canonical fields understood by the host source/model mapper. */
-export function compileTavernReasoning(policy?: LlmReasoningPolicy): { readonly includeReasoning?: boolean; readonly reasoningEffort?: string } {
-    const normalized = normalizeReasoningPolicy(policy);
-    return {
-        ...(normalized.mode === 'provider_default' ? {} : { includeReasoning: normalized.mode === 'enabled' }),
-        ...(normalized.effort === 'provider_default' ? {} : { reasoningEffort: normalized.effort === 'minimal' ? 'min' : normalized.effort === 'xhigh' ? 'max' : normalized.effort }),
     };
 }

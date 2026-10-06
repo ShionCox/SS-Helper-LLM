@@ -1,5 +1,6 @@
 import { buildStructuredOutputSystemInstruction } from './structured-output';
 import { isStrictJsonSchemaCompatible } from './strict-json-schema';
+import { createSSHelperError } from '@ss-helper/sdk';
 
 export type StructuredOutputVendor = 'openai' | 'deepseek' | 'gemini' | 'claude' | 'unknown';
 export type StructuredOutputTransport = 'json_schema' | 'json_object' | 'tavern_json_schema' | 'prompt_only';
@@ -57,6 +58,7 @@ export function createStructuredOutputPlan(input: {
         readonly preferred: StructuredOutputTransport;
     };
     readonly strictSchemaUnavailable?: boolean;
+    readonly requireNative?: boolean;
 }): StructuredOutputPlan {
     const strictSchemaCompatible = isStrictJsonSchemaCompatible(input.spec.schema);
     const declared = new Set(input.capability.transports);
@@ -66,6 +68,11 @@ export function createStructuredOutputPlan(input: {
         transport = declared.has('json_object') ? 'json_object' : 'prompt_only';
     }
     if (!declared.has(transport)) transport = 'prompt_only';
+    if (input.requireNative && transport === 'prompt_only') {
+        const native = (['json_schema', 'json_object', 'tavern_json_schema'] as const).find((candidate) => declared.has(candidate) && (candidate !== 'json_schema' || (strictSchemaCompatible && !input.strictSchemaUnavailable)));
+        if (!native) throw createSSHelperError('LLM_TASK_REQUIREMENT_UNSUPPORTED', { stage: 'llm.structured.requirements', expected: 'nativeStructured' });
+        transport = native;
+    }
     return {
         identity: input.identity,
         transport,

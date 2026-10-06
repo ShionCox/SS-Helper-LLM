@@ -15,7 +15,7 @@ function agentEntry() {
     request: {
       taskKind: 'generation', generationInput: { messages: [{ role: 'user', content: 'private-prompt' }] },
       providerRequest: { headers: { authorization: 'Bearer private-token' }, payload: { messages: [{ content: 'private-wire-prompt' }] } },
-      providerRequestMeta: { requestFormat: 'agent_tool_turn', method: 'POST', endpointOrigin: 'https://relay.invalid', endpointPath: '/v1', queryParameterNames: ['token'], messageCount: 1, inputCharCount: 14, rawBody: 'private-meta-request' },
+      providerRequestMeta: { requestFormat: 'agent_tool_turn', method: 'POST', endpointOrigin: 'https://relay.invalid', endpointPath: '/v1', queryParameterNames: ['token'], messageCount: 1, inputCharCount: 14, jsonOutputMode: 'json_object', strictToolSchema: 'none', rawBody: 'private-meta-request' },
     },
     agent: {
       state: 'tool_calls', toolSessionRound: 1, totalCalls: 1, toolDescriptions: { 'entity.resolve_context': 'private-tool-description' },
@@ -26,7 +26,7 @@ function agentEntry() {
     },
     response: {
       rawResponseText: '{"summary":"模型完整返回","apiKey":"private-raw-key"}', providerResponse: { content: 'API 完整返回', headers: { authorization: 'Bearer private-token' }, debugRequest: { payload: { messages: [{ role: 'user', content: 'private-provider-echo-prompt' }] } } }, parsedResponse: { summary: '解析后的记忆' }, normalizedResponse: { summary: '标准化记忆', apiKey: 'private-response-key' },
-      providerResponseMeta: { outcome: 'success', receivedBytes: 20, rawResponse: 'private-meta-response' }, parseMeta: { stage: 'llm.provider.response', outcome: 'success', responseCharCount: 20, candidateText: 'private-parse-candidate' },
+      providerResponseMeta: { outcome: 'success', receivedBytes: 20, finishReason: 'stop', rawResponse: 'private-meta-response' }, parseMeta: { stage: 'llm.provider.response', outcome: 'success', responseCharCount: 20, candidateText: 'private-parse-candidate' },
     },
   };
 }
@@ -36,7 +36,10 @@ test('full retention persists complete response and Agent result while stripping
   assert.ok(stored);
   assert.equal(stored.contentMode, 'full');
   assert.equal(stored.value.request.providerRequestMeta.requestFormat, 'agent_tool_turn');
+  assert.equal(stored.value.request.providerRequestMeta.jsonOutputMode, 'json_object');
+  assert.equal(stored.value.request.providerRequestMeta.strictToolSchema, 'none');
   assert.equal(stored.value.response.providerResponseMeta.outcome, 'success');
+  assert.equal(stored.value.response.providerResponseMeta.finishReason, 'stop');
   assert.deepEqual({ callId: stored.value.agent.toolCalls[0].callId, name: stored.value.agent.toolCalls[0].name }, { callId: 'call-1', name: 'entity.resolve_context' });
   assert.equal(stored.value.agent.toolCalls[0].argumentBytes > 0, true);
   assert.equal(stored.value.agent.toolResults[0].resultBytes > 0, true);
@@ -65,7 +68,9 @@ test('summary retention keeps route and failure classification without diagnosti
   assert.ok(stored);
   assert.equal(stored.contentMode, 'summary');
   assert.deepEqual(stored.value.response.failure, entry.response.failure);
-  assert.equal(stored.value.request.providerRequestMeta, undefined);
+  assert.equal(stored.value.request.providerRequestMeta.jsonOutputMode, 'json_object');
+  assert.equal(stored.value.request.providerRequestMeta.strictToolSchema, 'none');
+  assert.equal(stored.value.response.providerResponseMeta.finishReason, 'stop');
   assert.equal(stored.value.response.parsedResponse, undefined);
   assert.equal(stored.value.response.normalizedResponse, undefined);
   assert.equal(stored.value.response.validationIssues, undefined);
@@ -118,8 +123,6 @@ test('oversized complete response keeps a bounded sanitized head-tail preview', 
     'agent.toolCalls[*].arguments',
     'agent.toolResults[*].content',
     'agent.finalOutput',
-    'request.providerRequestMeta',
-    'response.providerResponseMeta',
     'response.parseMeta',
   ]);
   assert.equal(stored.value.response.responsePreview.kind, 'truncated_text');

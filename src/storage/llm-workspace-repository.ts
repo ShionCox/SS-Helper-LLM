@@ -7,11 +7,11 @@ import type {
   WorkspaceRecord,
   WorkspaceSession,
   SSHelperFailureContext,
-  SSHelperReasonCode,
   VerifiedToolCapabilities,
 } from '@ss-helper/sdk';
 import { createSSHelperError, LLM_RESOURCE_CAPABILITY_VERIFY_V0, isSSHelperReasonCode } from '@ss-helper/sdk';
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
+import { configuredMaxTokensControl } from '../sdk/max-tokens';
 import type { LLMHubSettings, LLMRequestLogQueryOptions } from '../schema/types';
 import type { ResourceConfig } from '../schema/types';
 import { validateLlmSettings } from '../validation/settings';
@@ -144,7 +144,7 @@ async function sha256Json(value: unknown): Promise<string> {
 type QueryOptions = Pick<WorkspaceQueryOptions, 'filter' | 'where' | 'orderBy'>;
 
 export class LlmWorkspaceRepository {
-  private settings: PersistedSettings = { ...DEFAULT_LLM_SETTINGS };
+  private settings: PersistedSettings = this.settingsFrom(DEFAULT_LLM_SETTINGS);
   private settingsRevision = 0;
   private initialized?: Promise<void>;
   private initializationState: 'idle' | 'pending' | 'ready' = 'idle';
@@ -186,7 +186,7 @@ export class LlmWorkspaceRepository {
   private async loadSettingsFromWorkspace(): Promise<PersistedSettings> {
     const record = await this.read({ collection: 'settings', id: 'global' });
     this.settingsRevision = recordRevision(record);
-    this.settings = record ? this.settingsFrom(validateLlmSettings(record.value)) : { ...DEFAULT_LLM_SETTINGS };
+    this.settings = this.settingsFrom(record ? validateLlmSettings(record.value) : DEFAULT_LLM_SETTINGS);
     return structuredClone(this.settings);
   }
 
@@ -318,9 +318,12 @@ export class LlmWorkspaceRepository {
   }
 
   private settingsFrom(value: LLMHubSettings): PersistedSettings {
+    const { maxTokensMode: _defaultMode, maxTokens: _defaultTokens, ...defaults } = DEFAULT_LLM_SETTINGS;
+    const { maxTokensMode: _mode, maxTokens: _tokens, ...retained } = value;
     return {
-      ...DEFAULT_LLM_SETTINGS,
-      ...value,
+      ...defaults,
+      ...retained,
+      maxTokensControl: configuredMaxTokensControl(value),
       requestLogging: {
         ...DEFAULT_LLM_SETTINGS.requestLogging,
         ...(value.requestLogging ?? {}),
@@ -485,7 +488,7 @@ export class LlmWorkspaceRepository {
           throw error;
         }
         this.settingsRevision = 0;
-        this.settings = { ...DEFAULT_LLM_SETTINGS };
+        this.settings = this.settingsFrom(DEFAULT_LLM_SETTINGS);
         prepared?.commit();
       } catch (error) {
         prepared?.dispose();
@@ -788,7 +791,7 @@ export class LlmWorkspaceRepository {
         }
         this.initialized = undefined;
         this.settingsRevision = 0;
-        this.settings = { ...DEFAULT_LLM_SETTINGS };
+        this.settings = this.settingsFrom(DEFAULT_LLM_SETTINGS);
         prepared?.commit();
         await this.ready();
       } catch (error) {

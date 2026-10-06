@@ -11,6 +11,17 @@ const strictSchema = {
 
 const identity = structuredOutputIdentityFromSource({ manualVendor: 'openai', model: 'gpt-4o-mini' });
 
+test('structured prompts contain one schema and only a schema-valid minimal example', () => {
+  const schema = { type: 'object', required: ['claims'], additionalProperties: false, properties: { claims: { type: 'array', items: { type: 'object', required: ['content', 'knowledge'], additionalProperties: false, properties: { content: { type: 'string', minLength: 6 }, knowledge: { type: 'object', required: ['privacy'], additionalProperties: false, properties: { privacy: { type: 'string', enum: ['public', 'private'] } } } } } } } };
+  const plan = createStructuredOutputPlan({ identity, capability: { transports: ['json_object'], preferred: 'json_object' }, spec: { name: 'capture', schema } });
+  assert.equal(plan.promptInstruction.split('JSON Schema：').length, 2);
+  const example = JSON.parse(plan.promptInstruction.split('最小合法 JSON 格式示例：\n')[1].split('\n\n')[0]);
+  assert.deepEqual(example, { claims: [] });
+  assert.equal(plan.promptInstruction.includes('字段规则摘要'), false);
+  const unavailable = createStructuredOutputPlan({ identity, capability: { transports: ['json_object'], preferred: 'json_object' }, spec: { name: 'required-value', schema: { type: 'object', required: ['value'], properties: { value: { type: 'string', minLength: 6 } }, additionalProperties: false } } });
+  assert.equal(unavailable.promptInstruction.includes('最小合法 JSON 格式示例'), false);
+});
+
 test('planner follows explicit provider capability instead of URL or model-name guessing', () => {
   const strict = createStructuredOutputPlan({
     identity,

@@ -103,19 +103,12 @@ export interface TaskDescriptor {
     structuredPolicy?: LlmStructuredRepairPolicy;
 }
 
-/** 路由绑定 —— 一个插件对某个任务的覆盖 */
-export interface RouteBinding {
-    taskKey: string;
-    resourceId: string;
-}
-
 /** 消费方注册包 */
 export interface ConsumerRegistration {
     pluginId: string;
     displayName: string;
     registrationVersion: number;
     tasks: TaskDescriptor[];
-    routeBindings?: RouteBinding[];
 }
 
 // ═══════════════════════════════════════════
@@ -128,8 +121,6 @@ export interface ConsumerPersistentSnapshot {
     displayName: string;
     registrationVersion: number;
     tasks: TaskDescriptor[];
-    routeBindings: RouteBinding[];
-    staleReason?: string;
 }
 
 /** 会话字段 —— 不跨重启 */
@@ -146,16 +137,6 @@ export interface ConsumerSnapshot extends ConsumerPersistentSnapshot {
 // ═══════════════════════════════════════════
 //  失效绑定快照
 // ═══════════════════════════════════════════
-
-export interface StaleBindingSnapshot {
-    taskKey: string;
-    taskKind: CapabilityKind;
-    registrationVersion: number;
-    lastSeenAt: number;
-    source: 'task_removed' | 'task_kind_changed' | 'capability_mismatch' | 'plugin_inactive';
-    isStale: true;
-    staleReason: string;
-}
 
 // ═══════════════════════════════════════════
 //  请求编排
@@ -206,6 +187,8 @@ export interface RequestDebugInfo {
 }
 
 export interface LLMProviderRequestMetadata {
+    jsonOutputMode?: 'json_object' | 'json_schema' | 'prompt_json';
+    strictToolSchema?: 'native' | 'beta' | 'none';
     requestFormat: string;
     operation?: string;
     method?: 'GET' | 'POST';
@@ -733,5 +716,4 @@ import type {
     ProviderPrivacyPolicy,
     ProviderToolDialect,
     LlmReasoningPolicy,
-    VerifiedReasoningCapabilities,
 } from '@ss-helper/sdk';

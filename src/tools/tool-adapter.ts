@@ -7,6 +7,7 @@ import type {
     ProviderPrivacyPolicy,
     ProviderToolDialect,
     LlmReasoningPolicy,
+    LlmToolTurnDiagnostics,
 } from '@ss-helper/sdk';
 
 export interface ProviderToolStartInput {
@@ -23,7 +24,9 @@ export interface ProviderToolStartInput {
     readonly signal: AbortSignal;
 }
 
-export type ProviderToolStep<TState = unknown> =
+export type ProviderToolStep<TState = unknown> = {
+    readonly diagnostics?: Pick<LlmToolTurnDiagnostics, 'jsonOutputMode' | 'strictToolSchema' | 'finishReason'>;
+} & (
     | {
         readonly state: 'tool_calls';
         readonly calls: readonly NormalizedToolCall[];
@@ -37,7 +40,7 @@ export type ProviderToolStep<TState = unknown> =
         readonly adapterState: TState;
         readonly transport?: 'stream' | 'non_stream';
         readonly usage?: { readonly inputTokens?: number; readonly outputTokens?: number; readonly totalTokens?: number };
-    };
+    });
 
 export interface ProviderToolAdapter<TState = unknown> {
     readonly dialect: ProviderToolDialect;

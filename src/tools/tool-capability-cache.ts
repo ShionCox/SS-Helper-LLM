@@ -1,4 +1,4 @@
-import type { ProviderToolDialect, VerifiedToolCapabilities } from '@ss-helper/sdk';
+import type { VerifiedToolCapabilities } from '@ss-helper/sdk';
 
 export interface ToolCapabilityCacheKeyInput {
     readonly resourceId: string;
@@ -58,23 +58,4 @@ export class ToolCapabilityCache {
     }
 
     clear(): void { this.snapshots.clear(); }
-}
-
-export function declaredToolCapability(input: {
-    readonly resourceId: string;
-    readonly model: string;
-    readonly dialect: ProviderToolDialect;
-    readonly probeVersion: number;
-}): VerifiedToolCapabilities {
-    return Object.freeze({
-        status: 'declared',
-        resourceId: input.resourceId,
-        model: input.model,
-        dialect: input.dialect,
-        parallelToolCalls: false,
-        streamingToolCalls: 'unknown',
-        strictToolSchema: 'unknown',
-        reasoningReplay: input.dialect === 'deepseek_chat' || input.dialect === 'glm_chat' ? 'required' : input.dialect === 'gemini_interactions' || input.dialect === 'openai_responses' ? 'opaque' : 'none',
-        probeVersion: input.probeVersion,
-    });
 }

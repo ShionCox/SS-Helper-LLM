@@ -3,7 +3,18 @@ import type {
     GlobalMaxTokensControl,
     RunTaskArgs,
     TaskAssignment,
+    LLMHubSettings,
 } from '../schema/types';
+import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
+
+/** One effective projection for UI, ordinary requests and Agent requests. */
+export function configuredMaxTokensControl(settings: LLMHubSettings): GlobalMaxTokensControl & Required<Pick<GlobalMaxTokensControl, 'mode' | 'manualValue'>> {
+    return {
+        ...settings.maxTokensControl,
+        mode: settings.maxTokensMode ?? settings.maxTokensControl?.mode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
+        manualValue: settings.maxTokens ?? settings.maxTokensControl?.manualValue ?? DEFAULT_LLM_SETTINGS.maxTokens,
+    };
+}
 
 export type MaxTokensSource =
     | 'global_manual'

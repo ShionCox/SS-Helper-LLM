@@ -1,4 +1,4 @@
-import { LLM_TASK_STATUS_CHANGED_V0, createSSHelperError, readSSHelperFailure, type HostPort, type LlmCapabilityKind, type LlmSafeResourceSummary, type LlmTaskStatusRequest, type LlmTaskStatusSnapshot, type LlmTaskStatusEntry, type LlmTaskRoutingAssignment, type LlmExecution, type LlmTaskRouteSetRequest, type LlmResourceCapabilityVerifyRequest, type LlmResourceCapabilityVerifyResponse, type LlmReasoningPolicy, type VerifiedReasoningCapabilities, type VerifiedToolCapabilities, type VerifiedEmbeddingCapabilities, type PluginSession } from '@ss-helper/sdk';
+import { LLM_TASK_STATUS_CHANGED_V0, createSSHelperError, readSSHelperFailure, type HostPort, type LlmCapabilityKind, type LlmSafeResourceSummary, type LlmTaskStatusRequest, type LlmTaskStatusSnapshot, type LlmTaskStatusEntry, type LlmTaskRoutingAssignment, type LlmExecution, type LlmTaskRouteSetRequest, type LlmResourceCapabilityVerifyResponse, type LlmReasoningPolicy, type VerifiedReasoningCapabilities, type VerifiedToolCapabilities, type VerifiedEmbeddingCapabilities, type PluginSession } from '@ss-helper/sdk';
 import { BudgetManager } from '../budget/budget-manager';
 import { RequestLogService } from '../log/requestLogService';
 import { RequestOrchestrator } from '../orchestrator/orchestrator';
@@ -14,7 +14,7 @@ import { ConsumerRegistry } from '../registry/consumer-registry';
 import { BUILTIN_TAVERN_RESOURCE_ID, TaskRouter } from '../router/router';
 import { LLMSDKImpl } from '../sdk/llm-sdk';
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
-import type { GlobalMaxTokensControl, LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
+import type { LLMCapability, LLMHubSettings, ResourceConfig, ResourceType } from '../schema/types';
 import { createLlmSdkServiceHandlers, type LlmServiceHandlers } from './services';
 import { LlmWorkspaceRepository, type PreparedSettingsRuntime, type SettingsRuntimePrepareOptions } from '../storage/llm-workspace-repository';
 import { validateLlmSettings } from '../validation/settings';
@@ -26,6 +26,8 @@ import { RequestRateLimiter } from '../runtime/request-rate-limiter';
 import { DEFAULT_REASONING_POLICY } from '../providers/reasoning-policy';
 import { verifyReasoningCapabilities } from '../providers/reasoning-capability-probe';
 import { stableToolDigest } from '../tools/tool-capability-cache';
+import { configuredMaxTokensControl } from '../sdk/max-tokens';
+import { describeSSHelperFailure } from '@ss-helper/sdk';
 
 export interface ProductionLlmProviderRegistration {
     readonly provider: LLMProvider;
@@ -62,28 +64,13 @@ export function createProviderFromResource(resource: ResourceConfig, apiKey: str
     return new OpenAIProvider({ ...base, apiType: resolvedApiType, structuredOutputIdentity: identity, enableRerank: resource.type === 'rerank' && resource.rerankProtocol === 'chat', embeddingPath: resource.embeddingPath, embeddingDimensions: resource.embeddingDimensions, toolDialect: resource.toolDialect ?? manifest.protocol, enableToolStream });
 }
 
-function configuredMaxTokensControl(settings: LLMHubSettings): GlobalMaxTokensControl {
-    const mode = settings.maxTokensMode ?? settings.maxTokensControl?.mode ?? DEFAULT_LLM_SETTINGS.maxTokensMode;
-    if (mode === 'manual') {
-        return {
-            mode,
-            manualValue: settings.maxTokens ?? settings.maxTokensControl?.manualValue ?? DEFAULT_LLM_SETTINGS.maxTokens,
-        };
-    }
-    return {
-        mode,
-        ...(mode === 'adaptive' && settings.maxTokensControl?.adaptive
-            ? { adaptive: settings.maxTokensControl.adaptive }
-            : {}),
-    };
-}
-
 function withMaxTokensDefaults(settings: LLMHubSettings): LLMHubSettings {
+    const output = configuredMaxTokensControl(settings);
     return {
         ...DEFAULT_LLM_SETTINGS,
         ...settings,
-        maxTokensMode: settings.maxTokensMode ?? settings.maxTokensControl?.mode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
-        maxTokens: settings.maxTokens ?? settings.maxTokensControl?.manualValue ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        maxTokensMode: output.mode,
+        maxTokens: output.manualValue,
     };
 }
 
@@ -160,7 +147,6 @@ export function createProductionLlmServices(
         status: 'unknown', resourceId, model: model || 'unknown', verifiedMaxBatchInputs: 8,
     });
     router.setRegistry(registry);
-    registry.setResourceCapabilityQuery((resourceId) => router.getProviderCapabilities(resourceId));
     router.registerProvider(new TavernProvider({ id: BUILTIN_TAVERN_RESOURCE_ID, generation: session.host.generation }), 'generation', [
         'chat', 'json',
         ...(session.host.has('tavern.generation.execute') ? ['tools' as const] : []),
@@ -397,12 +383,12 @@ export function createProductionLlmServices(
         };
     };
 
-    const capabilityStatus = async (request: { readonly checks: readonly { readonly id: string; readonly taskKey: string; readonly taskKind: LlmCapabilityKind; readonly requiredCapabilities?: readonly string[] }[] }, signal: AbortSignal): Promise<{ readonly revision: number; readonly checks: readonly { readonly id: string; readonly configured: boolean; readonly available: boolean; readonly resourceId?: string; readonly model?: string; readonly source?: 'tavern' | 'custom'; readonly reason?: string }[] }> => {
+    const capabilityStatus = async (request: { readonly checks: readonly { readonly id: string; readonly taskKey: string; readonly taskKind: LlmCapabilityKind; readonly requiredCapabilities?: readonly string[] }[] }, signal: AbortSignal, callerPluginId: string): Promise<{ readonly revision: number; readonly checks: readonly { readonly id: string; readonly configured: boolean; readonly available: boolean; readonly resourceId?: string; readonly model?: string; readonly source?: 'tavern' | 'custom'; readonly reason?: string }[] }> => {
         if (signal.aborted) throw createSSHelperError('REQUEST_ABORTED', { stage: 'llm.capability_status' });
         const settings = settingsState.value;
         const resources = Array.isArray(settings.resources) ? settings.resources : [];
         const entries = await Promise.all(request.checks.map(async (check) => {
-            const descriptor = registry.getTaskDescriptor('ss-helper.memory', check.taskKey);
+            const descriptor = registry.getTaskDescriptor(callerPluginId, check.taskKey);
             const execution = executionFor({ taskKind: check.taskKind, execution: descriptor?.execution, requiredCapabilities: check.requiredCapabilities });
             const base = { id: check.id };
             if (settings.enabled === false) return { ...base, configured: false, available: false, reason: 'llm_disabled' as const };
@@ -422,7 +408,7 @@ export function createProductionLlmServices(
                 missingCredential = true;
             }
             let route;
-            try { route = router.resolveRoute({ consumer: 'ss-helper.memory', taskKind: check.taskKind, execution, taskKey: check.taskKey, requiredCapabilities: required as never }); } catch (error) {
+            try { route = router.resolveRoute({ consumer: callerPluginId, taskKind: check.taskKind, execution, taskKey: check.taskKey, requiredCapabilities: required as never }); } catch (error) {
                 const failure = readSSHelperFailure(error);
                 if (missingCredential) return { ...base, configured: false, available: false, reason: 'credential_missing' as const };
                 if (candidates.length > 0 && enabledCandidates.length === 0) return { ...base, configured: false, available: false, reason: 'resource_disabled' as const };
@@ -532,7 +518,7 @@ export function createProductionLlmServices(
             taskKind: task.taskKind ?? (executionFor(task) === 'embedding' ? 'embedding' : executionFor(task) === 'rerank' ? 'rerank' : 'generation'),
             requiredCapabilities: task.requiredCapabilities,
         }));
-        const capability = await capabilityStatus({ checks }, new AbortController().signal);
+        const capability = await capabilityStatus({ checks }, new AbortController().signal, callerPluginId);
         const byId = new Map(capability.checks.map((entry) => [entry.id, entry]));
         const resources = await safeResources();
         const resourcesById = new Map(resources.map((resource) => [resource.resourceId, resource]));
@@ -541,6 +527,12 @@ export function createProductionLlmServices(
             const entry = byId.get(task.taskKey);
             const resource = entry?.resourceId ? resourcesById.get(entry.resourceId) : undefined;
             const assignment = (settings.taskAssignments ?? []).find((item) => item.pluginId === callerPluginId && item.taskKey === task.taskKey && item.resourceId);
+            const provider = entry?.resourceId ? router.getProvider(entry.resourceId) : undefined;
+            const unsupported = (task.requirements?.nativeStructured === 'required' && (execution !== 'structured' || !provider?.capabilities.structuredOutput?.transports.some(transport => transport !== 'prompt_only')))
+                || (task.requirements?.strictToolSchema === 'required' && (execution !== 'tool_turn' || !['native', 'beta'].includes(resource?.toolCapabilities?.strictToolSchema ?? 'unknown')))
+                || (task.requirements?.streamingToolCalls === 'required' && (execution !== 'tool_turn' || resource?.toolCapabilities?.streamingToolCalls !== 'incremental' || settings.streamingEnabled === false));
+            const available = entry?.available === true && !unsupported;
+            const reasonCode = unsupported ? 'LLM_TASK_REQUIREMENT_UNSUPPORTED' : 'LLM_TASK_ROUTE_UNAVAILABLE';
             const route = entry?.resourceId === undefined ? undefined : {
                 resourceId: entry.resourceId,
                 provider: resource?.apiType ?? entry.source ?? 'unknown',
@@ -557,12 +549,12 @@ export function createProductionLlmServices(
             return {
                 taskKey: task.taskKey,
                 execution,
-                available: entry?.available === true,
+                available,
                 ...(entry?.resourceId ? { resourceId: entry.resourceId } : {}),
                 ...(route ? { route } : {}),
                 ...(task.requirements ? { requirements: task.requirements } : {}),
-                ...(entry?.available === true ? {} : {
-                    failure: readSSHelperFailure(createSSHelperError('LLM_TASK_ROUTE_UNAVAILABLE', {
+                ...(available ? {} : {
+                    failure: readSSHelperFailure(createSSHelperError(reasonCode, {
                         stage: 'llm.task.status',
                         ...(entry?.resourceId ? { resourceId: entry.resourceId } : {}),
                         ...(entry?.model ? { model: entry.model } : {}),
@@ -622,9 +614,14 @@ export function createProductionLlmServices(
     const runtimeDisposers: Array<() => void> = [];
     const detachRuntimePreparer = repository?.attachRuntimePreparer(prepareRuntime);
     if (repository) {
-        registry.setPersistCallback((snapshots) => { void repository.saveConsumers(snapshots as unknown as Record<string, import('@ss-helper/sdk').PlainData>); });
+        registry.setPersistCallback((snapshots) => repository.saveConsumers(snapshots as unknown as Record<string, import('@ss-helper/sdk').PlainData>));
         const unsubscribeRepository = repository.subscribeChanges((kinds) => notifyCapabilityChange(kinds));
-        void (async () => {
+        let initializing = false;
+        let initialized = false;
+        const initializeRuntime = async (): Promise<void> => {
+            if (disposed || initializing || initialized) return;
+            initializing = true;
+            try {
             let delayMs = 0;
             while (!disposed) {
                 if (disposed) return;
@@ -636,13 +633,23 @@ export function createProductionLlmServices(
                     const settings = await repository.loadSettings();
                     const prepared = await prepareRuntime(settings);
                     prepared.commit();
+                    initialized = true;
                     notifyCapabilityChange(['generation', 'embedding', 'rerank']);
                     return;
-                } catch {
+                } catch (error) {
+                    const failure = describeSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage: 'llm.runtime.initialize' });
+                    if (!failure.retryable) {
+                        logger.error('LLM 初始化需要修复配置。', safeFailureLogDetail(error, failure));
+                        return;
+                    }
                     delayMs = Math.min(5_000, delayMs === 0 ? 120 : delayMs * 2);
                 }
             }
-        })();
+            } finally { initializing = false; }
+        };
+        const unsubscribeRecovery = repository.subscribeSettings(() => { void initializeRuntime(); });
+        void initializeRuntime();
+        runtimeDisposers.push(unsubscribeRecovery);
         runtimeDisposers.push(unsubscribeRepository);
     } else {
         void prepareRuntime(settingsState.value).then((prepared) => prepared.commit()).catch(() => undefined);

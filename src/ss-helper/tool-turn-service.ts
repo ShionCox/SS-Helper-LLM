@@ -263,6 +263,11 @@ export class LlmToolTurnService {
             });
         }
         const tools = this.compiler.compile(request.tools ?? [], resolved.adapter.dialect);
+        const requirements = this.router.getTaskRequirements(callerPluginId, request.task);
+        if ((requirements?.strictToolSchema === 'required' && !['native', 'beta'].includes(capability.strictToolSchema))
+            || (requirements?.streamingToolCalls === 'required' && (capability.streamingToolCalls !== 'incremental' || this.resources.getStreamingEnabled?.() === false))) {
+            throw createSSHelperError('LLM_TASK_REQUIREMENT_UNSUPPORTED', { stage: 'llm.tools.requirements', requestId, resourceId: route.resourceId, model: resolved.model });
+        }
         const outputSchema = request.outputSchema as PlainData;
         const messages = this.withOutputSchemaInstruction(
             this.readMessages(request.input),
@@ -366,6 +371,7 @@ export class LlmToolTurnService {
             toolSchemaProfile: 'ss_helper_tool_v0' as const,
             providerAdapterVersion: 1,
             capabilitySnapshotId: managed.capabilitySnapshotId,
+            ...managed.step.diagnostics,
         };
         const route = {
             resourceId: resource.id,

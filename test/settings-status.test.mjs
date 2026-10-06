@@ -1,10 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { API_VERSION, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION } from '@ss-helper/sdk';
+import { API_VERSION, CORE_DISCOVERY_SYMBOL, SDK_PACKAGE_VERSION, createSSHelperError } from '@ss-helper/sdk';
 import { LlmSettingsStatusMonitor, createWorkspaceLlmSettingsAdapter } from '../dist/index.js';
 
 const wait = (ms = 120) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test('nested output controls survive unrelated saves and settings failures never report a successful Tavern source', async () => {
+  let settings = { maxTokensControl: { mode: 'manual', manualValue: 12345, adaptive: { min: 900 } } };
+  const repository = { loadSettings: async () => settings, updateSettings: async mutate => { settings = mutate(settings); } };
+  const adapter = createWorkspaceLlmSettingsAdapter(repository, { loadStatus: () => ({}), subscribeStatus: () => () => {} });
+  assert.equal((await adapter.load()).maxTokensMode, 'manual');
+  assert.equal((await adapter.load()).maxTokens, 12345);
+  await adapter.save({ enabled: false });
+  assert.deepEqual(settings.maxTokensControl, { mode: 'manual', manualValue: 12345, adaptive: { min: 900 } });
+  const value = fixture();
+  value.repository.loadSettings = async () => { throw createSSHelperError('INVALID_PAYLOAD', { stage: 'fixture.settings', requestId: 'read-root' }); };
+  const monitor = new LlmSettingsStatusMonitor(value.session, value.repository, value.handlers, value.target);
+  await monitor.start();
+  assert.equal(monitor.loadStatus().generationSourceStatus.value, '设置不可用');
+  assert.match(monitor.loadStatus().generationSourceStatus.description, /INVALID_PAYLOAD.*read-root/u);
+  monitor.dispose();
+});
 
 test('simplified settings preserve hidden values and convert seconds without losing precision', async () => {
   let settings = { timeoutMs: 12345, maxTokensMode: 'adaptive', maxTokens: 5120, maxTokensControl: { adaptive: { min: 800 } }, requestLogging: { enabled: false, detailMode: 'full', maxEntries: 333 } };
@@ -19,7 +36,8 @@ test('simplified settings preserve hidden values and convert seconds without los
   assert.equal((await adapter.loadFieldState()).maxTokens.hidden, true);
   await adapter.save({ ...values, enabled: true });
   assert.equal(settings.timeoutMs, 12345);
-  assert.equal(settings.maxTokens, 5120);
+  assert.equal(settings.maxTokens, undefined);
+  assert.equal(settings.maxTokensControl.manualValue, 5120);
   assert.equal(settings.maxTokensControl.adaptive.min, 800);
   assert.equal(settings.requestLogging.maxEntries, 333);
   await adapter.save({ maxTokensMode: 'manual', 'requestLogging.detailMode': 'summary', timeoutSeconds: 30 });

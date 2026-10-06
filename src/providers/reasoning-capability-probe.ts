@@ -1,9 +1,7 @@
 import {
     createSSHelperError,
     readSSHelperFailure,
-    type LlmReasoningEffort,
     type LlmReasoningExecutionCapability,
-    type LlmReasoningMode,
     type LlmReasoningPolicy,
     type SSHelperFailureContext,
     type VerifiedReasoningCapabilities,

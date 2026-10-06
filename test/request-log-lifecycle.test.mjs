@@ -60,7 +60,7 @@ test('Workspace fallback keeps configured off and summary retention modes', asyn
     response: {
       requestId: 'turn-summary', state: 'tool_calls', toolSessionId: 'session-summary',
       calls: [{ callId: 'call-summary', name: 'entity.resolve_context', arguments: { mentions: ['不应保留'] } }],
-      route: { route: 'resource-a', provider: 'openai', model: 'model-a' },
+      route: { resourceId: 'resource-a', source: 'custom', provider: 'openai', model: 'model-a', execution: 'tool_turn', transport: 'openai_responses' },
       diagnostics: { toolSessionRound: 1, totalCalls: 1, toolSchemaProfile: 'ss_helper_tool_v0', providerAdapterVersion: 2, capabilitySnapshotId: 'capability-1' },
     },
     callerPluginId: 'ss-helper.memory', taskDescription: '解析人物与地点实体', requestId: 'turn-summary', startedAt: Date.now(), finishedAt: Date.now(),
@@ -288,7 +288,7 @@ test('stores Agent model turns as workflow children and pairs tool calls with la
     response: {
       requestId: 'turn-1', state: 'tool_calls', toolSessionId: 'session-1',
       calls: [{ callId: 'call-1', name: 'entity.resolve_context', arguments: { mentions: ['紫罗'], apiKey: 'private-tool-key' } }],
-      route: { route: 'resource-a', provider: 'openai', model: 'model-a' },
+      route: { resourceId: 'resource-a', source: 'custom', provider: 'openai', model: 'model-a', execution: 'tool_turn', transport: 'openai_responses' },
       diagnostics: { toolSessionRound: 1, totalCalls: 1, toolSchemaProfile: 'ss_helper_tool_v0', providerAdapterVersion: 2, capabilitySnapshotId: 'capability-1' },
     },
     callerPluginId: 'ss-helper.memory', consumerDisplayName: '记忆系统', taskDescription: '解析人物与地点实体', requestId: 'turn-1', startedAt: 10, finishedAt: 20,
@@ -297,7 +297,7 @@ test('stores Agent model turns as workflow children and pairs tool calls with la
     request: { ...baseRequest, toolSessionId: 'session-1', toolResults: [{ callId: 'call-1', name: 'entity.resolve_context', ok: true, content: { data: { items: [{ ref: 'A01' }] }, authorization: 'Bearer private-tool-token' } }] },
     response: {
       requestId: 'turn-2', state: 'final', output: { actorCandidates: [] },
-      route: { route: 'resource-a', provider: 'openai', model: 'model-a' },
+      route: { resourceId: 'resource-a', source: 'custom', provider: 'openai', model: 'model-a', execution: 'tool_turn', transport: 'openai_responses' },
       diagnostics: { toolSessionRound: 2, totalCalls: 1, toolSchemaProfile: 'ss_helper_tool_v0', providerAdapterVersion: 2, capabilitySnapshotId: 'capability-1' },
     },
     callerPluginId: 'ss-helper.memory', consumerDisplayName: '记忆系统', taskDescription: '解析人物与地点实体', requestId: 'turn-2', startedAt: 21, finishedAt: 30,

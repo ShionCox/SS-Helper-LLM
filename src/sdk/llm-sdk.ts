@@ -71,7 +71,6 @@ function hashSchema(schema: unknown): string | undefined {
     return `fnv1a32:${hash.toString(16).padStart(8, '0')}`;
 }
 
-type StructuredOutputTransport = NonNullable<LLMRequest['structuredOutput']>['transport'];
 
 /**
  * 功能：判断输入是否为普通对象，便于拼装 generation 用户消息。
@@ -245,6 +244,7 @@ export class LLMSDKImpl {
     dispose(): void {
         this.settingsResolver = null;
         this.orchestrator.dispose();
+        this.registry.dispose();
     }
 
     private readSettings(): LLMHubSettings {
@@ -830,7 +830,6 @@ export class LLMSDKImpl {
         const consumerBudget = this.budgetManager.getConfig(args.consumer);
         const settings = this.readSettings();
         const taskDescriptor = this.registry.getTaskDescriptor(args.consumer, args.taskKey);
-        const taskAssignment = this.router.getTaskAssignment(args.consumer, args.taskKey);
         const resolvedProvider = this.router.getProvider(resolved.resourceId);
         if (!resolvedProvider) {
             const failure: SSHelperFailureContext = {
@@ -844,6 +843,9 @@ export class LLMSDKImpl {
             return this.failureResult(failure);
         }
         const schema = args.schema && typeof args.schema === 'object' && !Array.isArray(args.schema) ? args.schema : undefined;
+        if (taskDescriptor?.requirements?.nativeStructured === 'required' && schema === undefined) {
+            throw createSSHelperError('LLM_TASK_REQUIREMENT_UNSUPPORTED', { stage: 'llm.structured.requirements', requestId: record.requestId, resourceId: resolved.resourceId, expected: 'nativeStructured' });
+        }
         if (schema !== undefined) {
             const schemaCheck = preflightJsonSchema(schema);
             if (!schemaCheck.valid) {
@@ -867,6 +869,7 @@ export class LLMSDKImpl {
             identity,
             spec: { schema, name: structuredName },
             capability: structuredCapability,
+            requireNative: taskDescriptor?.requirements?.nativeStructured === 'required',
         });
 
         const resolvedMaxTokens = this.resolveTaskMaxTokens(args);
@@ -969,7 +972,7 @@ export class LLMSDKImpl {
                     attemptId,
                 }));
             }
-            const rawResult = await this.tryProvider(
+            let rawResult = await this.tryProvider(
                 resourceId,
                 request,
                 schema,
@@ -980,6 +983,9 @@ export class LLMSDKImpl {
                 record.requestId,
                 attemptId,
             );
+            if (taskDescriptor?.requirements?.nativeStructured === 'required' && rawResult.structuredOutput?.actualTransport === 'prompt_only') {
+                rawResult = { ...rawResult, ok: false, reasonCode: 'LLM_TASK_REQUIREMENT_UNSUPPORTED', retryable: false, failure: { reasonCode: 'LLM_TASK_REQUIREMENT_UNSUPPORTED', stage: 'llm.structured.requirements', requestId: record.requestId, attemptId, resourceId } };
+            }
             const result = !rawResult.ok && rawResult.failure === undefined && isSSHelperReasonCode(rawResult.reasonCode)
                 ? {
                     ...rawResult,

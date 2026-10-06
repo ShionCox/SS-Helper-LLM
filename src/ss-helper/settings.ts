@@ -1,9 +1,11 @@
 import type { SettingsAdapter, SettingsFieldStateMap, SettingsSchema, SettingsValues, ToastNotification } from '@ss-helper/sdk';
+import { describeSSHelperFailure } from '@ss-helper/sdk';
 import config from '../../plugin.config.json' with { type: 'json' };
 import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
 import type { LLMHubSettings } from '../schema/types';
 import type { LlmWorkspaceRepository } from '../storage/llm-workspace-repository';
 import type { LlmSettingsStatusSource } from './settings-status';
+import { configuredMaxTokensControl } from '../sdk/max-tokens';
 
 export const LLM_POPUP_VERSION = 0 as const;
 
@@ -90,14 +92,15 @@ export const LLM_SETTINGS_SCHEMA = {
 } as const satisfies SettingsSchema;
 
 function toSettingsValues(settings: LLMHubSettings): SettingsValues {
+    const output = configuredMaxTokensControl(settings);
     const logging = settings.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
     return {
         enabled: settings.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
         streamingEnabled: settings.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
         maxRequestsPerMinute: settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: settings.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
-        maxTokensMode: settings.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode,
-        maxTokens: settings.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens,
+        maxTokensMode: output.mode,
+        maxTokens: output.manualValue,
         timeoutSeconds: (settings.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs) / 1000,
         'requestLogging.detailMode': logging.enabled === false ? 'off' : logging.detailMode ?? DEFAULT_LLM_SETTINGS.requestLogging.detailMode,
         'requestLogging.maxEntries': logging.maxEntries ?? DEFAULT_LLM_SETTINGS.requestLogging.maxEntries,
@@ -109,22 +112,22 @@ function toSettingsValues(settings: LLMHubSettings): SettingsValues {
 function applySettingsValues(current: LLMHubSettings, values: SettingsValues): LLMHubSettings {
     const existingLogging = current.requestLogging ?? DEFAULT_LLM_SETTINGS.requestLogging;
     const detailMode = values['requestLogging.detailMode'];
+    const output = configuredMaxTokensControl(current);
+    const { maxTokensMode: _mode, maxTokens: _tokens, ...retained } = current;
     const maxTokensMode = values.maxTokensMode === 'inherit' || values.maxTokensMode === 'manual' || values.maxTokensMode === 'adaptive'
         ? values.maxTokensMode
-        : current.maxTokensMode ?? DEFAULT_LLM_SETTINGS.maxTokensMode;
-    const maxTokens = typeof values.maxTokens === 'number' ? values.maxTokens : current.maxTokens ?? DEFAULT_LLM_SETTINGS.maxTokens;
+        : output.mode;
+    const maxTokens = typeof values.maxTokens === 'number' ? values.maxTokens : output.manualValue;
     return {
-        ...current,
+        ...retained,
         enabled: typeof values.enabled === 'boolean' ? values.enabled : current.enabled ?? DEFAULT_LLM_SETTINGS.enabled,
         streamingEnabled: typeof values.streamingEnabled === 'boolean' ? values.streamingEnabled : current.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled,
         maxRequestsPerMinute: typeof values.maxRequestsPerMinute === 'number' ? values.maxRequestsPerMinute : current.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute,
         globalProfile: typeof values.globalProfile === 'string' ? values.globalProfile : current.globalProfile ?? DEFAULT_LLM_SETTINGS.globalProfile,
-        maxTokensMode,
-        maxTokens,
         maxTokensControl: {
-            ...(current.maxTokensControl ?? {}),
+            ...output,
             mode: maxTokensMode,
-            ...(maxTokensMode === 'manual' ? { manualValue: maxTokens } : {}),
+            manualValue: maxTokens,
         },
         timeoutMs: typeof values.timeoutSeconds === 'number' ? Math.round(values.timeoutSeconds * 1000) : current.timeoutMs ?? DEFAULT_LLM_SETTINGS.timeoutMs,
         requestLogging: {
@@ -151,10 +154,8 @@ export function createWorkspaceLlmSettingsAdapter(repository: LlmWorkspaceReposi
         };
     };
     const reportSaveFailure = (failure: unknown): void => {
-        const code = failure && typeof failure === 'object' && 'code' in failure && typeof failure.code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/u.test(failure.code)
-            ? failure.code
-            : 'LLM_SETTINGS_SAVE_FAILED';
-        try { notify?.({ level: 'error', title: '设置保存失败', message: `模型来源设置未能保存（${code}），请检查运行状态。`, code, durationMs: 5200 }); } catch { /* Keep the original save failure authoritative. */ }
+        const diagnosis = describeSSHelperFailure(failure, { reasonCode: 'SETTINGS_SAVE_FAILED', stage: 'llm.settings.save' });
+        try { notify?.({ level: 'error', title: diagnosis.title, message: `${diagnosis.reason} ${diagnosis.action}${diagnosis.requestId ? `（${diagnosis.requestId}）` : ''}`, code: diagnosis.reasonCode, durationMs: 5200 }); } catch { /* Keep the original save failure authoritative. */ }
     };
     return {
         async load(): Promise<SettingsValues> { return toSettingsValues(await repository.loadSettings()); },
