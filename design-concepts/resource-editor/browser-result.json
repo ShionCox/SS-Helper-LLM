@@ -1,0 +1,47 @@
+{
+  "url": "http://127.0.0.1:8022/",
+  "referenceViewport": {
+    "width": 1586,
+    "height": 992,
+    "deviceScaleFactor": 1
+  },
+  "finalViewport": {
+    "width": 2005,
+    "height": 1244,
+    "deviceScaleFactor": 1
+  },
+  "dialog": {
+    "x": 402.5,
+    "y": 206,
+    "width": 1200,
+    "height": 832,
+    "top": 206,
+    "right": 1602.5,
+    "bottom": 1038,
+    "left": 402.5
+  },
+  "checks": [
+    "direct-edit-no-stepper",
+    "generation-embedding-rerank-fields",
+    "model-menu-keyboard-and-custom-input-focus",
+    "secret-reveal-toggle",
+    "advanced-keyboard-disclosure",
+    "dirty-close-cancel-discard-and-focus-return",
+    "390px-single-column-fixed-footer",
+    "390px-menu-within-viewport",
+    "700px-single-column",
+    "1536x600-footer-visible",
+    "reduced-motion-0.01ms",
+    "blocked-network-error-does-not-save",
+    "add-resource-wizard-preserved",
+    "segmented-keyboard-change-retains-selected-focus"
+  ],
+  "healthyLoad": {
+    "uncaughtExceptions": 0,
+    "consoleErrors": 0
+  },
+  "finalExceptions": 0,
+  "finalConsoleErrors": 0,
+  "secretButtonWidth": 28,
+  "intentionalOfflineConsoleErrors": 1
+}

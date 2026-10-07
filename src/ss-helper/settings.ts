@@ -13,6 +13,7 @@ const popup = (name: string) => ({ kind: 'popup', provider: 'ss-helper.llm', nam
 
 export const LLM_REQUEST_LOGS_POPUP = popup('request-logs');
 export const LLM_RESOURCE_WIZARD_POPUP = popup('resource-wizard');
+export const LLM_RESOURCE_EDITOR_POPUP = popup('resource-editor');
 export const LLM_RESOURCE_MANAGER_POPUP = popup('resource-manager');
 export const LLM_GENERATION_SOURCE_POPUP = popup('generation-source');
 

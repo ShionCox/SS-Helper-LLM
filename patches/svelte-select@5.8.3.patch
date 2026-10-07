@@ -1,0 +1,56 @@
+diff --git a/Select.svelte b/Select.svelte
+index 88f875a3c1287a3ba89943592e96313091405dca..e958f5dbf44f6393aae6bd887227cc15724eda0e 100644
+--- a/Select.svelte
++++ b/Select.svelte
+@@ -761,13 +761,20 @@
+                         </span>
+ 
+                         {#if !disabled && !multiFullItemClearable && ClearIcon}
+-                            <div
++                            <button
++                                type="button"
+                                 class="multi-item-clear"
+-                                on:pointerup|preventDefault|stopPropagation={() => handleMultiItemClear(i)}>
++                                aria-label={`移除 ${item[label]}`}
++                                on:pointerup|preventDefault|stopPropagation
++                                on:keydown|stopPropagation
++                                on:click|preventDefault|stopPropagation={() => {
++                                    handleMultiItemClear(i);
++                                    handleFocus();
++                                }}>
+                                 <slot name="multi-clear-icon">
+                                     <ClearIcon />
+                                 </slot>
+-                            </div>
++                            </button>
+                         {/if}
+                     </div>
+                 {/each}
+@@ -825,7 +832,7 @@
+ 
+     {#if required && (!value || value.length === 0)}
+         <slot name="required" {value}>
+-            <select class="required" required tabindex="-1" aria-hidden="true" />
++            <select class="required" required tabindex="-1" aria-hidden="true"></select>
+         </slot>
+     {/if}
+ </div>
+@@ -1115,12 +1122,18 @@
+     }
+ 
+     .multi-item-clear {
++        all: unset;
+         display: flex;
+         align-items: center;
+         justify-content: center;
+         --clear-icon-color: var(--multi-item-clear-icon-color, #000);
+     }
+ 
++    .multi-item-clear:focus-visible {
++        outline: var(--clear-select-focus-outline, 1px solid #006fe8);
++        outline-offset: 1px;
++    }
++
+     .multi-item.active {
+         outline: var(--multi-item-active-outline, 1px solid #006fe8);
+     }

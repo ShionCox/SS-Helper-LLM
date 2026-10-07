@@ -1,5 +1,6 @@
 import {
     describeSSHelperFailure,
+    readSSHelperFailure,
     isSSHelperReasonCode,
     type PopupUiContext,
     type ToastLevel,
@@ -489,6 +490,7 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
     const callScope = filters.querySelector<HTMLSelectElement>('[data-log-filter="callScope"]')!; renderSelectOptions(callScope, [['all', '全部调用'], ['ordinary', '普通请求'], ['agent_workflow', 'Agent 流程']]);
     const time = filters.querySelector<HTMLSelectElement>('[data-log-filter="time"]')!; renderSelectOptions(time, [['all', '全部时间'], ['day', '最近 24 小时'], ['week', '最近 7 天'], ['month', '最近 30 天']]);
     const stats = document.createElement('div'); stats.className = 'ss-helper-llm-log-stats';
+    const loadStatus = document.createElement('div'); loadStatus.className = 'ss-helper-llm-log-error-heading'; loadStatus.setAttribute('role', 'status');
     const layout = document.createElement('div'); layout.className = 'ss-helper-llm-log-layout';
     const listPane = document.createElement('div'); listPane.className = 'ss-helper-llm-log-list-pane';
     const listHeader = document.createElement('div'); listHeader.className = 'ss-helper-llm-log-list-header'; const listTitle = document.createElement('strong'); listTitle.textContent = '请求记录'; const listCount = document.createElement('span'); listHeader.append(listTitle, listCount); const list = document.createElement('div'); list.className = 'ss-helper-llm-log-list'; listPane.append(listHeader, list);
@@ -656,11 +658,13 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
         detailPane.append(content);
     };
     const load = async (announce = false): Promise<void> => {
+        let stage = 'llm.log.viewer.settings';
         try {
             const filter = query(); const now = Date.now(); const fromTs = filter.time === 'day' ? now - 86_400_000 : filter.time === 'week' ? now - 7 * 86_400_000 : filter.time === 'month' ? now - 30 * 86_400_000 : undefined;
             const settings = await repository.loadSettings();
             const resources = new Map((settings.resources ?? []).map(resource => [resource.id, resource.label] as const));
-            const rows = (await repository.queryLogs({
+            stage = 'llm.log.viewer.query';
+            const snapshot = await repository.loadLogView({
                 limit: 500,
                 state: filter.state as RequestState | 'all' | undefined,
                 taskKind: filter.taskKind === 'all' ? undefined : filter.taskKind as CapabilityKind,
@@ -670,7 +674,8 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
                 model: filter.model,
                 reasonCode: isSSHelperReasonCode(filter.reasonCode) ? filter.reasonCode : undefined,
                 fromTs,
-            })).map(asRecord).map(row => {
+            });
+            const rows = snapshot.rows.map(asRecord).map(row => {
                 const view = presentLogRow(row);
                 const description = options.describeTask?.(text(row.consumer ?? row.sourcePluginId, ''), view.taskKey, view.taskKind as 'generation' | 'embedding' | 'rerank');
                 return {
@@ -680,6 +685,7 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
                     resourceLabel: row.resourceLabel ?? resources.get(text(row.resourceId ?? asRecord(asRecord(row.response).meta).resourceId, '')),
                 };
             });
+            stage = 'llm.log.viewer.render';
             const search = filter.search?.toLowerCase();
             entries = search ? rows.filter(row => JSON.stringify(row).toLowerCase().includes(search)) : rows;
             const groups = workflowGroups(entries);
@@ -689,10 +695,18 @@ export async function renderRequestLogViewer(container: HTMLElement, repository:
                 selectedId = firstGroup ? `workflow:${firstGroup.id}` : text(entries[0]?.logId, '');
                 if (firstGroup) expandedWorkflows.add(firstGroup.id);
             }
-            renderList(); renderDetail(); renderStats(await repository.getLogStats());
-            if (announce) notify('success', '日志已加载', entries.length ? `已加载 ${entries.length} 条日志；完整返回内容仅保存在本机 Workspace。` : '当前筛选结果为空。', 'LLM_LOG_LOAD_SUCCESS');
+            renderList(); renderDetail(); renderStats(snapshot.stats);
             options.ui?.refreshControls(root);
-        } catch { disposeEditors(); detailPane.replaceChildren(); if (announce) notify('error', '日志加载失败', '无法读取本机 Workspace 日志，请检查 Workspace 状态后重试。', 'LLM_LOG_LOAD_FAILED'); }
+            loadStatus.remove();
+            if (announce) notify('success', '日志已加载', entries.length ? `已加载 ${entries.length} 条日志；完整返回内容仅保存在本机 Workspace。` : '当前筛选结果为空。', 'LLM_LOG_LOAD_SUCCESS');
+        } catch (error) {
+            const failure = readSSHelperFailure(error, { reasonCode: 'INTERNAL_ERROR', stage })!;
+            const diagnostic = describeSSHelperFailure(failure);
+            const message = document.createElement('p');
+            message.textContent = `${diagnostic.title}：${diagnostic.reason} ${diagnostic.action} 步骤：${failure.stage}${failure.requestId ? ` · 请求 ID：${failure.requestId}` : ''}`;
+            loadStatus.replaceChildren(badge(failure.reasonCode, 'error'), message); filters.after(loadStatus);
+            if (announce) notify('error', diagnostic.title, message.textContent, failure.reasonCode);
+        }
     };
     root.addEventListener('click', (event) => {
         const target = event.target as HTMLElement; const action = target.closest<HTMLElement>('[data-log-action]')?.dataset.logAction;

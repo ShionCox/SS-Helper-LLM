@@ -1,0 +1,9 @@
+{
+  "baseUrl": "https://api.deepseek.com",
+  "model": "deepseek-v4-flash",
+  "keyIsBlank": true,
+  "mode": [
+    "标准"
+  ],
+  "storedKeyHint": true
+}

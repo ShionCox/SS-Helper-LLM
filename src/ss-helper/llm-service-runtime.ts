@@ -24,8 +24,8 @@ import { LlmToolTurnService } from './tool-turn-service';
 import { normalizeProviderPrivacyPolicy } from '../tools/provider-privacy-policy';
 import { RequestRateLimiter } from '../runtime/request-rate-limiter';
 import { DEFAULT_REASONING_POLICY } from '../providers/reasoning-policy';
-import { verifyReasoningCapabilities } from '../providers/reasoning-capability-probe';
-import { stableToolDigest } from '../tools/tool-capability-cache';
+import { REASONING_CAPABILITY_PROBE_VERSION, verifyReasoningCapabilities } from '../providers/reasoning-capability-probe';
+import { invalidatedResourceIds, resourceConnectionDigest, stableToolDigest } from '../tools/tool-capability-cache';
 import { configuredMaxTokensControl } from '../sdk/max-tokens';
 import { describeSSHelperFailure } from '@ss-helper/sdk';
 
@@ -212,19 +212,11 @@ export function createProductionLlmServices(
         throw createSSHelperError('SERVER_SESSION_CLOSED', { stage: 'llm.tavern.snapshot' });
     };
     const reasoningPolicyFor = (resourceId: string): LlmReasoningPolicy => settingsState.value.resourcePolicies?.[resourceId] ?? DEFAULT_REASONING_POLICY;
-    const resourceConnectionRevision = (resource: ResourceConfig, model?: string): string => stableToolDigest(JSON.stringify({
-        source: resource.source,
-        apiType: resource.apiType,
-        baseUrl: resource.baseUrl,
-        model: model ?? resource.model,
-        toolDialect: resource.toolDialect,
-        customParams: resource.customParams,
-        privacyPolicy: resource.privacyPolicy,
-        epoch: resourceEpoch(resource.id),
-    }));
+    const resourceConnectionRevision = (resource: ResourceConfig, model?: string): string => resourceConnectionDigest({ ...resource, model: model ?? resource.model }, settingsState.value.streamingEnabled);
+    const tavernRevision = (current: Awaited<ReturnType<typeof readTavernSnapshot>>['snapshot']): string => stableToolDigest(JSON.stringify({ connectionRevision: current.connectionRevision, provider: current.provider, model: current.model, mainApi: current.mainApi, toolCallingSupported: current.toolCallingSupported }));
     const reasoningSnapshotFor = (resourceId: string, model?: string): VerifiedReasoningCapabilities | undefined => {
         const record = reasoningSnapshots.get(resourceId);
-        if (!record || (model !== undefined && record.capabilities.model !== model) || (record.capabilities.expiresAt !== undefined && record.capabilities.expiresAt <= Date.now())) return undefined;
+        if (!record || record.capabilities.probeVersion !== REASONING_CAPABILITY_PROBE_VERSION || (model !== undefined && record.capabilities.model !== model) || (record.capabilities.expiresAt !== undefined && record.capabilities.expiresAt <= Date.now())) return undefined;
         if (record.policy.mode !== reasoningPolicyFor(resourceId).mode || record.policy.effort !== reasoningPolicyFor(resourceId).effort) return undefined;
         const expectedRevision = resourceId === BUILTIN_TAVERN_RESOURCE_ID ? tavernConnectionRevision : (() => {
             const resource = settingsState.value.resources?.find((item) => item.id === resourceId);
@@ -271,6 +263,7 @@ export function createProductionLlmServices(
     }
     let disposed = false;
     let applyGeneration = 0;
+    let runtimeInitialized = false;
 
     const prepareRuntime = async (input: LLMHubSettings, options: SettingsRuntimePrepareOptions = {}): Promise<PreparedSettingsRuntime> => {
         const generation = ++applyGeneration;
@@ -282,10 +275,17 @@ export function createProductionLlmServices(
         try {
             for (const resource of resources) {
                 if (resource.enabled === false || resource.source === 'tavern') continue;
+                const previous = settingsState.value.resources?.find(item => item.id === resource.id);
+                const existing = managed.has(resource.id) ? router.getProvider(resource.id) : undefined;
                 let apiKey: string | null = null;
                 if (Object.prototype.hasOwnProperty.call(overrides, resource.id)) apiKey = overrides[resource.id] ?? null;
                 else if (!options.emptyCredentials && repository) apiKey = await repository.getResourceSecret(resource.id);
                 if (!apiKey) continue;
+                if (existing && previous && !Object.prototype.hasOwnProperty.call(overrides, resource.id)
+                    && resourceConnectionDigest(previous, settingsState.value.streamingEnabled) === resourceConnectionDigest(resource, settings.streamingEnabled)) {
+                    registrations.push({ provider: existing, resourceType: resource.type, capabilities: routingCapabilities(resource, existing), defaultModel: resource.model });
+                    continue;
+                }
                 const provider = createProviderFromResource(
                     resource,
                     apiKey,
@@ -331,13 +331,13 @@ export function createProductionLlmServices(
                     throw createSSHelperError('INTERNAL_ERROR', { stage: 'llm.runtime.apply.stale' });
                 }
                 const oldProviders = [...managed].map((id) => router.getProvider(id)).filter((provider): provider is LLMProvider => Boolean(provider));
-                const previousResources = settingsState.value.resources ?? [];
-                const previousPolicies = settingsState.value.resourcePolicies ?? {};
-                const streamingChanged = (settingsState.value.streamingEnabled ?? DEFAULT_LLM_SETTINGS.streamingEnabled) !== settings.streamingEnabled;
-                for (const resourceId of Object.keys(overrides)) {
+                const credentialChanges = options.emptyCredentials ? [BUILTIN_TAVERN_RESOURCE_ID, ...(settingsState.value.resources ?? []).map(resource => resource.id)] : Object.keys(overrides);
+                const invalidated = runtimeInitialized ? invalidatedResourceIds(settingsState.value, settings, credentialChanges) : new Set(credentialChanges);
+                for (const resourceId of invalidated) {
                     bumpResourceEpoch(resourceId);
                     reasoningSnapshots.delete(resourceId);
-                    toolTurn.invalidateResource(resourceId);
+                    // The repository removed persisted evidence in the settings transaction.
+                    toolTurn.invalidateResource(resourceId, repository === undefined);
                 }
                 settingsState.value = { ...settings };
                 requestRateLimiter.setMaxRequestsPerMinute(settings.maxRequestsPerMinute ?? DEFAULT_LLM_SETTINGS.maxRequestsPerMinute);
@@ -353,26 +353,11 @@ export function createProductionLlmServices(
                 });
                 router.applyTaskAssignments(settings.taskAssignments ?? []);
                 budget.replaceConfigs(settings.budgets ?? {});
-                const nextResources = settings.resources ?? [];
-                const nextById = new Map(nextResources.map((resource) => [resource.id, resource]));
-                for (const previous of previousResources) {
-                    const next = nextById.get(previous.id);
-                    const policyChanged = JSON.stringify(previousPolicies[previous.id] ?? DEFAULT_REASONING_POLICY) !== JSON.stringify(settings.resourcePolicies?.[previous.id] ?? DEFAULT_REASONING_POLICY);
-                    if (streamingChanged || policyChanged || !next || JSON.stringify(previous) !== JSON.stringify(next)) {
-                        bumpResourceEpoch(previous.id);
-                        reasoningSnapshots.delete(previous.id);
-                        toolTurn.invalidateResource(previous.id);
-                    }
-                }
-                if (JSON.stringify(previousPolicies[BUILTIN_TAVERN_RESOURCE_ID] ?? DEFAULT_REASONING_POLICY) !== JSON.stringify(settings.resourcePolicies?.[BUILTIN_TAVERN_RESOURCE_ID] ?? DEFAULT_REASONING_POLICY)) {
-                    bumpResourceEpoch(BUILTIN_TAVERN_RESOURCE_ID);
-                    reasoningSnapshots.delete(BUILTIN_TAVERN_RESOURCE_ID);
-                    toolTurn.invalidateResource(BUILTIN_TAVERN_RESOURCE_ID);
-                }
                 managed.clear();
                 for (const registration of registrations) managed.add(registration.provider.id);
-                for (const provider of oldProviders) provider.dispose?.();
+                for (const provider of oldProviders) if (!registrations.some(registration => registration.provider === provider)) provider.dispose?.();
                 if (repository === undefined) notifyCapabilityChange(['generation', 'embedding', 'rerank']);
+                runtimeInitialized = true;
                 committed = true;
             },
             dispose: (): void => {
@@ -467,14 +452,14 @@ export function createProductionLlmServices(
         }));
         let tavern: LlmSafeResourceSummary | undefined;
         try {
-            const { snapshot: current, epoch } = await readTavernSnapshot();
+            const { snapshot: current } = await readTavernSnapshot();
             const available = current.available === true;
-            let nextTavernRevision = stableToolDigest(JSON.stringify({ epoch, connectionRevision: current.connectionRevision, provider: current.provider, model: current.model, mainApi: current.mainApi, toolCallingSupported: current.toolCallingSupported }));
+            const nextTavernRevision = tavernRevision(current);
             if (tavernConnectionRevision !== '' && tavernConnectionRevision !== nextTavernRevision) {
                 tavernEpoch += 1;
-                nextTavernRevision = stableToolDigest(JSON.stringify({ epoch: tavernEpoch, connectionRevision: current.connectionRevision, provider: current.provider, model: current.model, mainApi: current.mainApi, toolCallingSupported: current.toolCallingSupported }));
                 reasoningSnapshots.delete(BUILTIN_TAVERN_RESOURCE_ID);
                 toolTurn.invalidateResource(BUILTIN_TAVERN_RESOURCE_ID);
+                void repository?.deleteReasoningCapability(BUILTIN_TAVERN_RESOURCE_ID).catch(error => logger.warn('思考验证清理失败', safeFailureLogDetail(error, { reasonCode: 'WORKSPACE_UNAVAILABLE', stage: 'llm.reasoning.invalidate' })));
             }
             tavernConnectionRevision = nextTavernRevision;
             tavernModel = current.model;
@@ -532,7 +517,9 @@ export function createProductionLlmServices(
                 || (task.requirements?.strictToolSchema === 'required' && (execution !== 'tool_turn' || !['native', 'beta'].includes(resource?.toolCapabilities?.strictToolSchema ?? 'unknown')))
                 || (task.requirements?.streamingToolCalls === 'required' && (execution !== 'tool_turn' || resource?.toolCapabilities?.streamingToolCalls !== 'incremental' || settings.streamingEnabled === false));
             const available = entry?.available === true && !unsupported;
-            const reasonCode = unsupported ? 'LLM_TASK_REQUIREMENT_UNSUPPORTED' : 'LLM_TASK_ROUTE_UNAVAILABLE';
+            const reasonCode = unsupported ? 'LLM_TASK_REQUIREMENT_UNSUPPORTED'
+                : entry?.reason === 'reasoning_unverified' ? 'LLM_REASONING_CAPABILITY_UNVERIFIED'
+                    : entry?.reason === 'reasoning_unsupported' ? 'LLM_REASONING_CONFIGURATION_UNSUPPORTED' : 'LLM_TASK_ROUTE_UNAVAILABLE';
             const route = entry?.resourceId === undefined ? undefined : {
                 resourceId: entry.resourceId,
                 provider: resource?.apiType ?? entry.source ?? 'unknown',
@@ -631,8 +618,10 @@ export function createProductionLlmServices(
                     const consumers = await repository.loadConsumers();
                     if (Object.keys(consumers).length) registry.restoreFromStorage(consumers as never);
                     const settings = await repository.loadSettings();
+                    const reasoning = await repository.listReasoningCapabilities();
                     const prepared = await prepareRuntime(settings);
                     prepared.commit();
+                    for (const record of reasoning) reasoningSnapshots.set(record.capabilities.resourceId, record);
                     initialized = true;
                     notifyCapabilityChange(['generation', 'embedding', 'rerank']);
                     return;
@@ -661,6 +650,7 @@ export function createProductionLlmServices(
         tavernConnectionRevision = '';
         reasoningSnapshots.delete(BUILTIN_TAVERN_RESOURCE_ID);
         toolTurn.invalidateResource(BUILTIN_TAVERN_RESOURCE_ID);
+        void repository?.deleteReasoningCapability(BUILTIN_TAVERN_RESOURCE_ID).catch(error => logger.warn('思考验证清理失败', safeFailureLogDetail(error, { reasonCode: 'WORKSPACE_UNAVAILABLE', stage: 'llm.reasoning.invalidate' })));
         notifyCapabilityChange(['generation']);
     }) : undefined;
     const handlers = createLlmSdkServiceHandlers(sdk);
@@ -686,7 +676,7 @@ export function createProductionLlmServices(
                 probeTavernEpoch = epoch;
                 model = current.model ?? model;
                 providerKind = providerManifest(current.provider).id as typeof providerKind;
-                connectionRevision = stableToolDigest(JSON.stringify({ epoch, connectionRevision: current.connectionRevision, provider: current.provider, model: current.model, mainApi: current.mainApi, toolCallingSupported: current.toolCallingSupported }));
+                connectionRevision = tavernRevision(current);
                 tavernModel = model;
                 tavernConnectionRevision = connectionRevision;
             }
@@ -719,12 +709,15 @@ export function createProductionLlmServices(
             }
             const policy = reasoningPolicyFor(request.resourceId);
             let toolCapability: VerifiedToolCapabilities | undefined;
+            let toolFailure: import('@ss-helper/sdk').SSHelperFailureContext | undefined;
             try {
                 toolCapability = (await toolTurn.verify(request.resourceId, model, request.force === true, requestId, signal, policy)).capability;
-            } catch {
+            } catch (error) {
                 // Reasoning verification is independent. A resource may still
                 // report completion/structured support when its optional tool
-                // handshake is unavailable.
+                // handshake is unavailable. Persistence, abort and runtime failures must surface.
+                if (readSSHelperFailure(error)?.reasonCode !== 'LLM_TOOL_CALLS_UNSUPPORTED') throw error;
+                toolFailure = readSSHelperFailure(error);
             }
             if (isTavern ? probeTavernEpoch !== tavernEpoch : probeResourceEpoch !== resourceEpoch(request.resourceId)) {
                 throw createSSHelperError('LLM_REASONING_CAPABILITY_UNVERIFIED', { stage: 'llm.reasoning.probe.stale', requestId, resourceId: request.resourceId, model });
@@ -743,11 +736,13 @@ export function createProductionLlmServices(
                     signal,
                     beforeRequest: () => requestRateLimiter.acquire(signal, requestId),
                     ...(toolCapability === undefined ? {} : { toolCapability }),
+                    ...(toolFailure === undefined ? {} : { toolFailure }),
                 });
                 const stillCurrent = isTavern ? probeTavernEpoch === tavernEpoch : probeResourceEpoch === resourceEpoch(request.resourceId);
                 if (!stillCurrent) throw createSSHelperError('LLM_REASONING_CAPABILITY_UNVERIFIED', { stage: 'llm.reasoning.probe.stale', requestId, resourceId: request.resourceId, model });
+                await repository?.saveReasoningCapability(reasoning, policy);
+                if (disposed || (isTavern ? probeTavernEpoch !== tavernEpoch : probeResourceEpoch !== resourceEpoch(request.resourceId))) throw createSSHelperError('LLM_REASONING_CAPABILITY_UNVERIFIED', { stage: 'llm.reasoning.probe.stale', requestId, resourceId: request.resourceId, model });
                 reasoningSnapshots.set(request.resourceId, { capabilities: reasoning, policy });
-                notifyCapabilityChange(['generation']);
             }
             notifyCapabilityChange(['generation']);
             return { resourceId: request.resourceId, taskKeys: request.taskKeys ?? [], capabilities: toolCapability === undefined ? [] : [toolCapability], reasoning };

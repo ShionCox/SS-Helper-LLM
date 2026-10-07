@@ -1,4 +1,8 @@
 import type { VerifiedToolCapabilities } from '@ss-helper/sdk';
+import type { LLMHubSettings, ResourceConfig } from '../schema/types';
+import { DEFAULT_LLM_SETTINGS } from '../schema/defaults';
+import { DEFAULT_REASONING_POLICY } from '../providers/reasoning-policy';
+import { providerManifest } from '../providers/provider-manifest';
 
 export interface ToolCapabilityCacheKeyInput {
     readonly resourceId: string;
@@ -26,6 +30,33 @@ export function stableToolDigest(value: string): string {
 
 export function endpointDigest(value: string | undefined): string {
     return stableToolDigest(String(value ?? '').trim().toLocaleLowerCase());
+}
+
+/** Connection identity survives reloads and excludes display-only resource names. */
+export function resourceConnectionDigest(resource: ResourceConfig, streamingEnabled = DEFAULT_LLM_SETTINGS.streamingEnabled): string {
+    return stableToolDigest(JSON.stringify({
+        source: resource.source, type: resource.type, apiType: resource.apiType,
+        baseUrl: resource.baseUrl, model: resource.model, enabled: resource.enabled !== false,
+        toolDialect: resource.toolDialect ?? providerManifest(resource.apiType).protocol,
+        customParams: resource.customParams, privacyPolicy: resource.privacyPolicy,
+        embeddingPath: resource.embeddingPath, embeddingDimensions: resource.embeddingDimensions,
+        rerankPath: resource.rerankPath, rerankProtocol: resource.rerankProtocol, streamingEnabled,
+    }));
+}
+
+export function invalidatedResourceIds(previous: LLMHubSettings, next: LLMHubSettings, credentialChanges: readonly string[] = []): Set<string> {
+    const ids = new Set(credentialChanges);
+    const nextById = new Map((next.resources ?? []).map(resource => [resource.id, resource]));
+    for (const resource of previous.resources ?? []) {
+        const updated = nextById.get(resource.id);
+        if (!updated || resourceConnectionDigest(resource, previous.streamingEnabled) !== resourceConnectionDigest(updated, next.streamingEnabled)) ids.add(resource.id);
+    }
+    for (const id of new Set([...Object.keys(previous.resourcePolicies ?? {}), ...Object.keys(next.resourcePolicies ?? {})])) {
+        const before = previous.resourcePolicies?.[id] ?? DEFAULT_REASONING_POLICY;
+        const after = next.resourcePolicies?.[id] ?? DEFAULT_REASONING_POLICY;
+        if (before.mode !== after.mode || before.effort !== after.effort) ids.add(id);
+    }
+    return ids;
 }
 
 export function capabilityCacheKey(input: ToolCapabilityCacheKeyInput): string {

@@ -311,10 +311,10 @@ export class LlmToolTurnService {
         if (scope.callerPluginId !== callerPluginId) throw createSSHelperError('LLM_TOOL_SESSION_SCOPE_MISMATCH', { stage: 'llm.tools.turn.cancel' });
         return this.sessions.cancel(toolSessionId);
     }
-    invalidateResource(resourceId: string): void {
+    invalidateResource(resourceId: string, deleteStored = true): void {
         this.resourceEpochs.set(resourceId, (this.resourceEpochs.get(resourceId) ?? 0) + 1);
         this.cache.invalidateResource(resourceId);
-        void this.store?.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
+        if (deleteStored) void this.store?.deleteToolCapabilitiesForResource(resourceId).catch(() => undefined);
         this.sessions.cancelByResource(resourceId);
     }
     dispose(): void { for (const resourceId of this.resourceEpochs.keys()) this.resourceEpochs.set(resourceId, (this.resourceEpochs.get(resourceId) ?? 0) + 1); this.sessions.dispose(); this.cache.clear(); }

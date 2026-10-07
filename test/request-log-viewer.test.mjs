@@ -68,11 +68,15 @@ test('request log viewer only renders the central structured failure', () => {
   assert.deepEqual(presentDiagnostic(undefined), {});
 });
 
-test('request log viewer uses a toast for load status instead of an in-workspace status row', () => {
+test('request log viewer uses success toasts and preserves structured failure diagnostics', () => {
   assert.equal(viewerSource.includes('ss-helper-llm-log-status'), false);
   assert.equal(viewerStyles.includes('ss-helper-llm-log-status'), false);
   assert.match(viewerSource, /notify\('success', '日志已加载'/u);
-  assert.match(viewerSource, /notify\('error', '日志加载失败'/u);
+  assert.match(viewerSource, /notify\('error', diagnostic.title, message.textContent, failure.reasonCode\)/u);
+  assert.match(viewerSource, /readSSHelperFailure\(error, \{ reasonCode: 'INTERNAL_ERROR', stage \}\)/u);
+  assert.match(viewerSource, /failure.requestId/u);
+  assert.equal(viewerSource.includes('无法读取本机 Workspace 日志'), false);
+  assert.equal(viewerSource.includes('catch { disposeEditors(); detailPane.replaceChildren();'), false);
 });
 
 test('request log viewer uses JSONEditor and keeps status beside the title', () => {

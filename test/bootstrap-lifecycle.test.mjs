@@ -107,14 +107,16 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   installSnapshot(target, coreDescriptor(1), first);
   const storage = { getItem() { return null; }, setItem() {}, removeItem() {} };
   const bootstrap = await startLlmPlugin({ pluginVersion: '0.0.1', target, storage, services });
-  assert.equal(active.size, 21, 'settings, chat indicator, menu item, status listener, popup, and typed bus handlers register once');
+  assert.equal(active.size, 22, 'settings, chat indicator, menu item, status listener, popup, and typed bus handlers register once');
   const registeredPopupTokens = firstPopupRegistrations.map(({ token }) => token);
   const schemaPopupTokens = collectPopupTokens(LLM_SETTINGS_SCHEMA.fields);
-  assert.equal(registeredPopupTokens.length, 11);
+  const resourceEditor = firstPopupRegistrations.find(({ token }) => token.name === 'resource-editor');
+  assert.ok(resourceEditor, 'the direct resource editor must be registered');
+  assert.equal(registeredPopupTokens.length, 12);
   assert.deepEqual(
     registeredPopupTokens.map(popupKey).sort(),
-    schemaPopupTokens.map(popupKey).sort(),
-    'every settings popup action must resolve to a registered popup token',
+    [...schemaPopupTokens, resourceEditor.token].map(popupKey).sort(),
+    'settings actions and the direct resource editor must each register once',
   );
   assert.ok(registeredPopupTokens.every(({ version }) => version === 0));
   const requestLogs = firstPopupRegistrations.find(({ token }) => token.name === 'request-logs');
@@ -132,7 +134,7 @@ test('Core replacement cleans the old generation and registers one fresh typed s
   installSnapshot(target, coreDescriptor(2), second);
   first.close({ reason: 'core_replaced', generation: 1 });
   target.dispatchEvent(new Event(CORE_LIFECYCLE_EVENT));
-  await waitFor(() => bootstrap.current.generation === 2 && active.size === 21);
+  await waitFor(() => bootstrap.current.generation === 2 && active.size === 22);
 
   bootstrap.dispose();
   await bootstrap.closed;

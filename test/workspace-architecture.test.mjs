@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { createSSHelperError, readSSHelperFailure } from '@ss-helper/sdk';
 import {
   LLM_SETTINGS_SCHEMA,
   LlmWorkspaceRepository,
@@ -58,6 +59,29 @@ class MemoryWorkspace {
   async query(collection, { filter = {}, limit = 1000, cursor } = {}) { const values = [...this.records.entries()].filter(([key, record]) => key.startsWith(`${collection}:`) && Object.entries(filter).every(([field, value]) => record.value?.[field] === value)).map(([, record]) => structuredClone(record)); const offset = cursor ? Number(cursor) : 0; const page = values.slice(offset, offset + limit); return { records: page, nextCursor: offset + page.length < values.length ? String(offset + page.length) : null }; }
   async commit({ operations, idempotencyKey }) { this.transactionKeys.push(idempotencyKey); if (this.failNextTransaction) { this.failNextTransaction = false; const error = new Error('injected transaction failure'); error.code = 'WORKSPACE_FAILURE'; throw error; } const snapshot = new Map(this.records); const results = []; try { for (const operation of operations) { if (operation.action === 'put') { const record = await this.put(operation); results.push({ collection: operation.collection, id: record.id, action: 'put', revision: record.revision }); } else { const removed = await this.remove(operation); results.push({ collection: operation.collection, id: operation.id, action: 'delete', revision: (snapshot.get(this.key(operation.collection, operation.id))?.revision ?? 0) + (removed ? 1 : 0), removed }); } } return { requestId: idempotencyKey, replayed: false, results }; } catch (error) { this.records = snapshot; throw error; } }
 }
+
+test('log view reads one snapshot while keeping filtered rows and global totals distinct', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  await repository.ready();
+  for (const [id, state, createdAt] of [['a', 'failed', 30], ['b', 'completed', 20], ['c', 'failed', 10]]) {
+    await workspace.put({ collection: 'request-logs', id, value: { logId: id, state, createdAt, resourceId: 'r', storageBytes: 100 } });
+  }
+  let reads = 0;
+  const query = workspace.query.bind(workspace);
+  workspace.query = async (collection, options) => { if (collection === 'request-logs') reads++; return query(collection, options); };
+  const view = await repository.loadLogView({ state: 'failed', resourceId: 'r', fromTs: 15, limit: 1 });
+  assert.equal(reads, 1);
+  assert.deepEqual(view.rows.map(row => row.logId), ['a']);
+  assert.equal(view.stats.count, 3);
+  assert.equal(view.stats.failed, 2);
+  assert.equal(view.stats.bytes, 300);
+  await workspace.remove({ collection: 'request-logs', id: 'a' });
+  const refreshed = await repository.loadLogView({ state: 'failed' });
+  assert.equal(reads, 2);
+  assert.deepEqual(refreshed.rows.map(row => row.logId), ['c']);
+  assert.equal(refreshed.stats.count, 2);
+});
 
 test('permanent invalid settings stop runtime retries and explicit repository recovery restores nested output limits', async () => {
   const workspace = new MemoryWorkspace();
@@ -355,6 +379,143 @@ test('resource health is strictly validated, persisted independently, and can co
   }), { code: 'WORKSPACE_FAILURE' });
   assert.equal((await repository.loadSettings()).globalProfile, 'precise');
   assert.equal((await repository.listResourceHealth()).find((record) => record.resourceId === failed.resourceId).state, 'failed');
+});
+
+test('saving an untested resource clears stale health atomically and rolls back credentials on failure', async () => {
+  const workspace = new MemoryWorkspace();
+  const repository = new LlmWorkspaceRepository(workspace, new MemorySecrets());
+  const resource = { id: 'save-only', type: 'generation', source: 'custom', apiType: 'openai', label: 'Save only', baseUrl: 'https://provider.example/v1', model: 'manual-model', enabled: true };
+  const health = { resourceId: resource.id, state: 'success', checkedAt: 1700000000000, durationMs: 321 };
+  await repository.saveResource(resource, 'old-key', { resourceHealth: health });
+  workspace.failNextTransaction = true;
+  await assert.rejects(repository.saveResource({ ...resource, model: 'new-model' }, 'new-key'), { code: 'WORKSPACE_FAILURE' });
+  assert.deepEqual(await repository.listResourceHealth(), [health]);
+  assert.equal(await repository.getResourceSecret(resource.id), 'old-key');
+  assert.equal((await repository.loadSettings()).resources[0].model, 'manual-model');
+  await repository.saveResource({ ...resource, model: 'new-model' }, 'new-key');
+  assert.deepEqual(await repository.listResourceHealth(), []);
+  assert.equal(await repository.getResourceSecret(resource.id), 'new-key');
+  assert.equal((await repository.loadSettings()).resources[0].model, 'new-model');
+});
+
+test('Agent evidence survives a complete runtime reload and display-only saves, and expires safely', async () => {
+  const workspace = new MemoryWorkspace();
+  const secrets = new MemorySecrets();
+  let repository = new LlmWorkspaceRepository(workspace, secrets);
+  const resource = { id: 'agent-reload', label: 'Agent', type: 'generation', source: 'custom', apiType: 'openai', baseUrl: 'https://fixture.invalid/v1', model: 'fixture-model', toolDialect: 'openai_chat_compatible', enabled: true };
+  const policy = { mode: 'enabled', effort: 'provider_default' };
+  await repository.saveSettings({ enabled: true, streamingEnabled: false, resources: [resource], globalAssignments: { generation: { resourceId: resource.id } }, resourcePolicies: { [resource.id]: policy } });
+  await repository.setResourceSecret(resource.id, 'fixture-key');
+  const originalFetch = globalThis.fetch;
+  let requests = 0;
+  let rejectAuthentication = false;
+  const events = [];
+  globalThis.fetch = async (_url, options) => {
+    requests++;
+    if (rejectAuthentication) return new Response('{}', { status: 401, headers: { 'content-type': 'application/json' } });
+    const body = JSON.parse(options.body);
+    const message = body.tools?.length && !body.messages.some(item => item.role === 'tool')
+      ? { role: 'assistant', content: null, tool_calls: ['probe-a', 'probe-b'].map((value, index) => ({ id: `call-${index}`, type: 'function', function: { name: body.tools[0].function.name, arguments: JSON.stringify({ value }) } })) }
+      : { role: 'assistant', content: '{"ok":true}' };
+    return new Response(JSON.stringify({ id: 'fixture', choices: [{ index: 0, message, finish_reason: message.tool_calls ? 'tool_calls' : 'stop' }] }), { headers: { 'content-type': 'application/json' } });
+  };
+  const session = {
+    host: { has: () => false, generation: { inspect: async () => ({ available: false, status: 'queued', taskId: 'current' }) } },
+    bus: { publish(_token, payload) { events.push(payload); } },
+  };
+  const instances = [];
+  const start = async () => {
+    const services = createProductionLlmServices(session, { repository });
+    instances.push(services);
+    services.registerConsumer({ displayName: 'Agent test', registrationVersion: 1, tasks: ['memory_extract_entities', 'memory_extract_content'].map(taskKey => ({ taskKey, taskKind: 'generation', execution: 'tool_turn', requiredCapabilities: ['chat', 'tools'] })) }, 'ss-helper.memory');
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const snapshot = await services.taskStatus({}, 'ss-helper.memory');
+      if (snapshot.resources.some(item => item.resourceId === resource.id && item.available)) return services;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    assert.fail('runtime did not initialize');
+  };
+  try {
+    const first = await start();
+    events.length = 0;
+    const verified = await first.verifyResourceCapability({ resourceId: resource.id, force: true }, new AbortController().signal, 'ss-helper.llm', 'agent-verify');
+    assert.equal(verified.capabilities[0].status, 'verified');
+    assert.equal(verified.reasoning.executions.find(item => item.execution === 'tool_turn').status, 'verified');
+    assert.equal(events.length, 1, 'one verification must publish one status change');
+    const beforeSave = requests;
+    await repository.saveResource({ ...resource, label: '改名资源' }, 'fixture-key', { reasoningPolicy: policy });
+    await repository.saveResource({ ...resource, label: '改名资源' }, 'fixture-key', { reasoningPolicy: policy });
+    assert.equal(requests, beforeSave, 'save must never probe the provider');
+    assert.equal((await repository.listToolCapabilities()).length, 1);
+    assert.equal((await repository.listReasoningCapabilities()).length, 1);
+    assert.equal((await first.taskStatus({}, 'ss-helper.memory')).tasks.every(item => item.available), true);
+    first.dispose();
+
+    repository = new LlmWorkspaceRepository(workspace, secrets);
+    const restored = await start();
+    const snapshot = await restored.taskStatus({}, 'ss-helper.memory');
+    const summary = snapshot.resources.find(item => item.resourceId === resource.id);
+    assert.equal(summary.toolCapabilities.status, 'verified');
+    assert.equal(summary.reasoningCapabilities.status, 'verified');
+    assert.equal(snapshot.tasks.every(item => item.available), true);
+    assert.equal(requests, beforeSave, 'reload must hydrate evidence without provider requests');
+
+    await assert.rejects(repository.saveReasoningCapability({ ...verified.reasoning, apiKey: 'must-not-persist' }, policy), { code: 'INVALID_PAYLOAD' });
+    const tool = (await repository.listToolCapabilities())[0];
+    for (const [name, change] of [
+      ['model', current => ({ ...current, resources: [{ ...resource, model: 'other-model' }] })],
+      ['endpoint', current => ({ ...current, resources: [{ ...resource, baseUrl: 'https://other.invalid/v1' }] })],
+      ['protocol', current => ({ ...current, resources: [{ ...resource, toolDialect: 'openai_responses' }] })],
+      ['parameters', current => ({ ...current, resources: [{ ...resource, customParams: { temperature: 0.2 } }] })],
+      ['streaming', current => ({ ...current, streamingEnabled: true })],
+      ['policy', current => ({ ...current, resourcePolicies: { [resource.id]: { mode: 'disabled', effort: 'provider_default' } } })],
+    ]) {
+      await repository.saveResource(resource, 'fixture-key', { reasoningPolicy: policy });
+      await repository.updateSettings(current => ({ ...current, streamingEnabled: false }));
+      await repository.saveToolCapability(tool.cacheKey, tool.capability);
+      await repository.saveReasoningCapability(verified.reasoning, policy);
+      await repository.updateSettings(change);
+      assert.equal((await repository.listToolCapabilities()).length, 0, `${name} must invalidate tool evidence`);
+      assert.equal((await repository.listReasoningCapabilities()).length, 0, `${name} must invalidate reasoning evidence`);
+    }
+    await repository.saveResource(resource, 'fixture-key', { reasoningPolicy: policy });
+    await repository.saveToolCapability(tool.cacheKey, tool.capability);
+    await repository.saveReasoningCapability(verified.reasoning, policy);
+    workspace.failNextTransaction = true;
+    await assert.rejects(repository.setResourceSecret(resource.id, 'other-key'), { code: 'WORKSPACE_FAILURE' });
+    assert.equal(await repository.getResourceSecret(resource.id), 'fixture-key');
+    assert.equal((await repository.listReasoningCapabilities()).length, 1);
+    await repository.setResourceSecret(resource.id, 'other-key');
+    assert.equal((await repository.listToolCapabilities()).length, 0);
+    assert.equal((await repository.listReasoningCapabilities()).length, 0);
+
+    for (const method of ['saveToolCapability', 'saveReasoningCapability']) {
+      const original = repository[method];
+      repository[method] = async () => { throw createSSHelperError('WORKSPACE_UNAVAILABLE', { stage: 'fixture.capability.persist', requestId: 'persist-failure' }); };
+      try {
+        await assert.rejects(restored.verifyResourceCapability({ resourceId: resource.id, force: true }, new AbortController().signal, 'ss-helper.llm', 'persist-failure'), error => {
+          const failure = readSSHelperFailure(error);
+          return failure.reasonCode === 'WORKSPACE_UNAVAILABLE' && failure.stage === 'fixture.capability.persist' && failure.requestId === 'persist-failure';
+        });
+      } finally { repository[method] = original; }
+    }
+    await repository.saveReasoningCapability({ ...verified.reasoning, expiresAt: Date.now() - 1 }, policy);
+    restored.dispose();
+    repository = new LlmWorkspaceRepository(workspace, secrets);
+    const expired = await start();
+    const expiredStatus = await expired.taskStatus({}, 'ss-helper.memory');
+    assert.equal(expiredStatus.tasks.every(item => !item.available), true);
+    assert.equal(expiredStatus.tasks[0].failure.reasonCode, 'LLM_REASONING_CAPABILITY_UNVERIFIED');
+    rejectAuthentication = true;
+    const rejected = await expired.verifyResourceCapability({ resourceId: resource.id, force: true }, new AbortController().signal, 'ss-helper.llm', 'auth-failure');
+    assert.equal(rejected.capabilities[0].failure.reasonCode, 'AUTH_FAILED');
+    assert.equal(rejected.reasoning.executions.every(item => item.failure?.reasonCode === 'AUTH_FAILED'), true);
+    await repository.deleteResource(resource.id);
+    assert.equal((await repository.listReasoningCapabilities()).length, 0);
+  } finally {
+    instances.forEach(instance => instance.dispose());
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test('provider factory covers direct browser generation and rerank resources', () => {

@@ -1,0 +1,22 @@
+{
+  "savedWithoutProbe": true,
+  "probeRequests": [],
+  "providerEndpointsBlocked": true,
+  "manager": {
+    "row": "DS-flash\nDeepSeek · deepseek-flash\n生成\n未测试\n等待测试\n已配置\n未验证\n未验证\n不适用\n不适用\n测试\n编辑",
+    "manualTestEnabled": true
+  },
+  "editor": {
+    "submitLabel": "保存后可在资源列表中测试连接\n取消\n保存",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-flash",
+    "keyIsBlank": true,
+    "untested": true
+  },
+  "reloadConfirmed": true,
+  "mobile": {
+    "noHorizontalOverflow": true,
+    "footerVisible": true,
+    "saveLabel": "保存后可在资源列表中测试连接\n取消\n保存"
+  }
+}

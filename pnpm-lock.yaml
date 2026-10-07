@@ -7,6 +7,11 @@ settings:
 overrides:
   '@ss-helper/sdk': file:vendor/ss-helper-sdk-0.0.1.tgz
 
+patchedDependencies:
+  svelte-select@5.8.3:
+    hash: 7877fdadb47b81c3150957779bc76862a4e6ad642b0e9314046607856e05cf50
+    path: patches/svelte-select@5.8.3.patch
+
 importers:
 
   .:
@@ -377,7 +382,7 @@ packages:
     resolution: {integrity: sha512-XExJS3cLqgrmNBIP3bBw6+1oQ1ksGjFh0+oClDKFYpCCqx/hlqwWO5KO/S63fzUo67SxI9dMrF0y5T/Ey7h8Zw==}
 
   '@ss-helper/sdk@file:vendor/ss-helper-sdk-0.0.1.tgz':
-    resolution: {integrity: sha512-ldgbPmpGi8lSMZuovtJ4G/qhSXvuX5yH1Mjwsy0d7aoEW692r13PhZCClnzMv9Kji1SRG4WwJgoDBvvpx3Q9HQ==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
+    resolution: {integrity: sha512-8i3GkgUHPyopM/nY3l1bMOWiJURoI6IMiar/J3aVSyoSF7TTrcULsUXMd51yaghPOx3jkfi6rtrWakDeQkOCXw==, tarball: file:vendor/ss-helper-sdk-0.0.1.tgz}
     version: 0.0.1
     engines: {node: '>=20'}
 
@@ -1049,10 +1054,10 @@ snapshots:
       sass: 1.102.0
       svelte: 5.56.8
       svelte-awesome: 3.3.5(svelte@5.56.8)
-      svelte-select: 5.8.3
+      svelte-select: 5.8.3(patch_hash=7877fdadb47b81c3150957779bc76862a4e6ad642b0e9314046607856e05cf50)
       vanilla-picker: 2.12.3
 
-  svelte-select@5.8.3:
+  svelte-select@5.8.3(patch_hash=7877fdadb47b81c3150957779bc76862a4e6ad642b0e9314046607856e05cf50):
     dependencies:
       svelte-floating-ui: 1.5.8
 

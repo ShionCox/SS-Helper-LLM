@@ -334,10 +334,6 @@ export class ResourceVerificationCoordinator {
       const listed = await provider.listModels?.(timeoutController.signal);
       if (listed?.ok) models = listed.models;
       const configuredModel = resource.model?.trim();
-      if (configuredModel && models.length > 0 && !models.some((model) => model.id === configuredModel)) {
-        update('model', 'error', '模型不在服务返回的列表中');
-        return { ok: false, reasonCode: 'MODEL_NOT_FOUND', checks, models };
-      }
       update('model', 'success', configuredModel ? '模型可用' : '服务模型检查通过');
 
       update('capability', 'running', '正在核对用途能力');
@@ -436,10 +432,7 @@ export class ResourceVerificationCoordinator {
         update('model', 'error', '尚未选择模型');
         return { ok: false, reasonCode: 'LLM_REQUEST_INVALID', checks, models };
       }
-      if (models.length > 0 && !models.some((model) => model.id === configuredModel)) {
-        update('model', 'error', '模型不在服务返回的列表中');
-        return { ok: false, reasonCode: 'MODEL_NOT_FOUND', checks, models };
-      }
+      // Model lists may omit callable aliases; the actual probe determines availability.
       const probe = await this.#compatibleGenerationProbe(resource, apiKey, timeoutController.signal);
       if (timeoutController.signal.aborted) throw new DOMException('aborted', 'AbortError');
       if (!probe.ok) {

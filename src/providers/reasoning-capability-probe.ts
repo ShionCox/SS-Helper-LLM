@@ -28,6 +28,7 @@ export interface ReasoningCapabilityProbeInput {
     readonly signal: AbortSignal;
     readonly beforeRequest?: () => Promise<void>;
     readonly toolCapability?: VerifiedToolCapabilities;
+    readonly toolFailure?: SSHelperFailureContext;
 }
 
 const SIMPLE_SCHEMA = Object.freeze({
@@ -38,7 +39,7 @@ const SIMPLE_SCHEMA = Object.freeze({
 });
 
 function probeFailure(input: ReasoningCapabilityProbeInput, error: unknown, stage: string): SSHelperFailureContext {
-    const observed = readSSHelperFailure(error, {
+    return readSSHelperFailure(error, {
         reasonCode: 'LLM_REASONING_PROBE_FAILED',
         stage,
         requestId: input.requestId,
@@ -46,14 +47,6 @@ function probeFailure(input: ReasoningCapabilityProbeInput, error: unknown, stag
         resourceId: input.resourceId,
         model: input.model,
     })!;
-    if (observed.reasonCode === 'LLM_REASONING_CONFIGURATION_UNSUPPORTED') return observed;
-    return createSSHelperError('LLM_REASONING_PROBE_FAILED', {
-        stage,
-        requestId: input.requestId,
-        providerKind: input.providerKind,
-        resourceId: input.resourceId,
-        model: input.model,
-    }).details as unknown as SSHelperFailureContext;
 }
 
 async function execute(input: ReasoningCapabilityProbeInput, request: LLMRequest): Promise<void> {
@@ -181,7 +174,7 @@ export async function verifyReasoningCapabilities(input: ReasoningCapabilityProb
             reasoningReplay: manifest.reasoning.replay,
         });
     } else {
-        const failure = input.toolCapability?.failure ?? createSSHelperError('LLM_REASONING_CAPABILITY_UNVERIFIED', {
+        const failure = input.toolCapability?.failure ?? input.toolFailure ?? createSSHelperError('LLM_REASONING_CAPABILITY_UNVERIFIED', {
             stage: 'llm.reasoning.probe.tool_turn',
             requestId: input.requestId,
             providerKind: input.providerKind,

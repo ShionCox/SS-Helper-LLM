@@ -40,7 +40,8 @@ test('resource names are optional and advanced visibility never changes saved ov
     controller.change('showAdvanced', true);
     controller.change('showAdvanced', false);
     assert.equal(controller.snapshot().dirty, false);
-    await controller.submit(); await controller.submit(); await controller.submit(); await controller.submit();
+    assert.equal(controller.snapshot().activeStepId, 'connection');
+    await controller.submit();
     assert.equal(saved.label, label || 'OpenAI-compatible · model-a');
     assert.equal(saved.toolDialect, 'openai_responses');
     controller.dispose();
@@ -75,6 +76,75 @@ test('resource wizard shows only purpose-specific connection fields', () => {
   assert.equal(snapshot.hiddenFieldIds.includes('rerankPath'), false);
   controller.change('rerankProtocol', 'chat');
   assert.equal(controller.snapshot().hiddenFieldIds.includes('rerankPath'), true);
+  controller.dispose();
+});
+
+test('direct editing validates locally and saves without probes, retaining secrets and drafts on persistence failure', async () => {
+  const saved = [];
+  const notifications = [];
+  let verified = 0;
+  let closed = 0;
+  let failSave = true;
+  let pendingDiscovery = false;
+  let discoveries = 0;
+  const controller = new ResourceWizardController({
+    mode: 'edit', source: { ...resource, customParams: { temperature: 0.3 } }, hasStoredSecret: true, timeoutMs: 30000,
+    repository: { getResourceSecret: async () => 'existing-test-secret', saveResource: async (...args) => {
+      if (failSave) throw Object.assign(new Error('fixture conflict'), { code: 'CONFLICT', details: { reasonCode: 'WORKSPACE_CONFLICT', stage: 'llm.resource.save' } });
+      saved.push(args);
+    } },
+    ui: { close: () => { closed += 1; } }, notify: (...args) => notifications.push(args), toolServices: {},
+    verification: {
+      discoverModels: async (_candidate, _secret, options) => {
+        discoveries += 1;
+        if (pendingDiscovery) await new Promise(resolve => options.signal.addEventListener('abort', resolve, { once: true }));
+        return { ok: false, supported: false, reasonCode: 'LLM_MODEL_DISCOVERY_UNSUPPORTED', models: [] };
+      },
+      verify: async () => { verified += 1; throw new Error('Saving must not verify the provider'); },
+    },
+  });
+  assert.equal(controller.snapshot().hiddenFieldIds.includes('reasoningMode'), false);
+  await controller.action('refresh-models');
+  assert.equal(notifications.at(-1)[3], 'LLM_MODEL_DISCOVERY_UNSUPPORTED');
+  controller.change('baseUrl', 'invalid-address');
+  await controller.action('refresh-models');
+  assert.equal(controller.snapshot().status.code, 'LLM_RESOURCE_INPUT_REQUIRED');
+  assert.equal(notifications.at(-1)[3], 'LLM_RESOURCE_INPUT_REQUIRED');
+  controller.change('baseUrl', resource.baseUrl);
+  controller.navigate('purpose'); controller.back();
+  assert.equal(controller.snapshot().activeStepId, 'connection');
+  controller.change('model', '');
+  await controller.submit();
+  assert.equal(verified, 0);
+  assert.equal(controller.snapshot().fieldErrors.model, '请输入模型 ID');
+  controller.change('model', 'model-b');
+  await controller.submit();
+  assert.equal(saved.length, 0);
+  assert.equal(closed, 0);
+  assert.equal(controller.snapshot().dirty, true);
+  assert.equal(controller.snapshot().status.code, 'WORKSPACE_CONFLICT');
+  assert.equal(verified, 0);
+  assert.doesNotMatch(JSON.stringify(notifications), /existing-test-secret/u);
+  pendingDiscovery = true;
+  const discovery = controller.action('refresh-models');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await controller.submit();
+  await discovery;
+  pendingDiscovery = false;
+  const previousDiscoveries = discoveries;
+  await controller.action('refresh-models');
+  assert.equal(discoveries, previousDiscoveries + 1, 'a failed save must not leave model refresh stuck busy');
+  failSave = false;
+  await controller.submit();
+  assert.equal(saved.length, 1);
+  assert.equal(saved[0][0].id, resource.id);
+  assert.equal(saved[0][0].model, 'model-b');
+  assert.deepEqual(saved[0][0].customParams, { temperature: 0.3 });
+  assert.equal(saved[0][1], 'existing-test-secret');
+  assert.equal(saved[0][2].resourceHealth, undefined, 'saving must not invent successful connection health');
+  assert.equal(verified, 0);
+  assert.equal(closed, 1);
+  assert.equal(controller.snapshot().dirty, false);
   controller.dispose();
 });
 
@@ -329,6 +399,65 @@ test('tavern same-origin probe discovers models with a draft key and verifies th
   assert.equal(calls.every((call) => call.signal instanceof AbortSignal), true);
 });
 
+test('model aliases absent from discovery are verified by actual calls through both transports', async () => {
+  const candidate = { ...resource, apiType: 'deepseek', baseUrl: 'https://api.deepseek.com', model: 'deepseek-v4-flash' };
+  for (const useTavern of [false, true]) {
+    for (const available of [true, false]) {
+      const calls = [];
+      const reply = (path, body) => {
+        calls.push({ path, body });
+        if (path.endsWith('/models') || path.endsWith('/status')) return { status: 200, body: { data: [{ id: 'deepseek-flash' }] } };
+        return available
+          ? { status: 200, body: { choices: [{ message: { content: 'OK' } }] } }
+          : { status: 404, body: { error: { code: 'model_not_found' } } };
+      };
+      const coordinator = new ResourceVerificationCoordinator(useTavern ? {
+        request: async (input) => {
+          const result = reply(input.path, input.body);
+          return { ...result, ok: result.status === 200 };
+        },
+      } : {
+        fetchImpl: async (url, init = {}) => {
+          const result = reply(String(url), init.body ? JSON.parse(init.body) : undefined);
+          return new Response(JSON.stringify(result.body), { status: result.status, headers: { 'content-type': 'application/json' } });
+        },
+      });
+      const result = await coordinator.verify(candidate, 'test-key');
+      assert.equal(result.ok, available);
+      assert.equal(result.checks.model.state, available ? 'success' : 'error');
+      const probe = calls.find(call => call.path.endsWith('/chat/completions') || call.path.endsWith('/generate'));
+      assert.equal(probe.body.model, candidate.model);
+      assert.equal(calls.some(call => call.path.includes('/beta')), false);
+    }
+  }
+});
+
+test('new and copied resources save without connecting to the provider', async () => {
+  for (const mode of ['create', 'copy']) {
+    let saved;
+    const controller = new ResourceWizardController({
+      mode, source: mode === 'copy' ? resource : undefined, hasStoredSecret: mode === 'copy', timeoutMs: 30000,
+      repository: { getResourceSecret: async () => 'old-key', saveResource: async (...args) => { saved = args; } },
+      ui: { close() {} }, notify() {}, verification: {},
+    });
+    controller.change('apiType', 'openai');
+    controller.change('model', 'manual-model');
+    controller.change('apiKey', 'new-key');
+    for (let step = 0; step < 3; step++) await controller.submit();
+    controller.change('baseUrl', 'invalid-address');
+    await controller.submit();
+    assert.equal(saved, undefined);
+    assert.ok(controller.snapshot().fieldErrors.baseUrl);
+    controller.change('baseUrl', 'https://api.example.test/v1');
+    await controller.submit();
+    assert.equal(saved[0].model, 'manual-model');
+    assert.notEqual(saved[0].id, resource.id);
+    assert.equal(saved[1], 'new-key');
+    assert.equal(saved[2].resourceHealth, undefined);
+    controller.dispose();
+  }
+});
+
 test('tavern probe rejects an unavailable draft endpoint without exposing the draft key', async () => {
   const coordinator = new ResourceVerificationCoordinator({
     request: async () => ({
@@ -363,7 +492,7 @@ test('resource verification honors an already-aborted caller signal', async () =
   }
 });
 
-test('legacy resource popup DOM, prompt editing, and save-before-test paths are removed', async () => {
+test('legacy resource popup DOM and prompt editing are removed while manual probes remain available', async () => {
   const plugin = await readFile(new URL('../src/ss-helper/plugin.ts', import.meta.url), 'utf8');
   const resourcePopups = await readFile(new URL('../src/ss-helper/resource-popups.ts', import.meta.url), 'utf8');
   const resourceStyles = await readFile(new URL('../src/ui/request-log-viewer.css', import.meta.url), 'utf8');
@@ -375,21 +504,15 @@ test('legacy resource popup DOM, prompt editing, and save-before-test paths are 
   assert.match(resourcePopups, /ResourceVerificationCoordinator/u);
   assert.match(resourcePopups, /createMenu|presentation:\s*'workspace'/u);
   assert.match(resourcePopups, /验证工具调用|verifyResourceCapability/u);
-  assert.match(resourcePopups, /ss-helper-llm-resource-checked-primary/u);
-  assert.match(resourceStyles, /ss-helper-llm-resource-row\s*\{\s*height:\s*54px/u);
-  assert.match(resourceStyles, /grid-template-columns:[^;]+170px;/u);
-  assert.match(resourceStyles, /grid-template-rows:\s*auto auto auto auto minmax\(0, 1fr\) auto/u);
   assert.match(resourceStyles, /ss-helper-llm-tavern-reasoning-policy[\s\S]+display:\s*grid/u);
-  assert.match(resourceStyles, /resource-columns\s*>\s*:last-child\s*\{\s*text-align:\s*right/u);
+  assert.match(resourceStyles, /resource-columns\s*>\s*:last-child\s*\{\s*text-align:\s*left/u);
   assert.match(resourcePopups, /listResourceHealth|saveResourceHealth|deleteResource/u);
-  assert.match(resourcePopups, /工具调用（Agent，可选）[\s\S]+force:\s*true/u);
+  assert.match(resourcePopups, /verifyResourceCapability[\s\S]+force:\s*true/u);
   assert.match(resourcePopups, /describeSSHelperFailure\(capability\?\.failure/u);
   assert.match(resourcePopups, /diagnostic\.title[\s\S]+diagnostic\.reason[\s\S]+diagnostic\.action/u);
-  assert.match(resourcePopups, /enabled:\s*true/u);
-  for (const field of ['customParams', 'toolDialect', 'privacyPolicy']) {
+  for (const field of ['customParams', 'privacyPolicy']) {
     assert.match(resourcePopups, new RegExp(`this\\.#source\\?\\.${field}`, 'u'));
   }
-  assert.match(resourcePopups, /await this\.#verification\.verify[\s\S]+await this\.#repository\.saveResource/u);
 });
 
 test('LLM UI has no Memory-owned task routing surface and protects consumer assignments', async () => {
